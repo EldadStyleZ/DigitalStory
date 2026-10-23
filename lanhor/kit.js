@@ -492,6 +492,7 @@
   Kit.toast = function (text, opts = {}) {
     const box = Kit.dom.toasts;
     if (!box) return;
+    const out = (n) => { n.classList.add('is-out'); setTimeout(() => n.remove(), 300); };
     // de-dupe identical consecutive toasts
     const lastT = box.lastElementChild;
     if (lastT && lastT.dataset.text === text && !lastT.classList.contains('is-out')) { clearTimeout(lastT._t); lastT._t = setTimeout(() => out(lastT), opts.ms || 1700); return; }
@@ -500,7 +501,6 @@
     t.dataset.text = text;
     box.append(t);
     while (box.children.length > 3) box.firstElementChild.remove();
-    const out = (n) => { n.classList.add('is-out'); setTimeout(() => n.remove(), 300); };
     t._t = setTimeout(() => out(t), opts.ms || 1700);
   };
 
@@ -613,7 +613,9 @@
           pct();
           if (t.onInput) t.onInput(v);
         });
-        inp.addEventListener('change', () => { inp.blur(); if (t.onChange) t.onChange(parseFloat(inp.value)); });
+        // give keys back to the toy after a mouse drag; keyboard users keep focus to keep stepping
+        inp.addEventListener('pointerup', () => inp.blur());
+        inp.addEventListener('change', () => { if (t.onChange) t.onChange(parseFloat(inp.value)); });
         w.append(row, inp);
         if (t.note) w.append(el('div', 'kit-tw-note', esc(Kit.t(t.note))));
         body.append(w);

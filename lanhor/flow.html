@@ -760,7 +760,7 @@
         }
       } else {
         z.glow += ((z.count > 0 ? 1 : 0) - z.glow) * Math.min(1, dt * 5);
-        if (z.count > 0 && n > 1) {
+        if (z.count > 0 && fish.length > 1) {   // live count: two red zones may each take one in the same frame
           z.timer += dt;
           if (z.timer >= tw('lossInterval')) { z.timer = 0; takeFrom(z); }
         } else z.timer = Math.max(0, z.timer - dt);
@@ -1733,6 +1733,19 @@
     const fix = document.createElement('style');
     fix.textContent = '.kit-drawer-body > * { flex-shrink: 0; }';
     document.head.append(fix);
+    // kit.js bug (line 497): repeating the toast that is still on screen schedules `out` before its `const`
+    // (line 503), so the timer throws and that toast never leaves (R pressed twice, "full" twice). Do kit's
+    // de-dupe here (extend the visible toast) so the broken branch is never reached.
+    const kitToast = Kit.toast;
+    Kit.toast = (text, opts = {}) => {
+      const last = Kit.dom.toasts.lastElementChild;
+      if (last && last.dataset.text === text && !last.classList.contains('is-out')) {
+        clearTimeout(last._t);
+        last._t = setTimeout(() => { last.classList.add('is-out'); setTimeout(() => last.remove(), 300); }, opts.ms || 1700);
+        return;
+      }
+      kitToast(text, opts);
+    };
     for (const k in DEF) if (Kit.tweaks[k] === undefined) Kit.tweaks[k] = DEF[k];
     loadLevel(0);
     const g = Kit.ui.group({ sprite: 'School', abstract: 'Group' });

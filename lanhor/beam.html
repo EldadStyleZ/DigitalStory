@@ -48,6 +48,7 @@ const KINDS = {
   hex: { verts: ngon(6, 1, 0), mat: 'stone' },
   circle: { verts: ngon(16, 0.95, 0), mat: 'stone' },
 };
+for (const k of Object.values(KINDS)) k.rmax = Math.max(...k.verts.map((v) => Math.hypot(v.x, v.y)));
 // kind, cx, cy (room fractions), size (fraction of the room's short side), rotation (deg), glass color
 const DEFAULT_OBJECTS = [
   ['hex', 0.25, 0.37, 0.075, 8, null],
@@ -247,6 +248,8 @@ function layout() {
 
 // ================================================================== world: obstacles
 function popScale(o) { return o.pop >= 1 ? 1 : Math.max(0.02, U.easeOutBack(o.pop)); }
+/** Bounding radius of an object once its pop-in has settled. */
+const fullRadius = (kind, size) => size * S.minDim * KINDS[kind].rmax;
 
 function makeObstacle(kind, cx, cy, size, rot, glass) {
   const def = KINDS[kind];
@@ -297,19 +300,23 @@ function clampObstacle(o) {
   if (dx || dy) { o.cx += dx / R.w; o.cy += dy / R.h; updateObstacle(o); }
 }
 
+/** Nearest spot to (x, y) where a new object of bounding radius r clears every other object
+ *  (judged at full size, so objects still popping in count); else the spot with the most room. */
 function findFreeSpot(x, y, r) {
+  let best = null, bestGap = -Infinity;
   for (let ring = 0; ring < 14; ring++) {
     const n = ring === 0 ? 1 : 10;
     for (let i = 0; i < n; i++) {
       const a = (i / n) * TAU + ring * 0.7, d = ring * r * 0.9;
       const px = x + Math.cos(a) * d, py = y + Math.sin(a) * d;
       if (!inRoom(px, py, r + 14)) continue;
-      let ok = true;
-      for (const o of S.obstacles) if (U.dist(px, py, o.bx, o.by) < o.br + r + 8) { ok = false; break; }
-      if (ok) return { x: px, y: py };
+      let gap = Infinity;
+      for (const o of S.obstacles) gap = Math.min(gap, U.dist(px, py, o.bx, o.by) - fullRadius(o.kind, o.size) - r);
+      if (gap >= 8) return { x: px, y: py };
+      if (gap > bestGap) { bestGap = gap; best = { x: px, y: py }; }
     }
   }
-  return { x, y };
+  return best || { x, y };
 }
 
 function addObject(type, at) {
@@ -322,7 +329,7 @@ function addObject(type, at) {
   const R = S.room, r = spec.size * S.minDim;
   let x = R.x + R.w / 2, y = R.y + R.h / 2;
   if (at) { x = at.x; y = at.y; } else if (Kit.mouse.inside && inRoom(Kit.mouse.x, Kit.mouse.y, 30)) { x = Kit.mouse.x; y = Kit.mouse.y; }
-  const spot = findFreeSpot(x, y, r);
+  const spot = findFreeSpot(x, y, fullRadius(spec.kind, spec.size));
   const o = makeObstacle(spec.kind, (spot.x - R.x) / R.w, (spot.y - R.y) / R.h, spec.size, rand(-0.4, 0.4), type === 'glass' ? S.color : null);
   o.pop = 0;
   updateObstacle(o);
@@ -708,6 +715,26 @@ function loseLight(m) {
   m.lostT = rand(0.6, 1); m.dazeT = 0.35; m.spin = Math.random() < 0.5 ? -1 : 1;
 }
 
+/** The point moths circle: in front of the lens along the beam, kept clear of the wall. */
+const focus = { x: 0, y: 0 };
+function orbitFocus(l, r) {
+  let fx = Math.cos(l.angle) * r * 1.3, fy = Math.sin(l.angle) * r * 1.3;
+  const n = fx * l.nx + fy * l.ny, minN = r * 0.8;
+  if (n < minN) { fx += l.nx * (minN - n); fy += l.ny * (minN - n); }
+  focus.x = l.ox + fx; focus.y = l.oy + fy;
+  return focus;
+}
+
+/** A moth circling the lamp is lit while the lamp is on, it stays in the swarm around the focus
+ *  (same reach as the orbit → seek switch) and nothing blocks the lens. The cone is only a few px
+ *  wide there, so the plain lit test would flicker. */
+function orbitLit(m, l, r) {
+  if (!l.on) return false;
+  const F = orbitFocus(l, r);
+  return U.dist(m.x, m.y, F.x, F.y) < r * 3.4 &&
+    !segBlocked(l.ox, l.oy, l.ox + Math.cos(l.angle) * r, l.oy + Math.sin(l.angle) * r, l.color);
+}
+
 /** Decide which lamp (if any) a moth follows, with hysteresis so it commits to one beam. */
 function senseLight(m, dt) {
   if (m.dazeT > 0) { m.dazeT -= dt; return; }
@@ -716,7 +743,7 @@ function senseLight(m, dt) {
   for (const l of S.lamps) {
     let I;
     if (l === m.target) {
-      I = m.state === 'orbit' && l.on && U.dist(m.x, m.y, l.ox, l.oy) < orbitR * 3.2 ? 1 : litAmount(m.x, m.y, l, 10 * DEG);
+      I = m.state === 'orbit' && orbitLit(m, l, orbitR) ? 1 : litAmount(m.x, m.y, l, 10 * DEG);
       curI = I;
     } else I = litAmount(m.x, m.y, l);
     if (I > bestI) { bestI = I; best = l; }
@@ -799,7 +826,7 @@ function updateMoths(dt, t) {
     steer.ax = 0; steer.ay = 0;
     const l = m.target;
     if (l && (m.state === 'seek' || m.state === 'orbit')) {
-      const fx = l.ox + l.nx * orbitR, fy = l.oy + l.ny * orbitR;
+      const F = orbitFocus(l, orbitR), fx = F.x, fy = F.y;
       if (m.state === 'seek') {
         let dx = fx - m.x, dy = fy - m.y;
         const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
@@ -870,8 +897,9 @@ function updateMoths(dt, t) {
 function bumpLamp(m, l) {
   m.bumpT = rand(0.55, 1.5);
   m.squash = 1;
-  m.vx = l.nx * 190 * S.scale + rand(-80, 80) * S.scale;
-  m.vy = l.ny * 190 * S.scale + rand(-80, 80) * S.scale;
+  // bounce back out along the beam, into the light
+  m.vx = Math.cos(l.angle) * 190 * S.scale + rand(-80, 80) * S.scale;
+  m.vy = Math.sin(l.angle) * 190 * S.scale + rand(-80, 80) * S.scale;
   l.fx.jolt = 1;
   burst(m.x, m.y, BASE[l.color], 4, 90);
   Kit.sfx('bite', { gap: 220, vol: 0.18, pitch: rand(1.2, 1.7) });
@@ -1483,7 +1511,6 @@ function buildMothSprites() {
   const res = ((MOTH_WS * S.scale) / 108) * Kit.dpr * 1.25;
   if (Math.abs(res - mothRes) < 0.01 && mothAtlas.width) return;
   mothRes = res;
-  // wings + body are painted once, then composed into flap frames (wings squashed toward the body)
   // wings + body are painted once per look, then composed into flap frames (wings squashed toward
   // the body) inside one atlas so every moth draw shares a texture
   const cw = Math.ceil(MOTH_CELL.w * res), ch = Math.ceil(MOTH_CELL.h * res);
@@ -1505,7 +1532,6 @@ function buildMothSprites() {
       g.drawImage(body, body.ux, body.uy, body.uw, body.uh);
     }
   });
-
 }
 
 function polyPath(ctx, pts, rr) {
@@ -1875,7 +1901,6 @@ function drawMothsSprite(ctx) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-/** A small spotlight clamped to the brass rail; lens at the lamp origin. */
 /** Brass clamp on the rail and the arm that holds the spotlight head. */
 function paintLampMount(ctx, l, alpha) {
   const s = S.scale, b = S.band;
