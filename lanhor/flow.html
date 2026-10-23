@@ -318,6 +318,7 @@
     anchor: { x: 0, y: 0, px: 0, py: 0, vx: 0, vy: 0, tile: -1, inCur: false },
     prog: { x: 0, y: 0 },
     idle: 10, steerVis: 0, millDir: 1,
+    intro: false, introVis: 0,   // opening cue: rings mark the school until the player first steers
     cx: 0, cy: 0, spread: 0,
     best: 1, lastN: -1, amb: 0,
     tips: { join: false, red: false, cur: false },
@@ -566,6 +567,7 @@
     readSteer();
     const ix = steerIn.x, iy = steerIn.y, steering = steerIn.on;
     S.idle = steering ? 0 : S.idle + dt;
+    if (steering) S.intro = false;
 
     const vmax = tw('swimSpeed');
     const ti = tileAt(A.x, A.y);
@@ -783,12 +785,15 @@
   }
 
   function takeFrom(z) {
-    let pick = (Math.random() * z.count) | 0;
+    let pick = (Math.random() * z.count) | 0, last = -1;
     for (let i = 0; i < S.fish.length; i++) {
       const t = tileAt(S.fish[i].x, S.fish[i].y);
       if (t < 0 || zoneOf[t] !== z.id) continue;
-      if (pick-- === 0) { removeFishAt(i, true); break; }
+      last = i;
+      if (pick-- === 0) break;
     }
+    if (last < 0) return;   // the count is from the frame start; another zone may have taken this fish already
+    removeFishAt(last, true);
     z.pulse = 1;
     Kit.sfx('lose', { pitch: U.rand(0.9, 1.1) });
     if (!S.tips.red) {
@@ -864,6 +869,7 @@
     }
     const target = S.idle < 0.08 || tw('showField') ? 1 : 0;
     S.steerVis += (target - S.steerVis) * Math.min(1, adt * (target ? 10 : 1.8));
+    S.introVis += ((S.intro ? 1 : 0) - S.introVis) * Math.min(1, adt * 3);
   }
 
   // ---- whole-school helpers (reset, tests, buttons)
@@ -875,6 +881,7 @@
     A.vx = A.vy = 0; A.inCur = false;
     S.prog.x = S.prog.y = 0;
     S.idle = 10;
+    S.intro = true;
     S.millDir = Math.random() < 0.5 ? 1 : -1;
     for (const z of zones) {
       z.progress = 0; z.timer = 0; z.pulse = 0; z.glow = 0; z.streak = 0; z.away = 0; z.full = false;
@@ -936,6 +943,7 @@
     A.x = A.px = (t % COLS) + 0.5; A.y = A.py = ((t / COLS) | 0) + 0.5;
     A.vx = A.vy = 0;
     A.tile = t;
+    S.intro = false;
     placeSchoolAt(t, S.fish.length);
     computeField();
     measureSchool();
@@ -1537,7 +1545,7 @@
     for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (solid[r * COLS + c]) g.rect(OX + c * T + 0.5, OY + r * T + 0.5, T - 1, T - 1);
     g.stroke();
     for (const z of zones) {
-      g.fillStyle = z.kind === 'green' ? 'rgba(52,199,89,0.36)' : 'rgba(255,59,48,0.36)';
+      g.fillStyle = z.kind === 'green' ? 'rgba(52,199,89,0.5)' : 'rgba(255,59,48,0.5)';   // strong enough for a projector
       g.fill(z.rects);
     }
   }
@@ -1604,8 +1612,8 @@
       const x = OX + z.sx * T, y = OY + z.sy * T, r = T * 0.34, p = z.full ? 1 : z.progress;
       ctx.lineCap = 'round';
       ctx.lineWidth = Math.max(2, T * 0.08);
-      ctx.globalAlpha = 0.3 + 0.35 * z.glow;
-      ctx.strokeStyle = plain ? SHAPE.g3 : 'rgba(190,255,215,0.45)';
+      ctx.globalAlpha = (0.3 + 0.35 * z.glow) * (plain ? 0.6 : 1);
+      ctx.strokeStyle = plain ? SHAPE.white : 'rgba(190,255,215,0.45)';
       ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke();
       if (p > 0.01) {
         ctx.globalAlpha = 0.95;
@@ -1706,6 +1714,14 @@
       ctx.beginPath(); ctx.arc(ax, ay, T * 0.45, 0, TAU); ctx.stroke();
       ctx.beginPath(); ctx.arc(ax, ay, 2.5, 0, TAU); ctx.fill();
     }
+    if (S.introVis > 0.01) {   // opening cue: two rings ripple out from the school until the first steer
+      ctx.lineWidth = Math.max(2, T * 0.07);
+      for (let k = 0; k < 2; k++) {
+        const ph = (S.amb / 1.8 + k * 0.5) % 1;
+        ctx.globalAlpha = 0.55 * (1 - ph) * S.introVis;
+        ctx.beginPath(); ctx.arc(ax, ay, T * (0.6 + ph * 1.8), 0, TAU); ctx.stroke();
+      }
+    }
     ctx.globalAlpha = 1;
   }
 
@@ -1728,25 +1744,6 @@
   }
 
   function setup() {
-    // kit.css bug (line 412): the drawer body is a scrolling flex column, so once it overflows its children
-    // shrink and the "Add 10" button collapses to a sliver. Pin the children to their natural height.
-    const fix = document.createElement('style');
-    fix.textContent = '.kit-drawer-body > * { flex-shrink: 0; }';
-    document.head.append(fix);
-    // kit.js bug (line 497): repeating the toast that is still on screen schedules `out` before its `const`
-    // (line 503), so the timer throws and that toast never leaves (R pressed twice, "full" twice). Do kit's
-    // de-dupe here (extend the visible toast) so the broken branch is never reached.
-    const kitToast = Kit.toast;
-    Kit.toast = (text, opts = {}) => {
-      const last = Kit.dom.toasts.lastElementChild;
-      if (last && last.dataset.text === text && !last.classList.contains('is-out')) {
-        clearTimeout(last._t);
-        last._t = setTimeout(() => { last.classList.add('is-out'); setTimeout(() => last.remove(), 300); }, opts.ms || 1700);
-        return;
-      }
-      kitToast(text, opts);
-    };
-    for (const k in DEF) if (Kit.tweaks[k] === undefined) Kit.tweaks[k] = DEF[k];
     loadLevel(0);
     const g = Kit.ui.group({ sprite: 'School', abstract: 'Group' });
     Kit.ui.button({ parent: g, icon: 'plus', label: 'Add 10', key: '+', tip: { sprite: 'Add 10 fish to the school', abstract: 'Add 10 agents to the group' }, onClick: addTen });
@@ -1789,8 +1786,8 @@
       abstract: 'Steer with WASD, arrows or hold the mouse. Grow in green, avoid red.',
     },
     about: {
-      sprite: 'Steer a school of fish through an underwater maze. Keep it in the green seagrass and new fish swim in to join. Red water picks them off one by one. Currents push the school until it slips out of them, and in narrow gaps the fish squeeze into a line, then gather back into a ball.',
-      abstract: 'Steer a group of agents through a maze. Keep it in the green zone and new agents appear and join. The red zone removes them one by one. Flow lanes push the group until it leaves them, and in narrow gaps the agents squeeze into a line, then gather back into a ball.',
+      sprite: 'Steer a school of fish through an underwater maze. Stay in the green seagrass and new fish join, one at a time. Red water picks them off. Currents carry the school until it slips out of them. In narrow gaps the fish squeeze into a line, then gather back into a ball.',
+      abstract: 'Steer a group of agents through a maze. Stay in the green zone and new agents join, one at a time. The red zone removes them. Flow lanes carry the group until it leaves them. In narrow gaps the agents squeeze into a line, then gather back into a ball.',
     },
     controls: [
       { keys: ['W', 'A', 'S', 'D'], label: { sprite: 'Swim the school', abstract: 'Move the group' } },
