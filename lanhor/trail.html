@@ -1,0 +1,1875 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Toy</title>
+<link rel="stylesheet" href="kit.css">
+</head>
+<body>
+<script src="kit.js"></script>
+<script>
+'use strict';
+(function () {
+  const U = Kit.util;
+  const TAU = U.TAU;
+
+  // ================================================================ config
+  const PITCH = 4;                    // maze cell pitch in tiles: 1 wall + 3 corridor
+  const COLONY = ['#ff3b30', '#0a84ff', '#ffd60a', '#34c759', '#af52de'];
+  const COLONY_NAME = ['Red', 'Blue', 'Yellow', 'Green', 'Purple'];
+  const DEF = { nests: 3, perNest: 25, speed: 3, vision: 14, bites: 20, trail: true, sight: false };
+  const MAX_FLAGS = 3;
+  const ANT_R = 0.22;                 // collision radius, tiles
+  const TOUCH_R = 0.6;                // ant to cube centre distance that counts as a touch
+  const HOME_R = 0.9;                 // ant to nest centre distance that counts as home
+  const FLAG_R = 1.8;                 // flag counting radius
+  const MILL_R = 2.4;                 // how far idle ants wander from the nest
+  const SEP_R = 0.62, LANE_R = 1.0, WALL_FEEL = 0.55;
+  const CUBE_MARGIN = 0.42;           // cubes keep this far from walls
+  const CUBE_SPR = 1.5;               // cube sprite box, tiles
+  const PAINT_STEP = 2;               // tiles between painted cubes
+  const TRAIL_CAP = 9000, TRAIL_LIFE = 4.5, TRAIL_BUCKETS = 3;
+  const TRAIL_ALPHA = [0.5, 0.3, 0.14];
+  const PART_CAP = 600;
+  const SHAPE = { bg: '#1c1c22', floor: '#0d0d10', wall: '#2c2c34', mid: '#5a5a66', light: '#9a9aa6', white: '#ffffff', red: '#ff3b30', yellow: '#ffd60a' };
+  const ANT_DARK = '#2e170b';
+  const ICON_CUBE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l7.5 4.2v8.6L12 20.5l-7.5-4.2V7.7z"/><path d="M4.5 7.7L12 12l7.5-4.3M12 12v8.5"/></svg>';
+  const ICON_DIAMOND = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l8.5 8.5-8.5 8.5L3.5 12z"/></svg>';
+  const tw = (id) => (id in Kit.tweaks ? Kit.tweaks[id] : DEF[id]);
+  const word = (sprite, abstract) => Kit.pick(sprite, abstract);
+
+  // ================================================================ state
+  let ready = false, firstReset = true, silent = false;
+  let seed = 0, cols = 0, rows = 0;
+  let grid = null;                    // Uint8Array, 1 = wall
+  let kind = null;                    // per tile: 0 open, 1 hedge, 2 pebble
+  let plazas = [];
+  let fields = [];                    // per base: { dist, wp } for the way home
+  let T = 20, OX = 0, OY = 0;         // tile size (px) and map origin
+  const bases = [], ants = [], cubes = [], flags = [];
+  let simTime = 0, totalBites = 0, nextCubeId = 1;
+  let tool = 'sugar';
+  const seenOnce = { wall: false, eaten: false, flagHit: false, flagFull: false };
+  let ui = {};
+
+  // ================================================================ map generation
+  function hash(i, k) {
+    let h = (Math.imul(i, 374761393) + Math.imul(k, 668265263) + Math.imul(seed, 1274126177)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+  }
+
+  /** Coarse recursive-backtracker maze with loops, plazas, bulges and pebbles; returns tile grids. */
+  function genMaze(sd, nCx, nCy) {
+    const rnd = U.mulberry32(sd);
+    const ri = (a, b) => a + Math.floor(rnd() * (b - a + 1));
+    const C = 1 + nCx * PITCH, R = 1 + nCy * PITCH;
+    const g = new Uint8Array(C * R).fill(1);
+    const kd = new Uint8Array(C * R);
+    const carve = (x0, y0, x1, y1) => {
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) { g[y * C + x] = 0; kd[y * C + x] = 0; }
+    };
+    for (let j = 0; j < nCy; j++) for (let i = 0; i < nCx; i++) carve(1 + i * PITCH, 1 + j * PITCH, i * PITCH + 3, j * PITCH + 3);
+    // walls between cells: east[i,j] separates (i,j)-(i+1,j), south[i,j] separates (i,j)-(i,j+1)
+    const east = new Uint8Array(nCx * nCy).fill(1), south = new Uint8Array(nCx * nCy).fill(1);
+    const openEast = (i, j) => { east[j * nCx + i] = 0; carve((i + 1) * PITCH, 1 + j * PITCH, (i + 1) * PITCH, j * PITCH + 3); };
+    const openSouth = (i, j) => { south[j * nCx + i] = 0; carve(1 + i * PITCH, (j + 1) * PITCH, i * PITCH + 3, (j + 1) * PITCH); };
+
+    const seen = new Uint8Array(nCx * nCy);
+    const stack = [ri(0, nCx * nCy - 1)];
+    seen[stack[0]] = 1;
+    const nb = [];
+    while (stack.length) {
+      const c = stack[stack.length - 1], i = c % nCx, j = (c / nCx) | 0;
+      nb.length = 0;
+      if (i > 0 && !seen[c - 1]) nb.push(c - 1);
+      if (i < nCx - 1 && !seen[c + 1]) nb.push(c + 1);
+      if (j > 0 && !seen[c - nCx]) nb.push(c - nCx);
+      if (j < nCy - 1 && !seen[c + nCx]) nb.push(c + nCx);
+      if (!nb.length) { stack.pop(); continue; }
+      const n = nb[Math.floor(rnd() * nb.length)];
+      if (n === c + 1) openEast(i, j); else if (n === c - 1) openEast(i - 1, j);
+      else if (n === c + nCx) openSouth(i, j); else openSouth(i, j - 1);
+      seen[n] = 1;
+      stack.push(n);
+    }
+    // loops: knock out about a quarter of the walls still standing
+    for (let j = 0; j < nCy; j++) for (let i = 0; i < nCx; i++) {
+      if (i < nCx - 1 && east[j * nCx + i] && rnd() < 0.25) openEast(i, j);
+      if (j < nCy - 1 && south[j * nCx + i] && rnd() < 0.25) openSouth(i, j);
+    }
+    // plazas: cleared blocks of 2x2 or 3x2 cells, kept apart
+    const pl = [];
+    const plazaCell = new Uint8Array(nCx * nCy);
+    const want = ri(3, 5);
+    for (let tries = 0; pl.length < want && tries < 80; tries++) {
+      const w = ri(2, 3), h = rnd() < 0.75 ? 2 : 3;
+      if (w > nCx || h > nCy) continue;
+      const i0 = ri(0, nCx - w), j0 = ri(0, nCy - h);
+      if (pl.some((p) => i0 <= p.i + p.w && i0 + w >= p.i && j0 <= p.j + p.h && j0 + h >= p.j)) continue;
+      pl.push({ i: i0, j: j0, w, h });
+      for (let j = j0; j < j0 + h; j++) for (let i = i0; i < i0 + w; i++) {
+        plazaCell[j * nCx + i] = 1;
+        if (i < i0 + w - 1) east[j * nCx + i] = 0;
+        if (j < j0 + h - 1) south[j * nCx + i] = 0;
+      }
+      carve(1 + i0 * PITCH, 1 + j0 * PITCH, (i0 + w - 1) * PITCH + 3, (j0 + h - 1) * PITCH + 3);
+    }
+    // isolated wall posts: most go, the rest become pebbles
+    for (let j = 0; j < nCy - 1; j++) for (let i = 0; i < nCx - 1; i++) {
+      const t = ((j + 1) * PITCH) * C + (i + 1) * PITCH;
+      if (!g[t]) continue;
+      const free = !east[j * nCx + i] && !east[(j + 1) * nCx + i] && !south[j * nCx + i] && !south[j * nCx + i + 1];
+      if (free) { if (rnd() < 0.8) g[t] = 0; else kd[t] = 2; }
+    }
+    // bulges: a standing wall grows into one neighbour cell (at most one per cell) for an organic edge
+    const bulged = new Uint8Array(nCx * nCy);
+    const grow = (x0, y0, dx, dy, len) => { for (let k = 0; k < len; k++) { const t = (y0 + dy * k) * C + x0 + dx * k; g[t] = 1; kd[t] = 0; } };
+    for (let j = 0; j < nCy; j++) for (let i = 0; i < nCx; i++) {
+      const tryBulge = (ci, cj, x0, y0, dx, dy) => {
+        const cc = cj * nCx + ci;
+        if (bulged[cc] || plazaCell[cc]) return;
+        bulged[cc] = 1;
+        const r = rnd(), len = r < 0.5 ? 3 : 2, off = len === 2 && r > 0.75 ? 1 : 0;
+        grow(x0 + dx * off, y0 + dy * off, dx, dy, len);
+      };
+      if (i < nCx - 1 && east[j * nCx + i] && rnd() < 0.2) {
+        if (rnd() < 0.5) tryBulge(i, j, i * PITCH + 3, 1 + j * PITCH, 0, 1);
+        else tryBulge(i + 1, j, (i + 1) * PITCH + 1, 1 + j * PITCH, 0, 1);
+      }
+      if (j < nCy - 1 && south[j * nCx + i] && rnd() < 0.2) {
+        if (rnd() < 0.5) tryBulge(i, j, 1 + i * PITCH, j * PITCH + 3, 1, 0);
+        else tryBulge(i, j + 1, 1 + i * PITCH, (j + 1) * PITCH + 1, 1, 0);
+      }
+    }
+    // pebble clusters inside plazas
+    const plz = pl.map((p) => {
+      const x0 = 1 + p.i * PITCH, y0 = 1 + p.j * PITCH, x1 = (p.i + p.w - 1) * PITCH + 3, y1 = (p.j + p.h - 1) * PITCH + 3;
+      if (rnd() < 0.75) {
+        const rx = ri(x0 + 2, x1 - 2), ry = ri(y0 + 2, y1 - 2);
+        const set = (x, y) => { g[y * C + x] = 1; kd[y * C + x] = 2; };
+        set(rx, ry);
+        const extra = ri(0, 2);
+        for (let k = 0; k < extra; k++) {
+          const d = ri(0, 3), x = rx + [1, -1, 0, 0][d], y = ry + [0, 0, 1, -1][d];
+          if (x > x0 + 1 && x < x1 - 1 && y > y0 + 1 && y < y1 - 1) set(x, y);
+        }
+      }
+      return { x0, y0, x1, y1, cx: Math.floor((x0 + x1) / 2), cy: Math.floor((y0 + y1) / 2) };
+    });
+    // keep only the largest connected open region
+    const comp = new Int32Array(C * R).fill(-1);
+    const q = new Int32Array(C * R);
+    let best = -1, bestN = 0, id = 0;
+    for (let s = 0; s < C * R; s++) {
+      if (g[s] || comp[s] >= 0) continue;
+      let h = 0, t = 0;
+      q[t++] = s; comp[s] = id;
+      while (h < t) {
+        const c = q[h++], x = c % C;
+        if (x > 0 && !g[c - 1] && comp[c - 1] < 0) { comp[c - 1] = id; q[t++] = c - 1; }
+        if (x < C - 1 && !g[c + 1] && comp[c + 1] < 0) { comp[c + 1] = id; q[t++] = c + 1; }
+        if (c >= C && !g[c - C] && comp[c - C] < 0) { comp[c - C] = id; q[t++] = c - C; }
+        if (c < C * (R - 1) && !g[c + C] && comp[c + C] < 0) { comp[c + C] = id; q[t++] = c + C; }
+      }
+      if (t > bestN) { bestN = t; best = id; }
+      id++;
+    }
+    for (let s = 0; s < C * R; s++) {
+      if (!g[s] && comp[s] !== best) { g[s] = 1; kd[s] = 0; }
+      if (g[s] && kd[s] !== 2) kd[s] = 1;
+      const x = s % C, y = (s / C) | 0;
+      if (x === 0 || y === 0 || x === C - 1 || y === R - 1) kd[s] = 1;
+    }
+    return { grid: g, kind: kd, cols: C, rows: R, plazas: plz };
+  }
+
+  // ================================================================ grid queries, line of sight
+  const wallAt = (x, y) => x < 0 || y < 0 || x >= cols || y >= rows || grid[y * cols + x] === 1;
+  const wallPt = (tx, ty) => wallAt(Math.floor(tx), Math.floor(ty));
+  const inMap = (tx, ty) => tx >= 0 && ty >= 0 && tx < cols && ty < rows;
+
+  /** Supercover grid raycast: true if no wall tile lies on the segment. */
+  function los(x0, y0, x1, y1) {
+    let ix = Math.floor(x0), iy = Math.floor(y0);
+    const ex = Math.floor(x1), ey = Math.floor(y1);
+    if (wallAt(ix, iy) || wallAt(ex, ey)) return false;
+    const dx = x1 - x0, dy = y1 - y0;
+    const sx = dx > 0 ? 1 : -1, sy = dy > 0 ? 1 : -1;
+    const tdx = dx !== 0 ? Math.abs(1 / dx) : Infinity, tdy = dy !== 0 ? Math.abs(1 / dy) : Infinity;
+    let tmx = dx > 0 ? (ix + 1 - x0) * tdx : dx < 0 ? (x0 - ix) * tdx : Infinity;
+    let tmy = dy > 0 ? (iy + 1 - y0) * tdy : dy < 0 ? (y0 - iy) * tdy : Infinity;
+    let n = Math.abs(ex - ix) + Math.abs(ey - iy);
+    while (n > 0) {
+      if (Math.abs(tmx - tmy) < 1e-9) {
+        if (wallAt(ix + sx, iy) || wallAt(ix, iy + sy)) return false; // grazing a corner counts as blocked
+        ix += sx; iy += sy; tmx += tdx; tmy += tdy; n -= 2;
+      } else if (tmx < tmy) { ix += sx; tmx += tdx; n--; } else { iy += sy; tmy += tdy; n--; }
+      if (wallAt(ix, iy)) return false;
+    }
+    return true;
+  }
+  /** Line of sight for a body of half-width w (three parallel rays). */
+  function losWide(x0, y0, x1, y1, w) {
+    if (!los(x0, y0, x1, y1)) return false;
+    const dx = x1 - x0, dy = y1 - y0, d = Math.hypot(dx, dy);
+    if (d < 1e-6) return true;
+    const nx = (-dy / d) * w, ny = (dx / d) * w;
+    return los(x0 + nx, y0 + ny, x1 + nx, y1 + ny) && los(x0 - nx, y0 - ny, x1 - nx, y1 - ny);
+  }
+  function canSee(a, c) {
+    const dx = c.tx - a.tx, dy = c.ty - a.ty, v = tw('vision');
+    return dx * dx + dy * dy <= v * v && los(a.tx, a.ty, c.tx, c.ty);
+  }
+  /** Nudge a point out of wall margins; returns a shared {x,y} or null when the point is in a wall. */
+  const FIT = { x: 0, y: 0 };
+  function fitPoint(tx, ty, r) {
+    if (!inMap(tx, ty) || wallPt(tx, ty)) return null;
+    let x = tx, y = ty;
+    for (let it = 0; it < 3; it++) {
+      const ix = Math.floor(x), iy = Math.floor(y);
+      for (let yy = iy - 1; yy <= iy + 1; yy++) for (let xx = ix - 1; xx <= ix + 1; xx++) {
+        if (!wallAt(xx, yy)) continue;
+        const qx = x < xx ? xx : x > xx + 1 ? xx + 1 : x, qy = y < yy ? yy : y > yy + 1 ? yy + 1 : y;
+        const ex = x - qx, ey = y - qy, e = Math.hypot(ex, ey);
+        if (e < r && e > 1e-6) { x += (ex / e) * (r - e); y += (ey / e) * (r - e); }
+      }
+    }
+    if (wallPt(x, y)) return null;
+    FIT.x = x; FIT.y = y;
+    return FIT;
+  }
+
+  // ================================================================ way home: BFS distance + string-pulled waypoints
+  function downhill(c, dist) {
+    const x = c % cols, y = (c / cols) | 0;
+    let best = c, bd = dist[c];
+    const test = (t) => { if (dist[t] >= 0 && dist[t] < bd) { bd = dist[t]; best = t; } };
+    if (x > 0) test(c - 1);
+    if (x < cols - 1) test(c + 1);
+    if (y > 0) test(c - cols);
+    if (y < rows - 1) test(c + cols);
+    for (let dy = -1; dy <= 1; dy += 2) for (let dx = -1; dx <= 1; dx += 2) {
+      if (!wallAt(x + dx, y) && !wallAt(x, y + dy) && !wallAt(x + dx, y + dy)) test(c + dy * cols + dx);
+    }
+    return best;
+  }
+  function buildField(b) {
+    const N = cols * rows, dist = new Int32Array(N).fill(-1), q = new Int32Array(N);
+    let h = 0, t = 0;
+    dist[b.tile] = 0; q[t++] = b.tile;
+    while (h < t) {
+      const c = q[h++], x = c % cols, nd = dist[c] + 1;
+      if (x > 0 && !grid[c - 1] && dist[c - 1] < 0) { dist[c - 1] = nd; q[t++] = c - 1; }
+      if (x < cols - 1 && !grid[c + 1] && dist[c + 1] < 0) { dist[c + 1] = nd; q[t++] = c + 1; }
+      if (c >= cols && !grid[c - cols] && dist[c - cols] < 0) { dist[c - cols] = nd; q[t++] = c - cols; }
+      if (c < N - cols && !grid[c + cols] && dist[c + cols] < 0) { dist[c + cols] = nd; q[t++] = c + cols; }
+    }
+    const wp = new Int32Array(N).fill(-1);
+    const chain = new Int32Array(16);
+    for (let c = 0; c < N; c++) {
+      if (dist[c] < 0) continue;
+      let cur = c, n = 0;
+      while (n < 16 && dist[cur] > 0) { cur = downhill(cur, dist); chain[n++] = cur; }
+      if (!n) { wp[c] = c; continue; }
+      const x0 = (c % cols) + 0.5, y0 = ((c / cols) | 0) + 0.5;
+      let pick = chain[0];
+      for (let k = 1; k < n; k++) {
+        const w = chain[k];
+        if (losWide(x0, y0, (w % cols) + 0.5, ((w / cols) | 0) + 0.5, 0.3)) pick = w; else break;
+      }
+      wp[c] = pick;
+    }
+    return { dist, wp };
+  }
+
+  // ================================================================ entities
+  class Base {
+    constructor(i, tx, ty) { this.index = i; this.tx = tx; this.ty = ty; this.color = COLONY[i]; this.stored = 0; this.pulse = 0; }
+    get x() { return OX + this.tx * T; }
+    get y() { return OY + this.ty * T; }
+    get tile() { return Math.floor(this.ty) * cols + Math.floor(this.tx); }
+    // lets tests use either ant.base.x or bases[ant.base]
+    valueOf() { return this.index; }
+    toString() { return String(this.index); }
+  }
+
+  class Ant {
+    constructor(base) {
+      this.base = base;
+      this.tx = base.tx; this.ty = base.ty;
+      this.h = Math.random() * TAU; this.hc = 1; this.hs = 0; this.v = 0;
+      this.state = 'home'; this.target = null; this.visited = new Set();
+      this.carry = false; this.hidden = false; this.hideT = 0; this.vis = 1; this.goHole = false;
+      this.scanT = Math.random() * 0.25; this.lost = 0;
+      this.sf = U.rand(0.86, 1.14);                  // personal speed factor
+      this.zf = U.rand(2.4, 3.8); this.zp = Math.random() * TAU; this.nz = 0; // zig-zag
+      this.phase = Math.random() * TAU; this.pause = 0;
+      this.mx = base.tx; this.my = base.ty; this.millT = 0;
+      this.sepX = 0; this.sepY = 0; this.unstuck = 0; this.stuckT = 0; this.bestM = Infinity;
+      this.flagMask = 0; this.trailAcc = 0;
+    }
+    get x() { return OX + this.tx * T; }
+    set x(v) { this.tx = (v - OX) / T; }
+    get y() { return OY + this.ty * T; }
+    set y(v) { this.ty = (v - OY) / T; }
+  }
+
+  class Cube {
+    constructor(tx, ty) { this.id = nextCubeId++; this.tx = tx; this.ty = ty; this.bites = 0; this.born = simTime; this.hit = 0; this.dead = false; this.r = Math.random(); }
+    get x() { return OX + this.tx * T; }
+    get y() { return OY + this.ty * T; }
+  }
+
+  class Flag {
+    constructor(tx, ty, slot) { this.slot = slot; this.bit = 1 << slot; this.tx = tx; this.ty = ty; this.count = 0; this.born = simTime; this.hit = 0; }
+    get x() { return OX + this.tx * T; }
+    get y() { return OY + this.ty * T; }
+  }
+
+  // ---------------------------------------------------------------- particles (pooled)
+  const P_CRUMB = 0, P_PUFF = 1, P_RING = 2, P_SPARK = 3, P_GRAIN = 4, P_DUST = 5;
+  const parts = [];
+  for (let i = 0; i < PART_CAP; i++) parts.push({ on: false, type: 0, x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, size: 0, color: '#fff', rot: 0 });
+  let partIdx = 0;
+  function spawn(type, x, y, vx, vy, life, size, color) {
+    if (silent) return;
+    const p = parts[partIdx];
+    partIdx = (partIdx + 1) % PART_CAP;
+    p.on = true; p.type = type; p.x = x; p.y = y; p.vx = vx; p.vy = vy; p.life = life; p.max = life; p.size = size; p.color = color || '#fff'; p.rot = Math.random() * TAU;
+  }
+  function burst(type, x, y, n, speed, life, size, color) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * TAU, s = speed * U.rand(0.4, 1);
+      spawn(type, x, y, Math.cos(a) * s, Math.sin(a) * s, life * U.rand(0.7, 1.2), size * U.rand(0.7, 1.2), color);
+    }
+  }
+  function updateParticles(dt) {
+    for (let i = 0; i < PART_CAP; i++) {
+      const p = parts[i];
+      if (!p.on) continue;
+      p.life -= dt;
+      if (p.life <= 0) { p.on = false; continue; }
+      const f = Math.exp(-dt * 5);
+      p.vx *= f; p.vy *= f;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.rot += dt * 4;
+    }
+  }
+
+  // ---------------------------------------------------------------- scent trail (ring buffer, tile units)
+  const TR = { x: new Float32Array(TRAIL_CAP), y: new Float32Array(TRAIL_CAP), t: new Float32Array(TRAIL_CAP).fill(-1e9), c: new Uint8Array(TRAIL_CAP), i: 0 };
+  function pushTrail(x, y, c) {
+    const i = TR.i;
+    TR.x[i] = x; TR.y[i] = y; TR.t[i] = simTime; TR.c[i] = c;
+    TR.i = (i + 1) % TRAIL_CAP;
+  }
+
+  // ================================================================ world setup
+  function randomSeed() { return 10000 + Math.floor(Math.random() * 89999); }
+
+  function newMap(sd, opts = {}) {
+    seed = sd != null && isFinite(sd) ? Math.abs(Math.floor(sd)) % 1000000 : randomSeed();
+    const pr = Kit.playRect;
+    const tt = U.clamp(pr.w / 60, 18, 24);
+    const nCx = Math.max(6, Math.round((pr.w / tt - 1) / PITCH));
+    const nCy = Math.max(4, Math.round((pr.h / tt - 1) / PITCH));
+    const m = genMaze(seed, nCx, nCy);
+    grid = m.grid; kind = m.kind; cols = m.cols; rows = m.rows; plazas = m.plazas;
+    cubes.length = 0;
+    flags.length = 0;
+    placeBases(tw('nests'));
+    clearFx();
+    if (!opts.quiet) {
+      Kit.sfx('whoosh', { pitch: 1.25 });
+      Kit.toast(word('New map', 'New map') + ' · seed ' + seed, { tone: 'info' });
+    }
+    if (ui.seedNote) { ui.seedNote.label = 'Map seed ' + seed; Kit.rebuildTweaks(); }
+    layout({ crossfade: !opts.quiet });
+    syncStats(true);
+    return seed;
+  }
+
+  function placeBases(n) {
+    const rnd = U.mulberry32(Math.imul(seed, 31) + n * 7919);
+    const cand = [];
+    for (let y = 2; y < rows - 2; y++) for (let x = 2; x < cols - 2; x++) {
+      let ok = true;
+      for (let dy = -1; dy <= 1 && ok; dy++) for (let dx = -1; dx <= 1; dx++) if (grid[(y + dy) * cols + x + dx]) { ok = false; break; }
+      if (ok) cand.push(y * cols + x);
+    }
+    bases.length = 0;
+    for (let k = 0; k < n && cand.length; k++) {
+      let best = cand[Math.floor(rnd() * cand.length)], bestScore = -1;
+      if (k > 0) {
+        for (let s = 0; s < 80; s++) {
+          const c = cand[Math.floor(rnd() * cand.length)], x = c % cols, y = (c / cols) | 0;
+          let md = 1e9;
+          for (const b of bases) md = Math.min(md, Math.hypot(b.tx - x - 0.5, b.ty - y - 0.5));
+          // spread out, but keep a little away from the outer hedge
+          const edge = Math.min(x, y, cols - 1 - x, rows - 1 - y);
+          const score = md - (edge < 4 ? (4 - edge) * 1.5 : 0) + rnd() * 2;
+          if (score > bestScore) { bestScore = score; best = c; }
+        }
+      }
+      bases.push(new Base(k, (best % cols) + 0.5, ((best / cols) | 0) + 0.5));
+    }
+    fields = bases.map(buildField);
+    for (const f of flags) f.count = 0;
+    spawnAll();
+  }
+
+  function spawnAll() {
+    ants.length = 0;
+    for (const b of bases) for (let i = 0; i < tw('perNest'); i++) spawnAnt(b, Math.random() < 0.45);
+  }
+  function spawnAnt(b, hidden) {
+    const a = new Ant(b);
+    if (hidden) { a.hidden = true; a.vis = 0; a.hideT = U.rand(0.3, 4); }
+    else { pickMill(a); a.tx = a.mx; a.ty = a.my; a.millT = U.rand(0, 2); pickMill(a); }
+    ants.push(a);
+    return a;
+  }
+  /** Match the ant count of every nest to the tweak (adds at the nest, removes idle ants first). */
+  function syncAntCount() {
+    const per = tw('perNest');
+    for (const b of bases) {
+      let mine = 0;
+      for (const a of ants) if (a.base === b) mine++;
+      while (mine < per) { spawnAnt(b, true).hideT = U.rand(0.1, 1.5); mine++; }
+      for (let pass = 0; pass < 2 && mine > per; pass++) {
+        for (let i = ants.length - 1; i >= 0 && mine > per; i--) {
+          const a = ants[i];
+          if (a.base !== b || (pass === 0 && a.state !== 'home')) continue;
+          ants.splice(i, 1); mine--;
+        }
+      }
+    }
+  }
+
+  function clearFx() {
+    TR.t.fill(-1e9);
+    for (const p of parts) p.on = false;
+  }
+
+  /** Example scene: four cubes leading from the first nest toward the nearest plaza, plus a flag on the way. */
+  function placeExample() {
+    if (!bases.length || !plazas.length) return;
+    const b = bases[0], f = fields[0];
+    const openNear = (p) => {
+      let best = -1, bd = 1e9;
+      for (let y = p.y0; y <= p.y1; y++) for (let x = p.x0; x <= p.x1; x++) {
+        const t = y * cols + x;
+        if (grid[t] || f.dist[t] < 0) continue;
+        const d = Math.abs(x - p.cx) + Math.abs(y - p.cy);
+        if (d < bd) { bd = d; best = t; }
+      }
+      return best;
+    };
+    let goal = -1, gs = Infinity;
+    for (const p of plazas) {
+      const t = openNear(p);
+      if (t < 0) continue;
+      const d = f.dist[t], score = d < 10 ? d + 1000 : d;
+      if (score < gs) { gs = score; goal = t; }
+    }
+    if (goal < 0) return;
+    const path = [];
+    for (let cur = goal; f.dist[cur] > 0; cur = downhill(cur, f.dist)) path.push(cur);
+    path.reverse();
+    const tc = (t) => [(t % cols) + 0.5, ((t / cols) | 0) + 0.5];
+    let [px, py] = [b.tx, b.ty];
+    let idx = -1;
+    const stops = [];
+    for (let k = 0; k < 4; k++) {
+      let pick = -1;
+      for (let j = idx + 1; j < path.length; j++) {
+        const [x, y] = tc(path[j]), d = Math.hypot(x - px, y - py);
+        if (d > 6) break;
+        if (d >= 3.4 && losWide(px, py, x, y, 0.25)) pick = j;
+      }
+      if (pick < 0) pick = Math.min(path.length - 1, idx + 3);
+      if (pick <= idx) break;
+      const [x, y] = tc(path[pick]);
+      if (addCube(x, y)) stops.push(pick);
+      px = x; py = y; idx = pick;
+    }
+    if (stops.length >= 2) {
+      const j = Math.round((stops[stops.length - 2] + stops[stops.length - 1]) / 2);
+      const [x, y] = tc(path[j]);
+      addFlag(x, y);
+    }
+  }
+
+  // ================================================================ simulation
+  function pickMill(a) {
+    const b = a.base;
+    for (let k = 0; k < 8; k++) {
+      const ang = Math.random() * TAU, r = U.rand(0.9, MILL_R);
+      const x = b.tx + Math.cos(ang) * r, y = b.ty + Math.sin(ang) * r;
+      if (fitPoint(x, y, 0.35) && Math.abs(FIT.x - x) + Math.abs(FIT.y - y) < 0.05 && los(b.tx, b.ty, x, y)) { a.mx = x; a.my = y; return; }
+    }
+    a.mx = b.tx + U.rand(-0.6, 0.6); a.my = b.ty + U.rand(-0.6, 0.6);
+  }
+
+  // scan scratch (reused, no per-scan allocation)
+  const scanC = [], scanD = [];
+  /** Closest cube this ant can see and has not bitten on this trip, or null. */
+  function scan(a) {
+    const n = cubes.length;
+    if (!n) return null;
+    const v = tw('vision'), r2 = v * v;
+    let m = 0;
+    for (let i = 0; i < n; i++) {
+      const c = cubes[i];
+      if (a.visited.has(c)) continue;
+      const dx = c.tx - a.tx, dy = c.ty - a.ty, d2 = dx * dx + dy * dy;
+      if (d2 > r2) continue;
+      scanC[m] = c; scanD[m] = d2; m++;
+    }
+    for (let tries = 0; tries < m && tries < 48; tries++) {
+      let k = -1, bd = Infinity;
+      for (let i = 0; i < m; i++) if (scanD[i] < bd) { bd = scanD[i]; k = i; }
+      if (k < 0) break;
+      const c = scanC[k];
+      if (los(a.tx, a.ty, c.tx, c.ty)) { scanC.length = 0; scanD.length = 0; return c; }
+      scanD[k] = Infinity;
+    }
+    scanC.length = 0; scanD.length = 0;
+    return null;
+  }
+
+  function setState(a, s) { a.state = s; a.bestM = Infinity; a.stuckT = 0; a.lost = 0; }
+  function setSeek(a, c) {
+    if (a.state !== 'seek') {
+      if (a.state === 'home') {
+        // a short, individual reaction delay turns a crowd into a stream
+        if (a.hidden) a.hideT = Math.min(a.hideT, U.rand(0.15, 2.2));
+        else { a.pause = Math.max(a.pause, Math.random() * Math.random() * 1.2); a.v = 0; }
+        a.goHole = false;
+      }
+      setState(a, 'seek');
+    }
+    if (a.target !== c) { a.bestM = Infinity; a.stuckT = 0; }
+    a.target = c; a.lost = 0;
+  }
+  function giveUp(a) {
+    a.target = null;
+    if (a.state === 'seek') setState(a, a.hidden ? 'home' : 'return');
+  }
+  function retarget(a) {
+    const c = scan(a);
+    if (c) setSeek(a, c); else giveUp(a);
+  }
+  /** Periodic look-around (every 0.15–0.25 s per ant). */
+  function think(a, interval) {
+    if (!cubes.length) { if (a.state === 'seek') giveUp(a); return; }
+    const c = scan(a);
+    if (c) { setSeek(a, c); return; }
+    // brief occlusion while sliding past a corner: keep going for one more look
+    if (a.state === 'seek' && a.target && !a.target.dead && (a.lost += interval) < 0.45) return;
+    if (a.state === 'seek') giveUp(a);
+  }
+
+  function bite(a, c) {
+    c.bites++; totalBites++;
+    c.hit = 1;
+    a.visited.add(c);
+    a.carry = true;
+    a.pause = U.rand(0.16, 0.3);
+    spawn(P_CRUMB, c.tx, c.ty - 0.15, U.rand(-1.6, 1.6), U.rand(-1.8, -0.4), 0.5, 0.09);
+    spawn(P_CRUMB, c.tx, c.ty - 0.1, U.rand(-1.6, 1.6), U.rand(-1.2, 0.4), 0.45, 0.07);
+    if (!silent) Kit.sfx('bite', { gap: 70, pitch: U.rand(0.85, 1.3), vol: 0.5 });
+    if (c.bites >= tw('bites')) killCube(c, 'eaten');
+    else retarget(a);
+  }
+
+  function arriveHome(a) {
+    const b = a.base;
+    if (a.carry) {
+      a.carry = false;
+      b.stored++;
+      b.pulse = 1;
+      spawn(P_RING, b.tx, b.ty, 0, 0, 0.5, 1.3, b.color);
+      if (!silent) Kit.sfx('bloop', { gap: 140, vol: 0.22, pitch: U.rand(1.1, 1.5) });
+      if (Math.random() < 0.5) a.goHole = true;
+    }
+    a.visited.clear();
+    a.flagMask = 0;
+    a.target = null;
+    setState(a, 'home');
+    a.millT = 0;
+    const c = scan(a);
+    if (c) setSeek(a, c);
+  }
+
+  function hide(a, dur) { a.hidden = true; a.hideT = dur; a.goHole = false; a.v = 0; }
+  function emerge(a) {
+    const b = a.base;
+    a.hidden = false;
+    a.tx = b.tx + U.rand(-0.12, 0.12); a.ty = b.ty + U.rand(-0.12, 0.12);
+    a.h = a.state === 'seek' && a.target ? Math.atan2(a.target.ty - a.ty, a.target.tx - a.tx) : Math.random() * TAU;
+    a.v = 0; a.millT = 0;
+  }
+
+  function countFlag(a, f) {
+    a.flagMask |= f.bit;
+    f.count++;
+    f.hit = 1;
+    spawn(P_RING, f.tx, f.ty, 0, 0, 0.6, 1.2, SHAPE.yellow);
+    if (silent) return;
+    Kit.sfx('join', { gap: 110, vol: 0.5, pitch: U.rand(0.95, 1.2) });
+    if (!seenOnce.flagHit) { seenOnce.flagHit = true; Kit.toast(word('An ant reached the flag', 'An agent reached the goal'), { tone: 'good' }); }
+  }
+
+  // separation through Kit.SpatialHash (tile units); the visitor is defined once to avoid per-ant closures
+  const spatial = new Kit.SpatialHash(1);
+  let sepA = null, sepX = 0, sepY = 0;
+  function sepVisit(b) {
+    if (b === sepA || b.hidden) return;
+    const dx = sepA.tx - b.tx, dy = sepA.ty - b.ty, d2 = dx * dx + dy * dy;
+    if (d2 > LANE_R * LANE_R || d2 < 1e-8) return;
+    const d = Math.sqrt(d2);
+    if (d < SEP_R) { const f = (SEP_R - d) / SEP_R; sepX += (dx / d) * f; sepY += (dy / d) * f; }
+    // oncoming traffic: both sidestep to their right, which sorts two-way streams into lanes
+    const ca = sepA.hc, sa = sepA.hs;
+    if (ca * b.hc + sa * b.hs < -0.4 && dx * ca + dy * sa < 0) {
+      const f = (1 - d / LANE_R) * 0.75;
+      sepX -= sa * f; sepY += ca * f;
+    }
+  }
+  function computeSeparation() {
+    spatial.clear();
+    for (let i = 0; i < ants.length; i++) {
+      const a = ants[i];
+      a.hc = Math.cos(a.h); a.hs = Math.sin(a.h);
+      if (!a.hidden) spatial.insert(a, a.tx, a.ty);
+    }
+    for (let i = 0; i < ants.length; i++) {
+      const a = ants[i];
+      if (a.hidden) continue;
+      sepA = a; sepX = 0; sepY = 0;
+      spatial.query(a.tx, a.ty, LANE_R, sepVisit);
+      let sx = sepX * 2, sy = sepY * 2;
+      const m = Math.hypot(sx, sy);
+      if (m > 1.6) { sx *= 1.6 / m; sy *= 1.6 / m; }
+      a.sepX = sx; a.sepY = sy;
+    }
+    sepA = null;
+  }
+
+  /** Push an ant's body out of wall tiles; rescue it if its centre ended inside one. */
+  function collide(a) {
+    for (let it = 0; it < 2; it++) {
+      const ix = Math.floor(a.tx), iy = Math.floor(a.ty);
+      if (wallAt(ix, iy)) { rescue(a); return; }
+      for (let yy = iy - 1; yy <= iy + 1; yy++) for (let xx = ix - 1; xx <= ix + 1; xx++) {
+        if (!wallAt(xx, yy)) continue;
+        const qx = a.tx < xx ? xx : a.tx > xx + 1 ? xx + 1 : a.tx;
+        const qy = a.ty < yy ? yy : a.ty > yy + 1 ? yy + 1 : a.ty;
+        const ex = a.tx - qx, ey = a.ty - qy, e2 = ex * ex + ey * ey;
+        if (e2 < ANT_R * ANT_R && e2 > 1e-10) { const e = Math.sqrt(e2), k = (ANT_R - e) / e; a.tx += ex * k; a.ty += ey * k; }
+      }
+    }
+  }
+  function rescue(a) {
+    const ix = Math.floor(a.tx), iy = Math.floor(a.ty);
+    let best = null, bd = Infinity;
+    for (let r = 1; r <= 3 && !best; r++) {
+      for (let yy = iy - r; yy <= iy + r; yy++) for (let xx = ix - r; xx <= ix + r; xx++) {
+        if (wallAt(xx, yy)) continue;
+        const cx = U.clamp(a.tx, xx + ANT_R, xx + 1 - ANT_R), cy = U.clamp(a.ty, yy + ANT_R, yy + 1 - ANT_R);
+        const d = U.dist2(a.tx, a.ty, cx, cy);
+        if (d < bd) { bd = d; best = [cx, cy]; }
+      }
+    }
+    if (best) { a.tx = best[0]; a.ty = best[1]; } else { a.tx = a.base.tx; a.ty = a.base.ty; }
+  }
+
+  function stepAnts(h) {
+    const spdBase = tw('speed');
+    const STRIDE = TAU / (0.95 * 0.42); // one gait cycle per ~0.4 body lengths
+    for (let i = 0; i < ants.length; i++) {
+      const a = ants[i], b = a.base;
+      a.scanT -= h;
+      if (a.scanT <= 0) { const iv = U.rand(0.15, 0.25); a.scanT += iv; think(a, iv); }
+      if (a.hidden) {
+        a.vis = Math.max(0, a.vis - h * 6);
+        if ((a.hideT -= h) <= 0) emerge(a);
+        continue;
+      }
+      if (a.vis < 1) a.vis = Math.min(1, a.vis + h * 5);
+      if (a.pause > 0) a.pause -= h;
+
+      // goal for this state
+      let gx, gy, spd = spdBase * a.sf, idle = false;
+      if (a.state === 'seek' && a.target) { gx = a.target.tx; gy = a.target.ty; }
+      else if (a.state === 'return') {
+        const w = fields[b.index].wp[Math.floor(a.ty) * cols + Math.floor(a.tx)];
+        if (w >= 0 && w !== b.tile) { gx = (w % cols) + 0.5; gy = ((w / cols) | 0) + 0.5; } else { gx = b.tx; gy = b.ty; }
+      } else if (a.goHole) { gx = b.tx; gy = b.ty; spd *= 0.6; }
+      else {
+        if ((a.millT -= h) <= 0) { pickMill(a); a.millT = U.rand(1.2, 3.6); if (Math.random() < 0.2) a.goHole = true; }
+        gx = a.mx; gy = a.my; spd *= 0.42;
+        idle = U.dist2(a.tx, a.ty, gx, gy) < 0.09;
+      }
+
+      // steering: smooth turn toward the goal with an ant-like zig-zag
+      const dx = gx - a.tx, dy = gy - a.ty, d = Math.sqrt(dx * dx + dy * dy);
+      a.nz += ((Math.random() * 2 - 1) * 7 - a.nz * 3) * h;
+      let want = d > 1e-4 ? Math.atan2(dy, dx) : a.h;
+      want += (Math.sin(simTime * a.zf + a.zp) * 0.3 + a.nz * 0.1) * U.clamp(d - 0.4, 0, 1);
+      const dA = U.angleDiff(a.h, want);
+      const turn = Math.max(7, spd * 2.8) * h;
+      a.h += dA > turn ? turn : dA < -turn ? -turn : dA;
+      let vt = a.pause > 0 || idle ? 0 : spd * (1 - 0.55 * Math.min(1, Math.abs(dA) / 1.6));
+      a.v += (vt - a.v) * Math.min(1, h * 7);
+      const c = Math.cos(a.h), s = Math.sin(a.h);
+      let vx = c * a.v, vy = s * a.v;
+      if (a.unstuck > 0) a.unstuck -= h; else { vx += a.sepX; vy += a.sepY; }
+
+      // walls push gently, so streams keep off the hedges
+      const ix = Math.floor(a.tx), iy = Math.floor(a.ty);
+      let rx = 0, ry = 0;
+      for (let yy = iy - 1; yy <= iy + 1; yy++) for (let xx = ix - 1; xx <= ix + 1; xx++) {
+        if (!wallAt(xx, yy)) continue;
+        const qx = a.tx < xx ? xx : a.tx > xx + 1 ? xx + 1 : a.tx;
+        const qy = a.ty < yy ? yy : a.ty > yy + 1 ? yy + 1 : a.ty;
+        const ex = a.tx - qx, ey = a.ty - qy, e2 = ex * ex + ey * ey;
+        if (e2 < WALL_FEEL * WALL_FEEL && e2 > 1e-10) { const e = Math.sqrt(e2), f = (WALL_FEEL - e) / WALL_FEEL; rx += (ex / e) * f; ry += (ey / e) * f; }
+      }
+      vx += rx * 1.6; vy += ry * 1.6;
+
+      const px = a.tx, py = a.ty;
+      a.tx += vx * h; a.ty += vy * h;
+      collide(a);
+      const moved = Math.hypot(a.tx - px, a.ty - py);
+      a.phase += moved * STRIDE;
+
+      // events
+      if (a.state === 'seek' && a.target) {
+        const t = a.target, ex = t.tx - a.tx, ey = t.ty - a.ty;
+        if (ex * ex + ey * ey < TOUCH_R * TOUCH_R) bite(a, t);
+      } else if (a.state === 'return') {
+        if (U.dist2(a.tx, a.ty, b.tx, b.ty) < HOME_R * HOME_R) arriveHome(a);
+      } else if (a.goHole && U.dist2(a.tx, a.ty, b.tx, b.ty) < 0.09) hide(a, U.rand(0.8, 3));
+      for (let k = 0; k < flags.length; k++) {
+        const f = flags[k];
+        if (!(a.flagMask & f.bit) && U.dist2(a.tx, a.ty, f.tx, f.ty) < FLAG_R * FLAG_R) countFlag(a, f);
+      }
+      if (a.state !== 'home' && moved > 0) {
+        a.trailAcc += moved;
+        if (a.trailAcc >= 0.34) { a.trailAcc = 0; pushTrail(a.tx - c * 0.3, a.ty - s * 0.3, b.index); }
+      }
+      // watchdog: no progress for a while → ignore the crowd briefly and wiggle free
+      if (a.state !== 'home' && a.pause <= 0) {
+        const m = a.state === 'seek' ? d : fields[b.index].dist[Math.floor(a.ty) * cols + Math.floor(a.tx)];
+        if (m < a.bestM - 0.3) { a.bestM = m; a.stuckT = 0; }
+        else if ((a.stuckT += h) > 2.2) { a.unstuck = 0.8; a.stuckT = 0; a.bestM = m; a.h += U.rand(-1.2, 1.2); }
+      }
+    }
+  }
+
+  function update(dt) {
+    if (!grid) return;
+    simTime += dt;
+    computeSeparation();
+    const n = Math.max(1, Math.ceil((dt * (tw('speed') + 5)) / 0.3));
+    for (let k = 0; k < n; k++) stepAnts(dt / n);
+    for (const c of cubes) c.hit = Math.max(0, c.hit - dt * 5);
+    for (const f of flags) f.hit = Math.max(0, f.hit - dt * 4);
+    for (const b of bases) b.pulse = Math.max(0, b.pulse - dt * 2.5);
+    updateParticles(dt);
+  }
+
+  /** Run the simulation synchronously (pre-warm and tests). */
+  function simulate(sec) {
+    const was = silent;
+    silent = true;
+    for (let t = 0; t < sec; t += 1 / 60) update(1 / 60);
+    silent = was;
+  }
+
+  // ================================================================ player actions
+  function addCube(tx, ty, opts = {}) {
+    const p = fitPoint(tx, ty, CUBE_MARGIN);
+    if (!p) return null;
+    if (opts.user) {
+      for (const c of cubes) if (U.dist2(c.tx, c.ty, p.x, p.y) < 0.64) { c.hit = 1; return null; }
+    }
+    const c = new Cube(p.x, p.y);
+    cubes.push(c);
+    if (opts.user) {
+      burst(P_SPARK, c.tx, c.ty - 0.2, 5, 3.2, 0.5, 0.22, '#fff7d6');
+      spawn(P_RING, c.tx, c.ty, 0, 0, 0.45, 0.9, '#ffffff');
+      burst(P_DUST, c.tx, c.ty + 0.15, 4, 1.2, 0.5, 0.25, '#d9b07a');
+      Kit.sfx('place', { gap: opts.paint ? 55 : 0, pitch: U.rand(0.9, 1.15) });
+    }
+    return c;
+  }
+  function killCube(c, how) {
+    const i = cubes.indexOf(c);
+    if (i < 0) return;
+    cubes.splice(i, 1);
+    c.dead = true;
+    if (how === 'eaten') {
+      burst(P_PUFF, c.tx, c.ty, 6, 2.2, 0.55, 0.45, '#fffaf0');
+      burst(P_CRUMB, c.tx, c.ty, 8, 3, 0.6, 0.09);
+      for (let k = 0; k < 5; k++) spawn(P_GRAIN, c.tx + U.rand(-0.5, 0.5), c.ty + U.rand(-0.4, 0.5), 0, 0, U.rand(4, 7), U.rand(0.05, 0.08));
+      spawn(P_RING, c.tx, c.ty, 0, 0, 0.5, 1.1, '#ffffff');
+      if (!silent) {
+        Kit.sfx('pop', { gap: 60 });
+        if (!seenOnce.eaten) {
+          seenOnce.eaten = true;
+          const n = tw('bites');
+          Kit.toast(word(`A cube is gone after ${n} bites`, `An attractor is gone after ${n} hits`), { tone: 'info', ms: 2400 });
+        }
+      }
+    } else if (how === 'user') {
+      burst(P_PUFF, c.tx, c.ty, 4, 1.6, 0.4, 0.35, '#fffaf0');
+      spawn(P_RING, c.tx, c.ty, 0, 0, 0.35, 0.8, '#ffffff');
+      Kit.sfx('remove', { gap: 40 });
+    } else if (how === 'clear') {
+      burst(P_PUFF, c.tx, c.ty, 2, 1.4, 0.35, 0.3, '#fffaf0');
+    }
+    for (const a of ants) if (a.target === c) retarget(a);
+  }
+  function clearCubes(user) {
+    if (!cubes.length) return;
+    for (const c of cubes.slice()) killCube(c, 'clear');
+    if (user) {
+      Kit.sfx('whoosh', { pitch: 0.9 });
+      Kit.toast(word('Sugar cleared', 'Attractors cleared'), { tone: 'info' });
+    }
+  }
+  function addFlag(tx, ty, user) {
+    const p = fitPoint(tx, ty, 0.4);
+    if (!p) return null;
+    const x = p.x, y = p.y;
+    if (flags.length >= MAX_FLAGS) {
+      removeFlag(flags[0], true);
+      if (user && !seenOnce.flagFull) { seenOnce.flagFull = true; Kit.toast(word('Three flags at most. The oldest one moved.', 'Three goals at most. The oldest one moved.'), { tone: 'info', ms: 2400 }); }
+    }
+    let slot = 0;
+    while (flags.some((f) => f.slot === slot)) slot++;
+    const f = new Flag(x, y, slot);
+    flags.push(f);
+    if (user) {
+      spawn(P_RING, x, y, 0, 0, 0.5, FLAG_R, SHAPE.yellow);
+      burst(P_SPARK, x, y - 1, 4, 2.5, 0.45, 0.2, '#fff3b0');
+      Kit.sfx('chirp');
+    }
+    return f;
+  }
+  function removeFlag(f, quiet) {
+    const i = flags.indexOf(f);
+    if (i < 0) return;
+    flags.splice(i, 1);
+    for (const a of ants) a.flagMask &= ~f.bit;
+    spawn(P_PUFF, f.tx, f.ty, 0, 0, 0.35, 0.6, '#fffaf0');
+    if (!quiet) Kit.sfx('remove');
+  }
+  function cubeNear(tx, ty, r) {
+    let best = null, bd = r * r;
+    for (const c of cubes) { const d = U.dist2(c.tx, c.ty, tx, ty); if (d < bd) { bd = d; best = c; } }
+    return best;
+  }
+  function flagNear(tx, ty) {
+    for (let i = flags.length - 1; i >= 0; i--) {
+      const f = flags[i];
+      // the ground spot or the cloth above it
+      if (U.dist2(f.tx, f.ty, tx, ty) < 0.7 * 0.7) return f;
+      if (!Kit.isAbstract && tx > f.tx - 0.25 && tx < f.tx + 1.05 && ty > f.ty - 1.8 && ty < f.ty) return f;
+    }
+    return null;
+  }
+  function baseNear(tx, ty) {
+    for (const b of bases) if (U.dist2(b.tx, b.ty, tx, ty) < 1.4 * 1.4) return b;
+    return null;
+  }
+  function buzzWall(tx, ty) {
+    Kit.sfx('buzz', { gap: 200 });
+    spawn(P_RING, tx, ty, 0, 0, 0.35, 0.7, SHAPE.red);
+    if (!seenOnce.wall) { seenOnce.wall = true; Kit.toast(word('Sugar only goes on open ground', 'Attractors only go on open ground'), { tone: 'bad' }); }
+  }
+  /** Primary action at a tile point with the current tool. */
+  function actAt(tx, ty) {
+    if (!inMap(tx, ty)) return null;
+    if (wallPt(tx, ty)) { buzzWall(tx, ty); return null; }
+    return tool === 'flag' ? addFlag(tx, ty, true) : addCube(tx, ty, { user: true });
+  }
+  /** Remove a cube (or flag) under a tile point. */
+  function eraseAt(tx, ty, allowFlag) {
+    const c = cubeNear(tx, ty, 0.75);
+    if (c) { killCube(c, 'user'); return true; }
+    if (allowFlag) { const f = flagNear(tx, ty); if (f) { removeFlag(f); return true; } }
+    return false;
+  }
+  function removeLastCube() {
+    const c = cubes[cubes.length - 1];
+    if (c) killCube(c, 'user');
+  }
+
+  // ================================================================ input
+  // paint drag: px/py last pointer point, lx/ly last cube, qx/qy last open point still in sight of it
+  const drag = { mode: null, px: 0, py: 0, lx: 0, ly: 0, has: false, qx: 0, qy: 0, qok: false, flag: null };
+  const kb = { on: false, tx: 0, ty: 0, mx: 0, my: 0 };
+  const toTile = (p) => [(p.x - OX) / T, (p.y - OY) / T];
+
+  /** Paint along the pointer path: a cube every PAINT_STEP tiles, plus one at a corner whenever the
+   *  next spot would be out of sight of the previous cube, so ants can always see the next link. */
+  function paintTo(tx, ty) {
+    const sx = drag.px, sy = drag.py, len = Math.hypot(tx - sx, ty - sy);
+    const n = Math.max(1, Math.ceil(len / 0.25));
+    for (let i = 1; i <= n; i++) {
+      const x = sx + ((tx - sx) * i) / n, y = sy + ((ty - sy) * i) / n;
+      if (wallPt(x, y)) continue;
+      if (drag.has && !losWide(drag.lx, drag.ly, x, y, 0.25)) {
+        if (drag.qok && U.dist(drag.lx, drag.ly, drag.qx, drag.qy) > 0.9) paintCube(drag.qx, drag.qy);
+        else if (!drag.qok) paintCube(x, y);
+      } else if (!drag.has || U.dist(drag.lx, drag.ly, x, y) >= PAINT_STEP) paintCube(x, y);
+      drag.qx = x; drag.qy = y; drag.qok = !drag.has || losWide(drag.lx, drag.ly, x, y, 0.25);
+    }
+    drag.px = tx; drag.py = ty;
+  }
+  function paintCube(x, y) {
+    const c = addCube(x, y, { user: true, paint: true });
+    const p = c || fitPoint(x, y, CUBE_MARGIN);
+    if (!p) return;
+    drag.lx = c ? c.tx : p.x; drag.ly = c ? c.ty : p.y; drag.has = true; drag.qok = true;
+  }
+  function pointerDown(p) {
+    kb.on = false;
+    const [tx, ty] = toTile(p);
+    if (!inMap(tx, ty)) return;
+    if (p.button === 2) { drag.mode = 'erase'; eraseAt(tx, ty, true); return; }
+    if (p.button !== 0) return;
+    if (tool === 'flag') {
+      const f = flagNear(tx, ty);
+      if (f) { drag.mode = 'flag'; drag.flag = f; f.hit = 1; Kit.sfx('click'); return; }
+      actAt(tx, ty);
+      return;
+    }
+    drag.mode = 'paint'; drag.px = tx; drag.py = ty; drag.has = false; drag.qok = false;
+    const c = actAt(tx, ty);
+    if (c) { drag.lx = c.tx; drag.ly = c.ty; drag.has = true; drag.qx = c.tx; drag.qy = c.ty; drag.qok = true; }
+    else {
+      // clicked an existing cube: continue the trail from it
+      const near = cubeNear(tx, ty, 0.8);
+      if (near) { drag.lx = near.tx; drag.ly = near.ty; drag.has = true; drag.qx = near.tx; drag.qy = near.ty; drag.qok = true; }
+    }
+  }
+  function pointerMove(p) {
+    if (kb.on && (Math.abs(p.x - kb.mx) > 3 || Math.abs(p.y - kb.my) > 3)) kb.on = false;
+    const [tx, ty] = toTile(p);
+    if (drag.mode === 'paint' && p.buttons & 1) paintTo(tx, ty);
+    else if (drag.mode === 'erase' && p.buttons & 2) eraseAt(tx, ty, false);
+    else if (drag.mode === 'flag' && p.buttons & 1) {
+      const q = fitPoint(tx, ty, 0.4);
+      if (q) { drag.flag.tx = q.x; drag.flag.ty = q.y; }
+    }
+  }
+  function pointerUp() { drag.mode = null; drag.flag = null; }
+
+  function setTool(t) {
+    if (t === tool) return;
+    tool = t;
+    Kit.ui.setActive(ui.bSugar, t === 'sugar');
+    Kit.ui.setActive(ui.bFlag, t === 'flag');
+    Kit.setHint(t === 'flag' ? { sprite: 'Click to plant a flag. It counts the ants that reach it.', abstract: 'Click to set a goal. It counts the agents that reach it.' } : null);
+    Kit.sfx('click');
+  }
+  function setSight(v) { Kit.ui.setActive(ui.bSight, v); }
+  function toggleSight() { Kit.setTweak('sight', !tw('sight')); Kit.sfx('toggle', { pitch: tw('sight') ? 1.2 : 0.8 }); }
+
+  function keydown(e) {
+    switch (e.code) {
+      case 'Digit1': case 'Numpad1': setTool('sugar'); return true;
+      case 'Digit2': case 'Numpad2': case 'KeyG': setTool('flag'); return true;
+      case 'KeyC': clearCubes(true); return true;
+      case 'KeyN': newMap(); return true;
+      case 'KeyL': toggleSight(); return true;
+      case 'KeyZ': removeLastCube(); return true;
+      case 'ArrowLeft': case 'ArrowRight': case 'ArrowUp': case 'ArrowDown': {
+        if (!kb.on) {
+          const inside = Kit.mouse.inside && inMap((Kit.mouse.x - OX) / T, (Kit.mouse.y - OY) / T);
+          kb.tx = inside ? Math.floor((Kit.mouse.x - OX) / T) : Math.floor(bases[0] ? bases[0].tx : cols / 2);
+          kb.ty = inside ? Math.floor((Kit.mouse.y - OY) / T) : Math.floor(bases[0] ? bases[0].ty : rows / 2);
+          kb.on = true;
+        }
+        const st = e.shiftKey ? 3 : 1;
+        if (e.code === 'ArrowLeft') kb.tx -= st;
+        if (e.code === 'ArrowRight') kb.tx += st;
+        if (e.code === 'ArrowUp') kb.ty -= st;
+        if (e.code === 'ArrowDown') kb.ty += st;
+        kb.tx = U.clamp(kb.tx, 0, cols - 1); kb.ty = U.clamp(kb.ty, 0, rows - 1);
+        kb.mx = Kit.mouse.x; kb.my = Kit.mouse.y;
+        Kit.sfx('click', { gap: 30, vol: 0.4 });
+        return true;
+      }
+      case 'Enter': case 'NumpadEnter': {
+        const [tx, ty] = cursorTile();
+        actAt(tx, ty);
+        return true;
+      }
+      case 'Delete': case 'Backspace': {
+        const [tx, ty] = cursorTile();
+        if (!eraseAt(tx, ty, true)) Kit.sfx('buzz', { gap: 200, vol: 0.6 });
+        return true;
+      }
+      default: return false;
+    }
+  }
+  function cursorTile() {
+    if (kb.on) return [kb.tx + 0.5, kb.ty + 0.5];
+    if (Kit.mouse.inside) return [(Kit.mouse.x - OX) / T, (Kit.mouse.y - OY) / T];
+    kb.on = true; kb.mx = Kit.mouse.x; kb.my = Kit.mouse.y;
+    kb.tx = Math.floor(bases[0] ? bases[0].tx : cols / 2); kb.ty = Math.floor(bases[0] ? bases[0].ty : rows / 2);
+    return [kb.tx + 0.5, kb.ty + 0.5];
+  }
+
+  // ================================================================ layout and static layers
+  let layer = null, layerPrev = null, fadeT = 0;
+  const FADE = 0.45;
+  let cubeSpr = [], cubeBad = null, cubeGhost = null;
+
+  function layout(opts = {}) {
+    if (!grid) return;
+    const pr = Kit.playRect;
+    T = Math.max(8, Math.floor(Math.min(pr.w / cols, pr.h / rows)));
+    OX = Math.round(pr.x + (pr.w - cols * T) / 2);
+    OY = Math.round(pr.y + (pr.h - rows * T) / 2);
+    if (opts.crossfade && layer) { const t = layerPrev; layerPrev = layer; layer = t; fadeT = FADE; } else fadeT = 0;
+    buildLayers();
+  }
+  function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+  function buildLayers() {
+    const dpr = Kit.dpr, W = Kit.W, H = Kit.H;
+    if (!layer) layer = makeCanvas(1, 1);
+    if (!layerPrev) layerPrev = makeCanvas(1, 1);
+    layer.width = Math.round(W * dpr); layer.height = Math.round(H * dpr);
+    const g = layer.getContext('2d');
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (Kit.isAbstract) paintShapesLayer(g, W, H); else { paintSpriteLayer(g, W, H); buildCubeSprites(); buildAntSprites(); }
+  }
+
+  // ---------------------------------------------------------------- sprite ground
+  function dots(g, rnd, n, x0, y0, w, h, s0, s1, color) {
+    g.beginPath();
+    for (let i = 0; i < n; i++) { const s = s0 + rnd() * (s1 - s0); g.rect(x0 + rnd() * w, y0 + rnd() * h, s, s); }
+    g.fillStyle = color; g.fill();
+  }
+  function blobPath(g, x, y, r) { g.moveTo(x + r, y); g.arc(x, y, r, 0, TAU); }
+  /** Deterministic blob centres for a wall tile: [x, y, r] in tiles. */
+  function hedgeBlob(t, k) {
+    const x = t % cols, y = (t / cols) | 0;
+    return [x + 0.5 + (hash(t, k) - 0.5) * 0.3, y + 0.5 + (hash(t, k + 3) - 0.5) * 0.3, 0.55 + hash(t, k + 6) * 0.12];
+  }
+  function paintSpriteLayer(g, W, H) {
+    const rnd = U.mulberry32(seed * 7 + 13);
+    const mw = cols * T, mh = rows * T;
+    // undergrowth beyond the map
+    g.fillStyle = '#17210f'; g.fillRect(0, 0, W, H);
+    g.beginPath();
+    for (let i = 0, n = (W * H) / 650; i < n; i++) blobPath(g, rnd() * W, rnd() * H, 2 + rnd() * 6);
+    g.fillStyle = 'rgba(64,98,40,0.3)'; g.fill();
+    dots(g, rnd, (W * H) / 260, 0, 0, W, H, 1, 2.5, 'rgba(0,0,0,0.22)');
+
+    // soil
+    g.save();
+    g.beginPath(); g.rect(OX, OY, mw, mh); g.clip();
+    const sg = g.createLinearGradient(OX, OY, OX + mw, OY + mh);
+    sg.addColorStop(0, '#ab7a49'); sg.addColorStop(1, '#966639');
+    g.fillStyle = sg; g.fillRect(OX, OY, mw, mh);
+    for (let i = 0; i < 50; i++) {
+      const x = OX + rnd() * mw, y = OY + rnd() * mh, r = T * (2 + rnd() * 6), light = rnd() < 0.5;
+      const rg = g.createRadialGradient(x, y, 0, x, y, r);
+      rg.addColorStop(0, light ? 'rgba(205,160,104,0.32)' : 'rgba(104,64,32,0.28)');
+      rg.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = rg; g.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+    const area = mw * mh;
+    dots(g, rnd, area / 55, OX, OY, mw, mh, 1, 2, 'rgba(92,56,26,0.35)');
+    dots(g, rnd, area / 70, OX, OY, mw, mh, 1, 2, 'rgba(214,170,116,0.32)');
+    dots(g, rnd, area / 400, OX, OY, mw, mh, 1.5, 3, 'rgba(70,40,18,0.35)');
+    // tiny pebbles and twigs
+    g.beginPath();
+    for (let i = 0, n = area / 2200; i < n; i++) { const x = OX + rnd() * mw, y = OY + rnd() * mh, r = 1 + rnd() * T * 0.07; g.moveTo(x + r, y); g.ellipse(x, y, r, r * 0.75, rnd() * 3, 0, TAU); }
+    g.fillStyle = 'rgba(214,196,170,0.55)'; g.fill();
+    g.strokeStyle = 'rgba(96,62,32,0.5)'; g.lineWidth = Math.max(1, T * 0.05); g.lineCap = 'round';
+    g.beginPath();
+    for (let i = 0, n = area / 9000; i < n; i++) {
+      const x = OX + rnd() * mw, y = OY + rnd() * mh, a = rnd() * TAU, l = T * (0.3 + rnd() * 0.5);
+      g.moveTo(x, y); g.quadraticCurveTo(x + Math.cos(a + 0.4) * l * 0.5, y + Math.sin(a + 0.4) * l * 0.5, x + Math.cos(a) * l, y + Math.sin(a) * l);
+    }
+    g.stroke();
+    g.restore();
+
+    // wall shadows (blurred, offset)
+    const walls = [];
+    for (let t = 0; t < cols * rows; t++) if (grid[t]) walls.push(t);
+    const sh = makeCanvas(layer.width, layer.height);
+    const s2 = sh.getContext('2d');
+    s2.setTransform(Kit.dpr, 0, 0, Kit.dpr, 0, 0);
+    s2.beginPath();
+    for (const t of walls) for (let k = 0; k < 3; k++) { const b = hedgeBlob(t, k); blobPath(s2, OX + b[0] * T, OY + b[1] * T, b[2] * T); }
+    s2.fillStyle = '#000'; s2.fill();
+    g.save();
+    g.globalAlpha = 0.45;
+    g.filter = `blur(${Math.max(2, T * 0.22).toFixed(1)}px)`;
+    g.drawImage(sh, T * 0.12, T * 0.2, W, H);
+    g.restore();
+
+    // hedges: dark mass, mid tones, highlights, blades
+    const hedge = walls.filter((t) => kind[t] !== 2);
+    const layerBlobs = (dxo, dyo, rs, keyOff, count, color) => {
+      g.beginPath();
+      for (const t of hedge) for (let k = 0; k < count; k++) {
+        const b = hedgeBlob(t, k + keyOff);
+        blobPath(g, OX + (b[0] + dxo) * T, OY + (b[1] + dyo) * T, b[2] * rs * T);
+      }
+      g.fillStyle = color; g.fill();
+    };
+    layerBlobs(0, 0, 1, 0, 3, '#2a561e');
+    layerBlobs(-0.05, -0.08, 0.74, 0, 2, '#386f28');
+    layerBlobs(-0.1, -0.16, 0.5, 1, 1, '#4a8a33');
+    layerBlobs(-0.16, -0.24, 0.24, 2, 1, '#69aa45');
+    const blades = (color, n, len, keyOff) => {
+      g.beginPath();
+      for (const t of hedge) {
+        const x = t % cols, y = (t / cols) | 0;
+        for (let k = 0; k < n; k++) {
+          const bx = OX + (x + 0.1 + hash(t, 20 + k + keyOff) * 0.8) * T, by = OY + (y + 0.15 + hash(t, 30 + k + keyOff) * 0.8) * T;
+          const a = -Math.PI / 2 + (hash(t, 40 + k + keyOff) - 0.5) * 1.6, l = len * T * (0.6 + hash(t, 50 + k + keyOff) * 0.6);
+          g.moveTo(bx, by); g.quadraticCurveTo(bx + Math.cos(a) * l * 0.4 + l * 0.15, by + Math.sin(a) * l * 0.5, bx + Math.cos(a) * l, by + Math.sin(a) * l);
+        }
+      }
+      g.strokeStyle = color; g.lineWidth = Math.max(1, T * 0.05); g.lineCap = 'round'; g.stroke();
+    };
+    blades('#1d3f15', 2, 0.3, 0);
+    blades('#7fc152', 3, 0.26, 7);
+    // fallen leaves and small flowers on the hedges
+    const leafCols = ['#e0962e', '#c8642a', '#e8bf4c', '#a8472a'];
+    for (const t of hedge) {
+      const x = OX + ((t % cols) + 0.5) * T, y = OY + (((t / cols) | 0) + 0.5) * T;
+      if (hash(t, 60) < 0.07) {
+        const a = hash(t, 61) * TAU, L = T * (0.28 + hash(t, 62) * 0.12);
+        g.save(); g.translate(x + (hash(t, 63) - 0.5) * T * 0.4, y + (hash(t, 64) - 0.5) * T * 0.4); g.rotate(a);
+        g.beginPath(); g.moveTo(-L, 0); g.quadraticCurveTo(0, -L * 0.62, L, 0); g.quadraticCurveTo(0, L * 0.62, -L, 0);
+        g.fillStyle = leafCols[Math.floor(hash(t, 65) * 4)]; g.fill();
+        g.strokeStyle = 'rgba(80,30,10,0.55)'; g.lineWidth = Math.max(0.8, T * 0.03);
+        g.beginPath(); g.moveTo(-L * 0.9, 0); g.lineTo(L * 0.85, 0); g.stroke();
+        g.restore();
+      } else if (hash(t, 66) < 0.05) {
+        const fx = x + (hash(t, 67) - 0.5) * T * 0.5, fy = y + (hash(t, 68) - 0.5) * T * 0.5, r = T * 0.07;
+        g.beginPath();
+        for (let k = 0; k < 5; k++) { const a = (k / 5) * TAU; blobPath(g, fx + Math.cos(a) * r * 1.2, fy + Math.sin(a) * r * 1.2, r); }
+        g.fillStyle = '#fff6e6'; g.fill();
+        g.beginPath(); blobPath(g, fx, fy, r * 0.8); g.fillStyle = '#ffc93c'; g.fill();
+      }
+    }
+    // pebbles
+    for (const t of walls) {
+      if (kind[t] !== 2) continue;
+      const x = OX + ((t % cols) + 0.5 + (hash(t, 70) - 0.5) * 0.15) * T, y = OY + (((t / cols) | 0) + 0.5 + (hash(t, 71) - 0.5) * 0.15) * T;
+      const rx = T * (0.5 + hash(t, 72) * 0.1), ry = rx * 0.8, rot = hash(t, 73) * Math.PI;
+      const pg = g.createRadialGradient(x - rx * 0.35, y - ry * 0.45, rx * 0.1, x, y, rx * 1.1);
+      pg.addColorStop(0, '#e3dbcc'); pg.addColorStop(0.6, '#b0a797'); pg.addColorStop(1, '#7e7668');
+      g.beginPath(); g.ellipse(x, y, rx, ry, rot, 0, TAU);
+      g.fillStyle = pg; g.fill();
+      g.strokeStyle = 'rgba(40,30,20,0.35)'; g.lineWidth = Math.max(1, T * 0.04); g.stroke();
+      g.beginPath(); g.ellipse(x - rx * 0.3, y - ry * 0.4, rx * 0.28, ry * 0.14, rot - 0.3, 0, TAU);
+      g.fillStyle = 'rgba(255,255,255,0.45)'; g.fill();
+      if (hash(t, 74) < 0.6) {
+        const sx = x + rx * 0.9, sy = y + ry * 0.7, sr = rx * 0.32;
+        g.beginPath(); g.ellipse(sx, sy, sr, sr * 0.8, rot, 0, TAU); g.fillStyle = '#a49b8b'; g.fill(); g.stroke();
+      }
+    }
+    // nest mounds: a ring of dug-out soil around a dark entrance
+    for (const b of bases) {
+      const x = OX + b.tx * T, y = OY + b.ty * T, r = T * 1.45;
+      g.fillStyle = 'rgba(70,38,14,0.35)';
+      g.beginPath(); g.ellipse(x + T * 0.08, y + T * 0.14, r, r * 0.92, 0, 0, TAU); g.fill();
+      const mg = g.createRadialGradient(x - T * 0.3, y - T * 0.4, T * 0.2, x, y, r);
+      mg.addColorStop(0, '#e2b47c'); mg.addColorStop(0.6, '#c99460'); mg.addColorStop(1, '#a8743f');
+      g.fillStyle = mg; g.beginPath(); g.ellipse(x, y, r, r * 0.92, 0, 0, TAU); g.fill();
+      const nr = U.mulberry32(seed + b.index * 101);
+      g.beginPath();
+      for (let i = 0; i < 90; i++) { const a = nr() * TAU, d = Math.sqrt(nr()) * T * 1.3, s = 1 + nr() * T * 0.07; g.rect(x + Math.cos(a) * d, y + Math.sin(a) * d * 0.92, s, s); }
+      g.fillStyle = 'rgba(244,212,166,0.75)'; g.fill();
+      g.beginPath();
+      for (let i = 0; i < 50; i++) { const a = nr() * TAU, d = Math.sqrt(nr()) * T * 1.3, s = 1 + nr() * T * 0.06; g.rect(x + Math.cos(a) * d, y + Math.sin(a) * d * 0.92, s, s); }
+      g.fillStyle = 'rgba(120,76,38,0.6)'; g.fill();
+      const hg = g.createRadialGradient(x, y + T * 0.05, 0, x, y, T * 0.5);
+      hg.addColorStop(0, '#080302'); hg.addColorStop(0.65, '#1e0f07'); hg.addColorStop(1, '#5a361a');
+      g.fillStyle = hg; g.beginPath(); g.ellipse(x, y, T * 0.5, T * 0.38, 0, 0, TAU); g.fill();
+      g.strokeStyle = 'rgba(255,232,196,0.6)'; g.lineWidth = Math.max(1, T * 0.07);
+      g.beginPath(); g.ellipse(x, y, T * 0.52, T * 0.4, 0, 0.12 * Math.PI, 0.88 * Math.PI); g.stroke();
+    }
+    // soft vignette
+    const vg = g.createRadialGradient(OX + mw / 2, OY + mh / 2, Math.min(mw, mh) * 0.35, OX + mw / 2, OY + mh / 2, Math.hypot(mw, mh) * 0.6);
+    vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(30,14,4,0.32)');
+    g.fillStyle = vg; g.fillRect(OX, OY, mw, mh);
+  }
+
+  /** Isometric sugar cube, pre-rendered per bite stage; drawn in tile units around the centre. */
+  function cubeCanvas(stage, bad) {
+    const px = Math.max(8, Math.ceil(T * CUBE_SPR * Kit.dpr));
+    const cv = makeCanvas(px, px), g = cv.getContext('2d');
+    const k = px / CUBE_SPR;
+    g.setTransform(k, 0, 0, k, px / 2, px / 2);
+    const w = 0.45, hh = 0.25, dz = 0.42, top = -dz / 2 - 0.03;
+    const N = [0, top - hh], E = [w, top], S = [0, top + hh], Wp = [-w, top];
+    const S2 = [0, top + hh + dz], E2 = [w, top + dz], W2 = [-w, top + dz];
+    const poly = (pts, fill) => { g.beginPath(); g.moveTo(pts[0][0], pts[0][1]); for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]); g.closePath(); g.fillStyle = fill; g.fill(); };
+    poly([Wp, S, S2, W2], bad ? '#ff7b72' : '#e2e8f2');
+    poly([S, E, E2, S2], bad ? '#e0443a' : '#bfcadc');
+    const tg = g.createLinearGradient(-w, top - hh, w, top + hh);
+    tg.addColorStop(0, '#ffffff'); tg.addColorStop(1, bad ? '#ffb1ab' : '#eef3fa');
+    poly([N, E, S, Wp], tg);
+    if (!bad) {
+      const r = U.mulberry32(11 + stage);
+      g.fillStyle = 'rgba(150,172,210,0.55)';
+      for (let i = 0; i < 16; i++) {
+        const u = 0.12 + r() * 0.76, v = 0.12 + r() * 0.76;
+        g.fillRect(N[0] + (E[0] - N[0]) * u + (Wp[0] - N[0]) * v, N[1] + (E[1] - N[1]) * u + (Wp[1] - N[1]) * v, 0.025, 0.025);
+      }
+      g.fillStyle = 'rgba(255,255,255,0.8)';
+      for (let i = 0; i < 10; i++) g.fillRect(-w + r() * w * 2 * 0.95, top + 0.04 + r() * dz, 0.022, 0.022);
+    }
+    g.lineJoin = 'round';
+    g.strokeStyle = bad ? 'rgba(120,0,0,0.7)' : 'rgba(104,120,152,0.85)';
+    g.lineWidth = 0.03;
+    g.beginPath(); g.moveTo(N[0], N[1]); g.lineTo(E[0], E[1]); g.lineTo(E2[0], E2[1]); g.lineTo(S2[0], S2[1]); g.lineTo(W2[0], W2[1]); g.lineTo(Wp[0], Wp[1]); g.closePath(); g.stroke();
+    g.strokeStyle = 'rgba(255,255,255,0.95)'; g.lineWidth = 0.02;
+    g.beginPath(); g.moveTo(Wp[0], Wp[1]); g.lineTo(S[0], S[1]); g.lineTo(E[0], E[1]); g.moveTo(S[0], S[1]); g.lineTo(S2[0], S2[1]); g.stroke();
+    const chips = [[0.03, top - hh + 0.03, 0.14], [w - 0.03, top + 0.04, 0.15], [-w + 0.03, top + dz - 0.01, 0.16], [0.15, top + hh + dz * 0.55, 0.13]];
+    for (let i = 0; i < stage; i++) {
+      const [cx, cy, r] = chips[i];
+      g.globalCompositeOperation = 'destination-out';
+      g.beginPath(); g.arc(cx, cy, r, 0, TAU); g.fill();
+      g.globalCompositeOperation = 'source-atop';
+      g.strokeStyle = 'rgba(140,156,186,0.95)'; g.lineWidth = 0.035;
+      g.beginPath(); g.arc(cx, cy, r + 0.015, 0, TAU); g.stroke();
+    }
+    g.globalCompositeOperation = 'source-over';
+    return cv;
+  }
+  function buildCubeSprites() {
+    cubeSpr = [0, 1, 2, 3, 4].map((s) => cubeCanvas(s, false));
+    cubeGhost = cubeSpr[0];
+    cubeBad = cubeCanvas(0, true);
+  }
+
+  function paintShapesLayer(g, W, H) {
+    g.fillStyle = SHAPE.bg; g.fillRect(0, 0, W, H);
+    g.fillStyle = SHAPE.floor; g.fillRect(OX, OY, cols * T, rows * T);
+    const gap = T >= 14 ? 1 : 0;
+    g.beginPath();
+    for (let t = 0; t < cols * rows; t++) if (grid[t]) g.rect(OX + (t % cols) * T + gap, OY + ((t / cols) | 0) * T + gap, T - gap * 2, T - gap * 2);
+    g.fillStyle = SHAPE.wall; g.fill();
+  }
+
+  // ================================================================ rendering — sprites
+  // leg geometry in body lengths (x forward, y to the side): attach x, knee x/y, foot x/y
+  const LEGS = [[0.06, 0.17, 0.17, 0.29, 0.27], [0.0, 0.02, 0.22, -0.01, 0.34], [-0.05, -0.15, 0.19, -0.31, 0.29]];
+  const ABDOMEN = COLONY.map((c) => U.mixHex(c, ANT_DARK, 0.22));
+  const TRAIL_COL = COLONY.map((c) => U.mixHex(c, '#fff1d6', 0.55));
+
+  const GAIT = 6;                     // walk-cycle frames per sprite set
+  let antSpr = [], antBox = 0;        // antSpr[colony][frame + carry * GAIT]; antBox in CSS px
+
+  /** One ant in body-length units: thorax at the origin, facing +x. */
+  function paintAnt(g, ci, phase, carry, lw) {
+    const E = (x, y, rx, ry) => { g.moveTo(x + rx, y); g.ellipse(x, y, rx, ry, 0, 0, TAU); };
+    g.fillStyle = 'rgba(48,22,6,0.3)';
+    g.beginPath(); E(-0.06, 0.05, 0.46, 0.2); g.fill();
+    // legs in alternating tripods, two-segment, plus elbowed antennae
+    const sw = Math.sin(phase) * 0.08, wig = Math.cos(phase) * 0.03;
+    g.beginPath();
+    for (let k = 0; k < 3; k++) {
+      const q = LEGS[k];
+      for (let side = -1; side <= 1; side += 2) {
+        const off = (k + (side > 0 ? 1 : 0)) & 1 ? sw : -sw;
+        g.moveTo(q[0], 0.045 * side);
+        g.lineTo(q[1] + off * 0.5, q[2] * side);
+        g.lineTo(q[3] + off, q[4] * side);
+      }
+    }
+    for (let side = -1; side <= 1; side += 2) {
+      g.moveTo(0.28, 0.035 * side);
+      g.lineTo(0.36, (0.13 + wig * side) * side);
+      g.lineTo(0.5, (0.08 - wig * side) * side);
+    }
+    g.strokeStyle = ANT_DARK; g.lineWidth = lw; g.lineCap = 'round'; g.lineJoin = 'round'; g.stroke();
+    g.beginPath(); E(0.03, 0, 0.13, 0.075); E(0.23, 0, 0.1, 0.095); E(-0.12, 0, 0.045, 0.04);
+    g.fillStyle = ANT_DARK; g.fill();
+    const ag = g.createRadialGradient(-0.34, -0.06, 0.02, -0.3, 0, 0.24);
+    ag.addColorStop(0, U.mixHex(COLONY[ci], '#ffffff', 0.25)); ag.addColorStop(0.55, ABDOMEN[ci]); ag.addColorStop(1, U.mixHex(ABDOMEN[ci], ANT_DARK, 0.45));
+    g.beginPath(); E(-0.3, 0, 0.22, 0.155); g.fillStyle = ag; g.fill();
+    g.beginPath(); E(-0.27, -0.055, 0.09, 0.04); E(0.25, -0.035, 0.035, 0.025);
+    g.fillStyle = 'rgba(255,255,255,0.42)'; g.fill();
+    if (carry) {
+      g.fillStyle = '#fffdf6'; g.fillRect(0.31, -0.085, 0.17, 0.17);
+      g.strokeStyle = 'rgba(90,70,50,0.6)'; g.lineWidth = lw * 0.5; g.strokeRect(0.31, -0.085, 0.17, 0.17);
+    }
+  }
+  function buildAntSprites() {
+    const L = T * 1.05;
+    antBox = Math.ceil(L * 1.3);
+    const px = Math.max(8, Math.ceil(antBox * Kit.dpr)), k = (px / antBox) * L;
+    const lw = Math.max(1, T * 0.055) / L;
+    antSpr = COLONY.map((_, ci) => {
+      const set = [];
+      for (let carry = 0; carry < 2; carry++) for (let f = 0; f < GAIT; f++) {
+        const cv = makeCanvas(px, px), g = cv.getContext('2d');
+        g.setTransform(k, 0, 0, k, px / 2, px / 2);
+        paintAnt(g, ci, (f / GAIT) * TAU, carry === 1, lw);
+        set[f + carry * GAIT] = cv;
+      }
+      return set;
+    });
+  }
+
+  function drawAntsSprite(ctx) {
+    const dpr = Kit.dpr, h = antBox / 2;
+    for (let i = 0; i < ants.length; i++) {
+      const a = ants[i];
+      if (a.vis <= 0.02) continue;
+      const f = Math.floor(((a.phase % TAU) + TAU) % TAU / TAU * GAIT) % GAIT;
+      const c = Math.cos(a.h) * a.vis * dpr, s = Math.sin(a.h) * a.vis * dpr;
+      ctx.setTransform(c, s, -s, c, (OX + a.tx * T) * dpr, (OY + a.ty * T) * dpr);
+      ctx.drawImage(antSpr[a.base.index][f + (a.carry ? GAIT : 0)], -h, -h, antBox, antBox);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  const bucketN = new Int32Array(COLONY.length * TRAIL_BUCKETS);
+  const bucketIdx = Array.from({ length: COLONY.length * TRAIL_BUCKETS }, () => new Int32Array(TRAIL_CAP));
+  function drawTrail(ctx) {
+    bucketN.fill(0);
+    for (let i = 0; i < TRAIL_CAP; i++) {
+      const age = simTime - TR.t[i];
+      if (age < 0 || age >= TRAIL_LIFE) continue;
+      const k = TR.c[i] * TRAIL_BUCKETS + Math.min(TRAIL_BUCKETS - 1, ((age / TRAIL_LIFE) * TRAIL_BUCKETS) | 0);
+      bucketIdx[k][bucketN[k]++] = i;
+    }
+    const sz = Math.max(1.5, T * 0.09), hs = sz / 2;
+    for (let c = 0; c < COLONY.length; c++) for (let k = 0; k < TRAIL_BUCKETS; k++) {
+      const m = bucketN[c * TRAIL_BUCKETS + k];
+      if (!m) continue;
+      const list = bucketIdx[c * TRAIL_BUCKETS + k];
+      ctx.beginPath();
+      for (let j = 0; j < m; j++) { const i = list[j]; ctx.rect(OX + TR.x[i] * T - hs, OY + TR.y[i] * T - hs, sz, sz); }
+      ctx.globalAlpha = TRAIL_ALPHA[k]; ctx.fillStyle = TRAIL_COL[c]; ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function cubeScale(c) {
+    const age = simTime - c.born;
+    const pop = age < 0.4 ? U.easeOutBack(U.clamp(age / 0.4, 0, 1)) : 1;
+    return (0.55 + 0.45 * (1 - c.bites / tw('bites'))) * pop;
+  }
+  function drawCubesSprite(ctx) {
+    const max = tw('bites');
+    // shadows and spilled crumbs
+    ctx.beginPath();
+    for (const c of cubes) {
+      const sc = cubeScale(c), px = OX + c.tx * T, py = OY + c.ty * T;
+      ctx.moveTo(px + T * 0.55 * sc + T * 0.06, py + T * 0.36 * sc);
+      ctx.ellipse(px + T * 0.06, py + T * 0.36 * sc, T * 0.55 * sc, T * 0.18 * sc, 0, 0, TAU);
+    }
+    ctx.fillStyle = 'rgba(48,22,6,0.32)'; ctx.fill();
+    ctx.beginPath();
+    for (const c of cubes) {
+      const n = Math.min(14, Math.floor(c.bites * 0.7)), px = OX + c.tx * T, py = OY + c.ty * T, s = Math.max(1.2, T * 0.06);
+      for (let k = 0; k < n; k++) {
+        const a = c.r * 40 + k * 2.39996, d = (0.55 + ((k * 0.618 + c.r) % 1) * 0.4) * T;
+        ctx.rect(px + Math.cos(a) * d, py + Math.sin(a) * d * 0.8 + T * 0.15, s, s);
+      }
+    }
+    ctx.fillStyle = '#fbf6ea'; ctx.fill();
+    for (const c of cubes) {
+      const sc = cubeScale(c), age = simTime - c.born, px = OX + c.tx * T, py = OY + c.ty * T;
+      const stage = Math.min(4, Math.floor((c.bites / max) * 5));
+      const drop = age < 0.22 ? (1 - age / 0.22) * T * 0.9 : 0;
+      const sq = c.hit * 0.14, w = T * CUBE_SPR * sc * (1 + sq), h = T * CUBE_SPR * sc * (1 - sq);
+      ctx.drawImage(cubeSpr[stage], px - w / 2, py - h / 2 - drop + (T * CUBE_SPR * sc - h) * 0.5, w, h);
+      // twinkle
+      const tk = (simTime * 0.8 + c.r * 9) % 3.2;
+      if (tk < 0.4) {
+        const k = Math.sin((tk / 0.4) * Math.PI), sx = px - T * 0.16 * sc, sy = py - T * 0.52 * sc, r = T * 0.3 * k;
+        star(ctx, sx, sy, r, 'rgba(255,255,255,0.95)');
+      }
+    }
+  }
+  function star(ctx, x, y, r, color) {
+    ctx.beginPath();
+    ctx.moveTo(x, y - r); ctx.quadraticCurveTo(x, y, x + r, y); ctx.quadraticCurveTo(x, y, x, y + r);
+    ctx.quadraticCurveTo(x, y, x - r, y); ctx.quadraticCurveTo(x, y, x, y - r);
+    ctx.fillStyle = color; ctx.fill();
+  }
+
+  function drawNestsSprite(ctx) {
+    for (const b of bases) {
+      const x = OX + b.tx * T, y = OY + b.ty * T, hov = hover.base === b;
+      const r = T * (1.25 + b.pulse * 0.25);
+      ctx.lineWidth = T * (0.34 + b.pulse * 0.3);
+      ctx.strokeStyle = U.rgba(b.color, 0.16 + b.pulse * 0.25 + (hov ? 0.12 : 0));
+      ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke();
+      ctx.lineWidth = Math.max(2, T * (hov ? 0.17 : 0.12));
+      ctx.strokeStyle = b.color;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke();
+    }
+  }
+
+  function drawFlagsSprite(ctx) {
+    const t = Kit.realTime;
+    for (const f of flags) {
+      const x = OX + f.tx * T, y = OY + f.ty * T, age = simTime - f.born;
+      const pop = age < 0.45 ? U.easeOutBack(U.clamp(age / 0.45, 0, 1)) : 1, hov = hover.flag === f;
+      ctx.fillStyle = 'rgba(255,214,10,0.08)';
+      ctx.beginPath(); ctx.arc(x, y, FLAG_R * T * pop, 0, TAU); ctx.fill();
+      ctx.setLineDash([T * 0.28, T * 0.22]);
+      ctx.lineWidth = Math.max(1.5, T * 0.07); ctx.strokeStyle = hov ? 'rgba(255,230,120,0.95)' : 'rgba(255,214,10,0.6)';
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const hgt = T * 1.75 * pop;
+      ctx.fillStyle = 'rgba(48,22,6,0.3)';
+      ctx.beginPath(); ctx.ellipse(x + T * 0.3, y + T * 0.05, T * 0.42, T * 0.12, 0.15, 0, TAU); ctx.fill();
+      ctx.strokeStyle = '#efe6d2'; ctx.lineWidth = Math.max(1.5, T * 0.1); ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y - hgt); ctx.stroke();
+      // waving pennant
+      const top = y - hgt + T * 0.05, len = T * 1.0 * pop, dep = T * 0.62 * pop;
+      ctx.beginPath(); ctx.moveTo(x, top);
+      for (let i = 1; i <= 8; i++) { const u = i / 8; ctx.lineTo(x + u * len, top + u * dep * 0.5 + Math.sin(t * 6 - u * 4) * T * 0.08 * u); }
+      for (let i = 8; i >= 0; i--) { const u = i / 8; ctx.lineTo(x + u * len, top + dep - u * dep * 0.5 + Math.sin(t * 6 - u * 4) * T * 0.08 * u); }
+      ctx.closePath();
+      ctx.fillStyle = SHAPE.yellow; ctx.fill();
+      ctx.strokeStyle = '#a88400'; ctx.lineWidth = Math.max(1, T * 0.04); ctx.stroke();
+      ctx.fillStyle = '#fff4d6'; ctx.beginPath(); ctx.arc(x, y - hgt, T * 0.1, 0, TAU); ctx.fill();
+      badge(ctx, x + T * 0.5, y - hgt - T * 0.6, String(f.count), 1 + f.hit * 0.35);
+    }
+  }
+  function badge(ctx, x, y, text, scale) {
+    const fs = Math.round(U.clamp(T * 0.62, 12, 18) * scale);
+    ctx.font = `600 ${fs}px Fredoka, Rubik, system-ui, sans-serif`;
+    const w = Math.max(fs * 1.3, ctx.measureText(text).width + fs * 0.8), h = fs * 1.35;
+    ctx.fillStyle = 'rgba(22,18,40,0.88)';
+    U.roundRect(ctx, x - w / 2, y - h / 2, w, h, h / 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y + fs * 0.04);
+  }
+
+  function drawParticlesSprite(ctx) {
+    for (let i = 0; i < PART_CAP; i++) {
+      const p = parts[i];
+      if (!p.on) continue;
+      const k = p.life / p.max, x = OX + p.x * T, y = OY + p.y * T;
+      switch (p.type) {
+        case P_CRUMB: case P_GRAIN: {
+          const s = p.size * T;
+          ctx.globalAlpha = Math.min(1, k * 2.5);
+          ctx.fillStyle = '#fffaf0'; ctx.fillRect(x - s / 2, y - s / 2, s, s);
+          break;
+        }
+        case P_PUFF:
+          ctx.globalAlpha = 0.6 * k; ctx.fillStyle = p.color;
+          ctx.beginPath(); ctx.arc(x, y, p.size * T * (1.4 - k * 0.6), 0, TAU); ctx.fill();
+          break;
+        case P_DUST:
+          ctx.globalAlpha = 0.45 * k; ctx.fillStyle = p.color;
+          ctx.beginPath(); ctx.arc(x, y, p.size * T * (1.5 - k * 0.7), 0, TAU); ctx.fill();
+          break;
+        case P_RING:
+          ctx.globalAlpha = k; ctx.strokeStyle = p.color; ctx.lineWidth = Math.max(1.5, T * 0.09 * k + 1);
+          ctx.beginPath(); ctx.arc(x, y, T * (0.3 + p.size * (1 - k)), 0, TAU); ctx.stroke();
+          break;
+        case P_SPARK:
+          ctx.globalAlpha = k; star(ctx, x, y, p.size * T * (0.5 + k * 0.5), p.color);
+          break;
+        default: break;
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function renderSprite(ctx) {
+    if (tw('trail')) drawTrail(ctx);
+    drawNestsSprite(ctx);
+    drawCubesSprite(ctx);
+    if (tw('sight')) drawSight(ctx, 'rgba(255,255,255,0.32)');
+    drawAntsSprite(ctx);
+    drawFlagsSprite(ctx);
+    drawParticlesSprite(ctx);
+  }
+
+  // ================================================================ rendering — shapes
+  function renderShapes(ctx) {
+    // bases
+    for (const b of bases) {
+      const x = OX + b.tx * T, y = OY + b.ty * T;
+      ctx.fillStyle = b.color;
+      ctx.beginPath(); ctx.arc(x, y, T * (1.1 + b.pulse * 0.12), 0, TAU); ctx.fill();
+      if (hover.base === b) { ctx.strokeStyle = SHAPE.white; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, T * 1.35, 0, TAU); ctx.stroke(); }
+    }
+    // goals: zone ring + diamond + count
+    for (const f of flags) {
+      const x = OX + f.tx * T, y = OY + f.ty * T, age = simTime - f.born;
+      const pop = age < 0.45 ? U.easeOutBack(U.clamp(age / 0.45, 0, 1)) : 1, s = T * 0.6 * pop * (1 + f.hit * 0.25);
+      ctx.strokeStyle = hover.flag === f ? SHAPE.white : SHAPE.mid; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y, FLAG_R * T * pop, 0, TAU); ctx.stroke();
+      ctx.fillStyle = SHAPE.yellow;
+      ctx.beginPath(); ctx.moveTo(x, y - s); ctx.lineTo(x + s, y); ctx.lineTo(x, y + s); ctx.lineTo(x - s, y); ctx.closePath(); ctx.fill();
+      const fs = Math.round(U.clamp(T * 0.66, 12, 18));
+      ctx.font = `600 ${fs}px Rubik, system-ui, sans-serif`;
+      ctx.fillStyle = SHAPE.white; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(f.count), x + s + T * 0.25, y);
+    }
+    // attractors: white square + hit ring
+    const max = tw('bites');
+    for (const c of cubes) {
+      const x = OX + c.tx * T, y = OY + c.ty * T, age = simTime - c.born;
+      const pop = age < 0.35 ? U.easeOutBack(U.clamp(age / 0.35, 0, 1)) : 1;
+      const s = T * 0.62 * pop * (1 + c.hit * 0.2);
+      ctx.fillStyle = SHAPE.white; ctx.fillRect(x - s / 2, y - s / 2, s, s);
+      const rr = T * 0.62 * pop;
+      ctx.lineWidth = Math.max(1.5, T * 0.09);
+      ctx.strokeStyle = SHAPE.wall; ctx.beginPath(); ctx.arc(x, y, rr, 0, TAU); ctx.stroke();
+      if (c.bites > 0) { ctx.strokeStyle = SHAPE.light; ctx.beginPath(); ctx.arc(x, y, rr, -Math.PI / 2, -Math.PI / 2 + (c.bites / max) * TAU); ctx.stroke(); }
+    }
+    if (tw('sight')) drawSight(ctx, 'rgba(255,255,255,0.3)');
+    // agents
+    const r0 = T * 0.27;
+    ctx.lineWidth = Math.max(1, T * 0.07); ctx.strokeStyle = SHAPE.floor;
+    for (let k = 0; k < bases.length; k++) {
+      const b = bases[k];
+      ctx.beginPath();
+      for (const a of ants) {
+        if (a.base !== b || a.vis <= 0.02) continue;
+        const x = OX + a.tx * T, y = OY + a.ty * T, r = r0 * a.vis;
+        ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU);
+      }
+      ctx.fillStyle = b.color; ctx.fill(); ctx.stroke();
+    }
+    ctx.beginPath();
+    for (const a of ants) {
+      if (!a.carry || a.vis <= 0.5) continue;
+      const x = OX + a.tx * T, y = OY + a.ty * T, r = r0 * 0.4;
+      ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU);
+    }
+    ctx.fillStyle = SHAPE.white; ctx.fill();
+    // particles: plain squares and rings only
+    for (let i = 0; i < PART_CAP; i++) {
+      const p = parts[i];
+      if (!p.on) continue;
+      const k = p.life / p.max, x = OX + p.x * T, y = OY + p.y * T;
+      if (p.type === P_CRUMB) {
+        const s = p.size * T; ctx.globalAlpha = Math.min(1, k * 2.5); ctx.fillStyle = SHAPE.white; ctx.fillRect(x - s / 2, y - s / 2, s, s);
+      } else if (p.type === P_RING || p.type === P_PUFF) {
+        ctx.globalAlpha = k; ctx.strokeStyle = p.type === P_PUFF ? SHAPE.white : p.color; ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.arc(x, y, T * (0.3 + (p.type === P_PUFF ? 0.5 : p.size) * (1 - k)), 0, TAU); ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ================================================================ rendering — shared overlays
+  const hover = { on: false, tx: 0, ty: 0, inMap: false, wall: false, cube: null, flag: null, base: null };
+  let lastCursor = '';
+  function setCursor(c) { if (c !== lastCursor) { lastCursor = c; Kit.canvas.style.cursor = c; } }
+  function computeHover() {
+    const mouseOn = Kit.mouse.inside && !Kit.helpOpen;
+    hover.on = kb.on || mouseOn;
+    if (kb.on) { hover.tx = kb.tx + 0.5; hover.ty = kb.ty + 0.5; } else { hover.tx = (Kit.mouse.x - OX) / T; hover.ty = (Kit.mouse.y - OY) / T; }
+    hover.inMap = hover.on && inMap(hover.tx, hover.ty);
+    hover.wall = hover.inMap && wallPt(hover.tx, hover.ty);
+    hover.cube = hover.inMap ? cubeNear(hover.tx, hover.ty, 0.75) : null;
+    hover.flag = hover.inMap && !hover.cube ? flagNear(hover.tx, hover.ty) : null;
+    hover.base = hover.inMap ? baseNear(hover.tx, hover.ty) : null;
+    if (!mouseOn) return;
+    if (drag.mode === 'flag') setCursor('grabbing');
+    else if (!hover.inMap) setCursor('default');
+    else if (hover.cube || hover.flag) setCursor(tool === 'flag' && hover.flag ? 'grab' : 'pointer');
+    else if (hover.wall) setCursor('not-allowed');
+    else setCursor('crosshair');
+  }
+
+  function drawSight(ctx, color) {
+    ctx.beginPath();
+    for (const a of ants) {
+      if (a.state !== 'seek' || !a.target || a.hidden) continue;
+      ctx.moveTo(OX + a.tx * T, OY + a.ty * T); ctx.lineTo(OX + a.target.tx * T, OY + a.target.ty * T);
+    }
+    ctx.strokeStyle = color; ctx.lineWidth = Math.max(1, T * 0.05); ctx.stroke();
+  }
+
+  function label(ctx, x, y, text) {
+    const fs = Math.round(U.clamp(T * 0.58, 12, 15));
+    ctx.font = `500 ${fs}px Rubik, system-ui, sans-serif`;
+    const w = ctx.measureText(text).width + fs * 1.2, h = fs * 1.9;
+    const lx = U.clamp(x - w / 2, 8, Kit.W - w - 8), ly = U.clamp(y - h, 8, Kit.H - h - 8);
+    ctx.fillStyle = 'rgba(14,12,30,0.9)';
+    U.roundRect(ctx, lx, ly, w, h, 9); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = '#f1effb'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, lx + fs * 0.6, ly + h / 2 + 0.5);
+  }
+
+  function drawOverlay(ctx) {
+    const abs = Kit.isAbstract;
+    if (hover.cube) {
+      const x = OX + hover.cube.tx * T, y = OY + hover.cube.ty * T;
+      ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(x, y, T * 0.78, 0, TAU); ctx.stroke();
+      label(ctx, x, y - T * 0.95, word('Right-click to remove', 'Right-click to remove'));
+    } else if (hover.flag && tool !== 'flag') {
+      const x = OX + hover.flag.tx * T, y = OY + hover.flag.ty * T;
+      label(ctx, x, y + T * 2.6, 'Right-click to remove');
+    }
+    if (hover.base && !hover.cube) {
+      const b = hover.base;
+      let home = 0;
+      for (const a of ants) if (a.base === b && a.state === 'home') home++;
+      const name = COLONY_NAME[b.index];
+      const text = abs ? `${name} base · ${home} agents home · ${b.stored} returned` : `${name} nest · ${home} ants home · ${b.stored} crumbs`;
+      label(ctx, OX + b.tx * T, OY + (b.ty - 1.6) * T, text);
+    }
+    // ghost of the next placement
+    if (hover.inMap && !hover.cube && !(tool === 'flag' && hover.flag) && !drag.mode) {
+      const bad = hover.wall;
+      const p = bad ? null : fitPoint(hover.tx, hover.ty, tool === 'flag' ? 0.4 : CUBE_MARGIN);
+      const gx = OX + (p ? p.x : hover.tx) * T, gy = OY + (p ? p.y : hover.ty) * T;
+      ctx.globalAlpha = bad ? 0.75 : 0.55;
+      if (tool === 'flag') {
+        if (abs) {
+          const s = T * 0.6;
+          ctx.fillStyle = bad ? SHAPE.red : SHAPE.yellow;
+          ctx.beginPath(); ctx.moveTo(gx, gy - s); ctx.lineTo(gx + s, gy); ctx.lineTo(gx, gy + s); ctx.lineTo(gx - s, gy); ctx.closePath(); ctx.fill();
+        } else {
+          ctx.strokeStyle = '#efe6d2'; ctx.lineWidth = Math.max(1.5, T * 0.1);
+          ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx, gy - T * 1.75); ctx.stroke();
+          ctx.fillStyle = bad ? SHAPE.red : SHAPE.yellow;
+          ctx.beginPath(); ctx.moveTo(gx, gy - T * 1.7); ctx.lineTo(gx + T, gy - T * 1.39); ctx.lineTo(gx, gy - T * 1.08); ctx.closePath(); ctx.fill();
+        }
+        if (!bad) { ctx.strokeStyle = abs ? SHAPE.mid : 'rgba(255,214,10,0.8)'; ctx.lineWidth = 1.5; ctx.setLineDash([5, 5]); ctx.beginPath(); ctx.arc(gx, gy, FLAG_R * T, 0, TAU); ctx.stroke(); ctx.setLineDash([]); }
+      } else if (abs) {
+        const s = T * 0.62;
+        ctx.fillStyle = bad ? SHAPE.red : SHAPE.white; ctx.fillRect(gx - s / 2, gy - s / 2, s, s);
+      } else {
+        const s = T * CUBE_SPR;
+        ctx.drawImage(bad ? cubeBad : cubeGhost, gx - s / 2, gy - s / 2, s, s);
+      }
+      ctx.globalAlpha = 1;
+      // vision preview: which ants could see a cube here
+      if (!bad && tool === 'sugar' && tw('sight')) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1.5; ctx.setLineDash([6, 6]);
+        ctx.beginPath(); ctx.arc(gx, gy, tw('vision') * T, 0, TAU); ctx.stroke(); ctx.setLineDash([]);
+      }
+    }
+    // keyboard cursor
+    if (kb.on) {
+      const x = OX + kb.tx * T, y = OY + kb.ty * T, s = T, l = T * 0.32;
+      ctx.strokeStyle = abs ? SHAPE.white : '#ff9f6e'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x, y + l); ctx.lineTo(x, y); ctx.lineTo(x + l, y);
+      ctx.moveTo(x + s - l, y); ctx.lineTo(x + s, y); ctx.lineTo(x + s, y + l);
+      ctx.moveTo(x + s, y + s - l); ctx.lineTo(x + s, y + s); ctx.lineTo(x + s - l, y + s);
+      ctx.moveTo(x + l, y + s); ctx.lineTo(x, y + s); ctx.lineTo(x, y + s - l);
+      ctx.stroke();
+    }
+  }
+
+  function render(ctx, rdt) {
+    if (!grid || !layer) { ctx.fillStyle = '#120f26'; ctx.fillRect(0, 0, Kit.W, Kit.H); return; }
+    ctx.drawImage(layer, 0, 0, Kit.W, Kit.H);
+    if (fadeT > 0) {
+      fadeT = Math.max(0, fadeT - rdt);
+      ctx.globalAlpha = fadeT / FADE;
+      ctx.drawImage(layerPrev, 0, 0, Kit.W, Kit.H);
+      ctx.globalAlpha = 1;
+    }
+    computeHover();
+    if (Kit.isAbstract) renderShapes(ctx); else renderSprite(ctx);
+    drawOverlay(ctx);
+    syncStats(false);
+  }
+
+  // ================================================================ UI wiring
+  let statT = 0;
+  function syncStats(force) {
+    Kit.setStat('ants', ants.length, { neutral: true });
+    Kit.setStat('sugar', cubes.length);
+    let f = 0;
+    for (const fl of flags) f += fl.count;
+    Kit.setStat('flag', f);
+    if (force || Kit.realTime - statT > 0.15) { statT = Kit.realTime; Kit.setStat('bites', totalBites, { neutral: true }); }
+  }
+
+  function setIcon(btn, html) {
+    const old = btn.querySelector('svg');
+    if (!old) return;
+    old.insertAdjacentHTML('beforebegin', html);
+    old.remove();
+  }
+
+  function setup() {
+    const gPlace = Kit.ui.group({ sprite: 'Place', abstract: 'Place' });
+    ui.bSugar = Kit.ui.button({ parent: gPlace, label: { sprite: 'Sugar', abstract: 'Attractor' }, icon: ICON_CUBE, key: '1', tip: { sprite: 'Sugar: click to drop, drag for a trail', abstract: 'Attractor: click to drop, drag for a line' }, onClick: () => setTool('sugar') });
+    ui.bFlag = Kit.ui.button({ parent: gPlace, label: { sprite: 'Flag', abstract: 'Goal' }, icon: 'flag', key: '2', tip: { sprite: 'Flag: counts the ants that reach it', abstract: 'Goal: counts the agents that reach it' }, onClick: () => setTool('flag') });
+    const gMap = Kit.ui.group(null);
+    ui.bClear = Kit.ui.button({ parent: gMap, label: 'Clear', icon: 'trash', key: 'C', tip: { sprite: 'Remove all sugar', abstract: 'Remove all attractors' }, onClick: () => clearCubes(true) });
+    ui.bNew = Kit.ui.button({ parent: gMap, label: 'New map', icon: 'shuffle', key: 'N', tip: 'Make a new maze', onClick: () => newMap() });
+    ui.bSight = Kit.ui.button({ parent: gMap, label: 'Sight lines', icon: 'eye', key: 'L', tip: { sprite: 'Show what each ant is heading to', abstract: 'Show what each agent is heading to' }, onClick: toggleSight });
+    Kit.ui.setActive(ui.bSugar, true);
+    Kit.ui.setActive(ui.bFlag, false);
+    Kit.ui.setActive(ui.bSight, tw('sight'));
+    ready = true;
+  }
+
+  function viewChanged(v) {
+    if (ui.bSugar) {
+      setIcon(ui.bSugar, v === 'abstract' ? Kit.icons.square : ICON_CUBE);
+      setIcon(ui.bFlag, v === 'abstract' ? ICON_DIAMOND : Kit.icons.flag);
+    }
+    if (grid) buildLayers();
+  }
+
+  function resize() {
+    if (!ready) return;
+    if (!grid) {
+      let s = null;
+      try { const q = new URLSearchParams(location.search).get('seed'); if (q && /^\d+$/.test(q)) s = parseInt(q, 10); } catch (e) { /* ignore */ }
+      newMap(s, { quiet: true });
+    } else layout();
+  }
+
+  function reset() {
+    if (!grid) return;
+    if (firstReset) {
+      firstReset = false;
+      placeExample();
+      simulate(1.3); // the first frame already shows a stream on the move
+      syncStats(true);
+      return;
+    }
+    cubes.length = 0;
+    for (const f of flags) f.count = 0;
+    for (const b of bases) { b.stored = 0; b.pulse = 0; }
+    totalBites = 0;
+    drag.mode = null;
+    clearFx();
+    spawnAll();
+    syncStats(true);
+  }
+
+  const seedNote = { type: 'note', label: 'Map seed' };
+  ui.seedNote = seedNote;
+
+  Kit.init({
+    id: 'trail',
+    number: '03',
+    accent: '#ff9f6e',
+    accentInk: '#2b1004',
+    title: { sprite: 'Ants & Sugar', abstract: 'Trail' },
+    hint: {
+      sprite: 'Click to drop sugar. Drag to lay a trail. Lead the ants anywhere.',
+      abstract: 'Click to drop an attractor. Drag to lay a line. Lead the agents anywhere.',
+    },
+    about: {
+      get sprite() {
+        const n = bases.length || tw('nests');
+        return `${n === 1 ? 'An ant colony lives' : n + ' ant colonies live'} in a garden maze. Drop sugar and every ant that can see a cube walks to the closest one, takes one bite, then looks for the next. Lay a trail of cubes to lead them anywhere. When the trail ends, each ant walks back to its own nest. A cube lasts ${tw('bites')} bites.`;
+      },
+      get abstract() {
+        const n = bases.length || tw('nests');
+        return `Agents start at ${n === 1 ? 'one base' : n + ' bases'} in a maze. Drop attractors and every agent that can see one moves to the closest, hits it once, then looks for the next. Lay a line of attractors to lead them anywhere. When the line ends, each agent goes back to its own base. An attractor lasts ${tw('bites')} hits.`;
+      },
+    },
+    controls: [
+      { keys: ['Click'], label: { sprite: 'Drop a sugar cube', abstract: 'Drop an attractor' } },
+      { keys: ['Drag'], label: { sprite: 'Lay a trail of sugar', abstract: 'Lay a line of attractors' } },
+      { keys: ['Right-click'], label: { sprite: 'Remove a cube or flag', abstract: 'Remove an attractor or goal' } },
+      { keys: ['1', '2'], label: { sprite: 'Sugar tool, flag tool (also G)', abstract: 'Attractor tool, goal tool (also G)' } },
+      { keys: ['Arrows', 'Enter'], label: 'Move the cursor and drop' },
+      { keys: ['Del', 'Z'], label: { sprite: 'Remove under cursor, undo last cube', abstract: 'Remove under cursor, undo last attractor' } },
+      { keys: ['C'], label: { sprite: 'Clear all sugar', abstract: 'Clear all attractors' } },
+      { keys: ['N'], label: 'New map' },
+      { keys: ['L'], label: 'Show sight lines' },
+    ],
+    stats: [
+      { id: 'ants', label: { sprite: 'Ants', abstract: 'Agents' }, value: 0 },
+      { id: 'sugar', label: { sprite: 'Sugar', abstract: 'Attractors' }, value: 0 },
+      { id: 'bites', label: { sprite: 'Bites', abstract: 'Hits' }, value: 0 },
+      { id: 'flag', label: { sprite: 'At flag', abstract: 'At goal' }, value: 0 },
+    ],
+    tweaks: [
+      { type: 'section', label: { sprite: 'Colonies', abstract: 'Bases' } },
+      { type: 'range', id: 'nests', label: { sprite: 'Nests', abstract: 'Bases' }, min: 1, max: 5, step: 1, value: DEF.nests, onChange: () => { placeBases(tw('nests')); layout(); syncStats(true); }, note: 'Places them again on the same maze' },
+      { type: 'range', id: 'perNest', label: { sprite: 'Ants per nest', abstract: 'Agents per base' }, min: 5, max: 80, step: 1, value: DEF.perNest, onInput: syncAntCount },
+      { type: 'section', label: { sprite: 'Ants', abstract: 'Agents' } },
+      { type: 'range', id: 'speed', label: { sprite: 'Ant speed', abstract: 'Agent speed' }, min: 1, max: 6, step: 0.25, value: DEF.speed, format: (v) => v + ' tiles/s' },
+      { type: 'range', id: 'vision', label: 'Vision radius', min: 4, max: 60, step: 1, value: DEF.vision, format: (v) => v + ' tiles' },
+      { type: 'section', label: { sprite: 'Sugar', abstract: 'Attractors' } },
+      { type: 'range', id: 'bites', label: { sprite: 'Bites per cube', abstract: 'Hits per attractor' }, min: 5, max: 60, step: 1, value: DEF.bites, onInput: (v) => { for (const c of cubes.slice()) if (c.bites >= v) killCube(c, 'eaten'); } },
+      { type: 'section', label: 'Display' },
+      { type: 'toggle', id: 'trail', label: 'Trail dots', value: DEF.trail, note: { sprite: 'Faint scent dots behind moving ants.', abstract: 'Shown in the Sprites look only.' } },
+      { type: 'toggle', id: 'sight', label: 'Sight lines', value: DEF.sight, onChange: setSight },
+      { type: 'section', label: 'Map' },
+      { type: 'button', id: 'newmap', label: 'New map', onClick: () => newMap() },
+      seedNote,
+    ],
+    setup,
+    reset,
+    update,
+    render,
+    resize,
+    viewChanged,
+    pointerDown,
+    pointerMove,
+    pointerUp,
+    pointerLeave() { if (!Kit.mouse.down) drag.mode = null; },
+    keydown,
+    escape() { drag.mode = null; kb.on = false; if (tool !== 'sugar') setTool('sugar'); },
+  });
+
+  // ================================================================ test API
+  window.__toy = {
+    get ants() { return ants; },
+    get cubes() { return cubes; },
+    get bases() { return bases; },
+    get flags() { return flags; },
+    get tile() { return T; },
+    get origin() { return { x: OX, y: OY }; },
+    get cols() { return cols; },
+    get rows() { return rows; },
+    get seed() { return seed; },
+    get bitesPerCube() { return tw('bites'); },
+    get tool() { return tool; },
+    get plazas() { return plazas.map((p) => ({ x: OX + (p.cx + 0.5) * T, y: OY + (p.cy + 0.5) * T })); },
+    isWall(x, y) { return wallPt((x - OX) / T, (y - OY) / T); },
+    canSee(ant, cube) { return canSee(ant, cube); },
+    placeCube(x, y) { return addCube((x - OX) / T, (y - OY) / T); },
+    removeCube(cube) { if (cube) killCube(cube, 'user'); },
+    clearCubes() { clearCubes(false); },
+    newMap(s) { return newMap(s, { quiet: true }); },
+    placeFlag(x, y) { return addFlag((x - OX) / T, (y - OY) / T); },
+    removeFlag(f) { removeFlag(f, true); },
+    setTool,
+    /** Advance the simulation synchronously by `sec` seconds. */
+    step(sec) { simulate(sec); },
+    /** Pixel centre of tile (cx, cy). */
+    tileCenter(cx, cy) { return { x: OX + (cx + 0.5) * T, y: OY + (cy + 0.5) * T }; },
+    /** Path length in tiles from a pixel point to base i (−1 if unreachable). */
+    homeDist(x, y, i) { const f = fields[i]; return f ? f.dist[Math.floor((y - OY) / T) * cols + Math.floor((x - OX) / T)] : -1; },
+    /** True when every open tile can reach every base. */
+    connected() { for (const f of fields) for (let t = 0; t < cols * rows; t++) if (!grid[t] && f.dist[t] < 0) return false; return true; },
+  };
+})();
+</script>
+</body>
+</html>

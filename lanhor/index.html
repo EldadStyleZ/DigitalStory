@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>לנהור Toys</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@500&family=Fredoka:wght@500;600;700&family=Rubik:wght@400;500;600&display=swap">
+<style>
+/* Launcher layout: full-window particle field behind a two-column hero (copy left, the word לנהור right,
+   drawn by the particles) and a row of three toy doors. One committed dark look shared with the toys. */
+:root {
+  color-scheme: dark;
+  --ink-0: #120f26;
+  --ink-1: rgba(27, 23, 52, 0.72);
+  --ink-2: rgba(44, 38, 82, 0.78);
+  --line: rgba(226, 231, 255, 0.11);
+  --line-strong: rgba(226, 231, 255, 0.24);
+  --fg: #f1effb;
+  --fg-dim: #b3acd6;
+  --fg-faint: #8a82b0;
+  --beam: #ffd166;
+  --flow: #4cc9f0;
+  --trail: #ff9f6e;
+  --accent: #ffd166;
+  --font-display: 'Fredoka', 'Rubik', system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+  --font-ui: 'Rubik', system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+body.view-abstract { --beam: #ffd60a; --flow: #0a84ff; --trail: #ff3b30; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--ink-0);
+  color: var(--fg);
+  font: 400 16px/1.55 var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+#field { position: fixed; inset: 0; width: 100%; height: 100%; display: block; z-index: 0; }
+.page {
+  position: relative;
+  z-index: 1;
+  min-height: 100%;
+  box-sizing: border-box;
+  display: grid;
+  grid-template-rows: auto 1fr auto auto;
+  gap: 28px;
+  max-width: 1320px;
+  margin: 0 auto;
+  padding-block: calc(20px + env(safe-area-inset-top, 0px)) calc(22px + env(safe-area-inset-bottom, 0px));
+  padding-left: max(28px, env(safe-area-inset-left, 0px));
+  padding-right: max(28px, env(safe-area-inset-right, 0px));
+}
+
+/* top row */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.mark { display: flex; align-items: center; gap: 10px; font: 500 15px/1.2 var(--font-ui); color: var(--fg-dim); }
+.mark-dots { display: flex; gap: 4px; }
+.mark-dots i { width: 8px; height: 8px; border-radius: 50%; background: var(--beam); }
+.mark-dots i:nth-child(2) { background: var(--flow); }
+.mark-dots i:nth-child(3) { background: var(--trail); }
+body.view-abstract .mark-dots i { border-radius: 1px; }
+.controls { display: flex; align-items: center; gap: 6px; padding: 5px; border-radius: 16px; background: var(--ink-1); border: 1px solid var(--line); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+.seg { position: relative; display: flex; padding: 3px; border-radius: 12px; background: rgba(0,0,0,0.28); border: 1px solid var(--line); }
+.seg button {
+  appearance: none; position: relative; z-index: 1; display: flex; align-items: center; gap: 6px;
+  height: 32px; padding: 0 13px; border: 0; border-radius: 9px; background: transparent;
+  color: var(--fg-dim); font: 500 13.5px/1 var(--font-ui); cursor: pointer; transition: color .2s;
+}
+.seg button svg { width: 16px; height: 16px; }
+.seg button[aria-pressed="true"] { color: #1d1500; }
+.seg-thumb { position: absolute; top: 3px; bottom: 3px; border-radius: 9px; background: var(--accent); transition: left .25s cubic-bezier(.3,1.4,.5,1), width .25s cubic-bezier(.3,1.4,.5,1); }
+.iconbtn { appearance: none; display: grid; place-items: center; width: 40px; height: 40px; border-radius: 11px; border: 0; background: transparent; color: var(--fg-dim); cursor: pointer; }
+.iconbtn:hover { background: rgba(255,255,255,0.07); color: var(--fg); }
+.iconbtn svg { width: 20px; height: 20px; }
+
+/* hero */
+.hero { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); align-items: center; gap: 32px; min-height: 320px; }
+.copy { display: flex; flex-direction: column; gap: 16px; max-width: 34rem; }
+.copy h1 {
+  margin: 0;
+  font: 600 clamp(34px, 4.4vw, 58px)/1.04 var(--font-display);
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+.copy p { margin: 0; font-size: 17px; color: var(--fg-dim); max-width: 46ch; }
+.copy p b { color: var(--fg); font-weight: 500; }
+.word-slot { position: relative; height: clamp(220px, 36vh, 400px); }
+.word-slot .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.gloss { position: absolute; right: 4%; bottom: 2%; font: 500 14px/1.2 var(--font-ui); color: var(--fg-faint); }
+
+/* toy doors */
+.doors { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.door {
+  --c: var(--beam);
+  position: relative;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto 1fr auto;
+  column-gap: 16px;
+  row-gap: 8px;
+  padding: 20px 20px 18px;
+  border-radius: 22px;
+  background: var(--ink-1);
+  border: 1px solid var(--line);
+  color: inherit;
+  text-decoration: none;
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  transition: transform .2s cubic-bezier(.3,1.4,.5,1), border-color .2s, background .2s, box-shadow .2s;
+  min-width: 0;
+}
+.door[data-toy="flow"] { --c: var(--flow); }
+.door[data-toy="trail"] { --c: var(--trail); }
+.door:hover, .door:focus-visible {
+  transform: translateY(-4px);
+  border-color: color-mix(in srgb, var(--c) 70%, transparent);
+  background: var(--ink-2);
+  box-shadow: 0 18px 50px rgba(0,0,0,0.4), 0 0 0 4px color-mix(in srgb, var(--c) 18%, transparent);
+  outline: none;
+}
+.glyph { grid-row: 1 / span 2; width: 64px; height: 64px; border-radius: 18px; display: grid; place-items: center; background: color-mix(in srgb, var(--c) 14%, transparent); color: var(--c); }
+.glyph svg { width: 44px; height: 44px; }
+.glyph .g-abstract { display: none; }
+body.view-abstract .glyph .g-sprite { display: none; }
+body.view-abstract .glyph .g-abstract { display: block; }
+body.view-abstract .glyph { border-radius: 6px; }
+.door h2 { margin: 2px 0 0; font: 600 23px/1.15 var(--font-display); display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.num { font: 600 15px/1 var(--font-display); color: var(--c); }
+.door p { margin: 0; font-size: 14.5px; line-height: 1.5; color: var(--fg-dim); min-width: 0; }
+.door-foot { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 13.5px; color: var(--fg-faint); }
+.door-foot .play { display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 14px; border-radius: 10px; background: var(--c); color: #160f05; font: 600 14.5px/1 var(--font-display); }
+body.view-abstract .door-foot .play { color: #0d0d10; }
+.door-foot .play kbd { color: inherit; background: rgba(0,0,0,0.14); border-color: rgba(0,0,0,0.28); }
+kbd { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: var(--fg); background: rgba(255,255,255,0.07); border: 1px solid var(--line-strong); border-bottom-width: 2px; border-radius: 6px; padding: 1px 7px; }
+
+.foot { display: flex; flex-wrap: wrap; gap: 8px 22px; font-size: 13.5px; color: var(--fg-faint); }
+.foot span { display: inline-flex; align-items: center; gap: 7px; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 980px) {
+  .hero { grid-template-columns: 1fr; gap: 8px; }
+  .word-slot { height: clamp(170px, 30vh, 260px); order: -1; }
+  .doors { grid-template-columns: 1fr; }
+}
+@media (max-width: 560px) {
+  .seg button span { display: none; }
+  .page { gap: 20px; }
+  .word-slot { height: 150px; }
+  .gloss { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .door, .seg-thumb { transition: none; }
+}
+</style>
+</head>
+<body class="view-sprite">
+<canvas id="field" aria-hidden="true"></canvas>
+<div class="page">
+  <header class="top">
+    <div class="mark"><span class="mark-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Digital Story, Bezalel Academy</span></div>
+    <div class="controls">
+      <div class="seg" role="group" aria-label="Look">
+        <div class="seg-thumb"></div>
+        <button type="button" id="b-sprite" title="Drawn look (V)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5c3.5 2.5 6 5.4 6 9a6 6 0 0 1-12 0c0-3.6 2.5-6.5 6-9z"/><path d="M9.5 13.5a2.6 2.6 0 0 0 2.5 2.6"/></svg><span>Sprites</span></button>
+        <button type="button" id="b-shapes" title="Plain shapes and base colors (V)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="13" width="7.5" height="7.5" rx="1"/><circle cx="17" cy="16.75" r="3.75"/><path d="M12 3.5l4.3 7.2H7.7z"/></svg><span>Shapes</span></button>
+      </div>
+      <button type="button" class="iconbtn" id="b-full" aria-label="Fullscreen" title="Fullscreen (F)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"/></svg></button>
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="copy">
+      <h1>Three toys about moving together toward something.</h1>
+      <p data-sprite="Each toy tests a different pull: <b>light</b>, <b>water</b> and <b>food</b>. Play them live, then switch to Shapes and let the class guess what they were."
+         data-abstract="Each toy tests a different pull. Play them live. Everything you see is plain shapes and base colors, so the reference is yours to guess."></p>
+    </div>
+    <div class="word-slot" id="word-slot">
+      <span class="sr" lang="he">לנהור</span>
+      <span class="gloss">to stream, to flock, to throng toward</span>
+    </div>
+  </section>
+
+  <nav class="doors" aria-label="Toys">
+    <a class="door" data-toy="beam" href="beam.html">
+      <span class="glyph" aria-hidden="true">
+        <svg class="g-sprite" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M24 4v6"/><path d="M17 10h14l-2 6H19z" fill="currentColor" fill-opacity=".25"/><path d="M19 16l-9 22h28l-9-22" opacity=".45"/><path d="M24 31c-3-4-9-4-10-1s4 4 10 1zM24 31c3-4 9-4 10-1s-4 4-10 1z" fill="currentColor" fill-opacity=".3"/><path d="M24 28v7"/></svg>
+        <svg class="g-abstract" viewBox="0 0 48 48" fill="currentColor"><rect x="5" y="20" width="8" height="8"/><path d="M13 24l30-14v28z" opacity=".4"/><circle cx="34" cy="24" r="4"/></svg>
+      </span>
+      <h2><span class="num">01</span><span data-sprite="Moths &amp; Lamps" data-abstract="Beam"></span></h2>
+      <p data-sprite="Hang up to five colored lamps on the frame. A moth rushes any beam that reaches it. Stones and colored glass shape the light."
+         data-abstract="Place up to five colored lights on the frame. An agent moves toward any light that reaches it. Objects block or filter the light."></p>
+      <div class="door-foot"><span>Mouse and keyboard</span><span class="play"><kbd>1</kbd> Play</span></div>
+    </a>
+    <a class="door" data-toy="flow" href="flow.html">
+      <span class="glyph" aria-hidden="true">
+        <svg class="g-sprite" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 18c4-5 12-5 16 0-4 5-12 5-16 0zM24 18l5-4v8z" fill="currentColor" fill-opacity=".3"/><path d="M18 32c4-5 12-5 16 0-4 5-12 5-16 0zM34 32l5-4v8z" fill="currentColor" fill-opacity=".3"/><path d="M6 40c4-2 8 2 12 0s8 2 12 0 8 2 12 0" opacity=".5"/></svg>
+        <svg class="g-abstract" viewBox="0 0 48 48" fill="currentColor"><circle cx="20" cy="20" r="4"/><circle cx="29" cy="17" r="4"/><circle cx="25" cy="27" r="4"/><circle cx="16" cy="29" r="4"/><circle cx="33" cy="26" r="4"/><rect x="4" y="38" width="40" height="5" opacity=".4"/></svg>
+      </span>
+      <h2><span class="num">02</span><span data-sprite="School of Fish" data-abstract="Flow"></span></h2>
+      <p data-sprite="Steer one fish through an underwater maze. Green water calls more fish to the school, red water takes them away and currents sweep you along."
+         data-abstract="Steer a group through a maze. Green zones add agents, red zones remove them and flows push the group along."></p>
+      <div class="door-foot"><span>Keyboard or mouse</span><span class="play"><kbd>2</kbd> Play</span></div>
+    </a>
+    <a class="door" data-toy="trail" href="trail.html">
+      <span class="glyph" aria-hidden="true">
+        <svg class="g-sprite" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="30" y="8" width="12" height="12" rx="2" fill="currentColor" fill-opacity=".25"/><circle cx="14" cy="32" r="3"/><circle cx="20" cy="27" r="4" fill="currentColor" fill-opacity=".3"/><circle cx="27" cy="22" r="3"/><path d="M17 25l-4-4M17 29l-5 1M22 23l-1-5M24 30l2 5M28 26l5 2"/></svg>
+        <svg class="g-abstract" viewBox="0 0 48 48" fill="currentColor"><rect x="34" y="8" width="8" height="8"/><rect x="22" y="20" width="6" height="6" opacity=".6"/><circle cx="12" cy="36" r="6"/><circle cx="19" cy="30" r="2.5"/><circle cx="26" cy="31" r="2.5"/><circle cx="31" cy="22" r="2.5"/></svg>
+      </span>
+      <h2><span class="num">03</span><span data-sprite="Ants &amp; Sugar" data-abstract="Trail"></span></h2>
+      <p data-sprite="Drop sugar to lead three ant colonies through a maze. Each ant walks to the closest cube it can see and heads home when the trail runs out."
+         data-abstract="Place attractors to lead agents from three bases through a maze. Each agent goes to the closest attractor it can see, then back to its base."></p>
+      <div class="door-foot"><span>Mostly mouse</span><span class="play"><kbd>3</kbd> Play</span></div>
+    </a>
+  </nav>
+
+  <footer class="foot">
+    <span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> open a toy</span>
+    <span><kbd>V</kbd> switch between Sprites and Shapes, here and inside every toy</span>
+    <span><kbd>F</kbd> fullscreen</span>
+  </footer>
+</div>
+
+<script>
+'use strict';
+(function () {
+  // ------------------------------------------------------------ view (shared with the toys)
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* blocked */ } },
+  };
+  function initialView() {
+    try {
+      const q = new URLSearchParams(location.search).get('view');
+      if (q === 'abstract' || q === 'shapes') return 'abstract';
+      if (q === 'sprite' || q === 'sprites') return 'sprite';
+    } catch (e) { /* ignore */ }
+    const h = location.hash.replace('#', '');
+    if (h === 'shapes') return 'abstract';
+    if (h === 'sprites') return 'sprite';
+    return store.get('lanhor-view', 'sprite') === 'abstract' ? 'abstract' : 'sprite';
+  }
+  let view = initialView();
+  const bSprite = document.getElementById('b-sprite');
+  const bShapes = document.getElementById('b-shapes');
+  const thumb = document.querySelector('.seg-thumb');
+  const seg = document.querySelector('.seg');
+  const doors = [...document.querySelectorAll('.door')];
+
+  function applyView() {
+    document.body.classList.toggle('view-abstract', view === 'abstract');
+    document.body.classList.toggle('view-sprite', view !== 'abstract');
+    for (const n of document.querySelectorAll('[data-sprite]')) n.innerHTML = n.getAttribute(view === 'abstract' ? 'data-abstract' : 'data-sprite');
+    bSprite.setAttribute('aria-pressed', String(view !== 'abstract'));
+    bShapes.setAttribute('aria-pressed', String(view === 'abstract'));
+    const on = view === 'abstract' ? bShapes : bSprite;
+    const sr = seg.getBoundingClientRect(), r = on.getBoundingClientRect();
+    if (r.width) { thumb.style.left = (r.left - sr.left - 1) + 'px'; thumb.style.width = r.width + 'px'; }
+    for (const d of doors) d.href = d.dataset.toy + '.html?view=' + view;
+    recolor();
+  }
+  function setView(v) { view = v; store.set('lanhor-view', v); applyView(); }
+  bSprite.addEventListener('click', () => setView('sprite'));
+  bShapes.addEventListener('click', () => setView('abstract'));
+  for (const d of doors) d.addEventListener('click', () => store.set('lanhor-view', view));
+
+  function toggleFullscreen() {
+    try {
+      if (!document.fullscreenElement) { const p = document.documentElement.requestFullscreen(); if (p && p.catch) p.catch(() => {}); }
+      else document.exitFullscreen();
+    } catch (e) { /* not allowed here */ }
+  }
+  document.getElementById('b-full').addEventListener('click', toggleFullscreen);
+  window.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.code === 'KeyV') setView(view === 'abstract' ? 'sprite' : 'abstract');
+    else if (e.code === 'KeyF') toggleFullscreen();
+    else if (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3') {
+      const d = doors[+e.code.slice(-1) - 1];
+      store.set('lanhor-view', view);
+      location.href = d.href;
+    }
+  });
+
+  // ------------------------------------------------------------ the particle crowd that spells לנהור
+  const cv = document.getElementById('field');
+  const ctx = cv.getContext('2d');
+  const slot = document.getElementById('word-slot');
+  const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let W = 0, H = 0, dpr = 1;
+  let targets = [];
+  const P = [];
+  const mouse = { x: -1e4, y: -1e4, on: false };
+  let hoverDoor = null;
+  let palette = [];
+
+  function recolor() {
+    palette = view === 'abstract'
+      ? ['#ff3b30', '#34c759', '#0a84ff', '#ffd60a', '#ffffff']
+      : ['#ffd166', '#4cc9f0', '#ff9f6e', '#ffe7a8', '#bfefff'];
+    for (let i = 0; i < P.length; i++) P[i].c = palette[i % palette.length];
+  }
+
+  function sampleWord() {
+    const r = slot.getBoundingClientRect();
+    if (r.width < 20 || r.height < 20) { targets = []; return; }
+    const off = document.createElement('canvas');
+    const w = Math.ceil(r.width), h = Math.ceil(r.height);
+    off.width = w; off.height = h;
+    const o = off.getContext('2d');
+    let size = Math.min(h * 0.78, w * 0.36);
+    o.font = `700 ${size}px Fredoka, Rubik, 'Arial Hebrew', Arial, sans-serif`;
+    o.direction = 'rtl';
+    const tw = o.measureText('לנהור').width;
+    if (tw > w * 0.96) { size *= (w * 0.96) / tw; o.font = `700 ${size}px Fredoka, Rubik, 'Arial Hebrew', Arial, sans-serif`; }
+    o.textAlign = 'center';
+    o.textBaseline = 'middle';
+    o.fillStyle = '#fff';
+    o.fillText('לנהור', w / 2, h * 0.46);
+    const data = o.getImageData(0, 0, w, h).data;
+    const step = Math.max(3, Math.round(size / 52));
+    const pts = [];
+    for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
+      if (data[(y * w + x) * 4 + 3] > 140) pts.push({ x: r.left + x + (Math.random() - 0.5) * step * 0.6, y: r.top + window.scrollY + y + (Math.random() - 0.5) * step * 0.6 });
+    }
+    // shuffle so particles fill the word evenly when counts differ
+    for (let i = pts.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pts[i], pts[j]] = [pts[j], pts[i]]; }
+    targets = pts;
+  }
+
+  function spawnAtEdge(p) {
+    const side = Math.floor(Math.random() * 4);
+    p.x = side === 0 ? -20 : side === 1 ? W + 20 : Math.random() * W;
+    p.y = side === 2 ? -20 : side === 3 ? H + 20 : Math.random() * H;
+    p.vx = 0; p.vy = 0;
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    sampleWord();
+    const want = Math.min(targets.length, W < 700 ? 1400 : 3600);
+    while (P.length < want) {
+      const p = { x: 0, y: 0, vx: 0, vy: 0, t: 0, s: 1.1 + Math.random() * 1.3, k: Math.random(), ph: Math.random() * 6.28, c: '#fff', door: Math.random() };
+      if (reduced) { p.x = W / 2; p.y = H / 2; } else spawnAtEdge(p);
+      P.push(p);
+    }
+    P.length = want;
+    for (let i = 0; i < P.length; i++) {
+      P[i].t = i % Math.max(1, targets.length);
+      if (reduced && targets.length) { const tg = targets[P[i].t]; P[i].x = tg.x; P[i].y = tg.y; }
+    }
+    recolor();
+    applyView();
+  }
+
+  // a point on the hovered door's outline, so part of the crowd streams to what you point at
+  function doorPoint(p, rect, t) {
+    const per = 2 * (rect.width + rect.height);
+    let d = ((p.door + t * 0.03) % 1) * per;
+    const x0 = rect.left, y0 = rect.top + window.scrollY;
+    if (d < rect.width) return [x0 + d, y0];
+    d -= rect.width;
+    if (d < rect.height) return [x0 + rect.width, y0 + d];
+    d -= rect.height;
+    if (d < rect.width) return [x0 + rect.width - d, y0 + rect.height];
+    d -= rect.width;
+    return [x0, y0 + rect.height - d];
+  }
+
+  let last = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.05, last ? (now - last) / 1000 : 0.016);
+    last = now;
+    const t = now / 1000;
+    const sy = window.scrollY;
+    const dRect = hoverDoor ? hoverDoor.getBoundingClientRect() : null;
+    if (!reduced) {
+      for (let i = 0; i < P.length; i++) {
+        const p = P[i];
+        let tx, ty, k = 7.5;
+        if (dRect && p.k < 0.32) { [tx, ty] = doorPoint(p, dRect, t); k = 5; }
+        else if (targets.length) { const tg = targets[p.t]; tx = tg.x + Math.sin(t * 1.3 + p.ph) * 1.4; ty = tg.y + Math.cos(t * 1.1 + p.ph) * 1.4; }
+        else { tx = p.x; ty = p.y; }
+        let ax = (tx - p.x) * k, ay = (ty - p.y) * k;
+        // the cursor pulls nearby particles toward it
+        const mx = mouse.x - p.x, my = mouse.y + sy - p.y;
+        const md2 = mx * mx + my * my;
+        if (mouse.on && md2 < 150 * 150) {
+          const md = Math.sqrt(md2) + 0.001;
+          const f = (1 - md / 150) * 2600;
+          ax += (mx / md) * f - my / md * f * 0.5;
+          ay += (my / md) * f + mx / md * f * 0.5;
+        }
+        p.vx = (p.vx + ax * dt) * Math.pow(0.04, dt);
+        p.vy = (p.vy + ay * dt) * Math.pow(0.04, dt);
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+      }
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const abstract = view === 'abstract';
+    ctx.globalCompositeOperation = abstract ? 'source-over' : 'lighter';
+    for (let i = 0; i < P.length; i++) {
+      const p = P[i];
+      const y = p.y - sy;
+      if (y < -10 || y > H + 10) continue;
+      ctx.fillStyle = p.c;
+      if (abstract) {
+        const s = p.s * 1.55;
+        ctx.globalAlpha = 0.95;
+        ctx.fillRect(p.x - s / 2, y - s / 2, s, s);
+      } else {
+        const sp = Math.min(1, Math.hypot(p.vx, p.vy) / 400);
+        ctx.globalAlpha = Math.min(1, 0.72 + 0.18 * Math.sin(t * 2 + p.ph) + sp * 0.3);
+        ctx.beginPath();
+        ctx.arc(p.x, y, p.s, 0, 6.2832);
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  window.addEventListener('pointermove', (e) => { mouse.x = e.clientX; mouse.y = e.clientY; mouse.on = e.pointerType !== 'touch'; });
+  document.addEventListener('pointerleave', () => { mouse.on = false; });
+  window.addEventListener('blur', () => { mouse.on = false; });
+  for (const d of doors) {
+    d.addEventListener('pointerenter', () => { hoverDoor = d; });
+    d.addEventListener('pointerleave', () => { if (hoverDoor === d) hoverDoor = null; });
+    d.addEventListener('focus', () => { hoverDoor = d; });
+    d.addEventListener('blur', () => { if (hoverDoor === d) hoverDoor = null; });
+  }
+  let rt = 0;
+  window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(resize, 120); });
+
+  applyView();
+  resize();
+  requestAnimationFrame(frame);
+  // re-sample once the display font has loaded so the word uses the right letterforms
+  if (document.fonts && document.fonts.load) {
+    Promise.race([document.fonts.load('700 120px Fredoka', 'לנהור'), new Promise((r) => setTimeout(r, 1500))])
+      .then(() => { sampleWord(); for (let i = 0; i < P.length; i++) P[i].t = i % Math.max(1, targets.length); applyView(); });
+  }
+})();
+</script>
+</body>
+</html>

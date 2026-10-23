@@ -1,0 +1,2343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Toy</title>
+<link rel="stylesheet" href="kit.css">
+</head>
+<body>
+<script src="kit.js"></script>
+<script>
+'use strict';
+/* Toy 01 — Beam (Sprites: Moths & Lamps).
+ * Up to five colored lamps hang on the frame. Each beam is a visibility polygon, blocked by
+ * objects (glass passes its own color). Moths that a beam reaches rush that lamp and flutter at it.
+ */
+
+// ================================================================== config
+const U = Kit.util;
+const { TAU, clamp, lerp, rand, angleDiff } = U;
+const DEG = Math.PI / 180;
+
+const MAX_LAMPS = 5;
+const MAX_OBJECTS = 16;
+const MAX_MOTHS = 40;
+const COLORS = ['red', 'green', 'blue'];
+const BASE = { red: '#ff3b30', green: '#34c759', blue: '#0a84ff' };   // swatches + Shapes view
+const LIGHT = { red: '#ff3a1e', green: '#36e64a', blue: '#2466ff' };  // sprite light: purer primaries mix cleanly
+const NAME = { red: 'Red', green: 'Green', blue: 'Blue' };
+const SH = { bg: '#0d0d10', dark: '#1c1c22', band: '#2c2c34', obj: '#5a5a66', mid: '#9a9aa6', white: '#ffffff' };
+const ACCENT = '#ffd166';
+const AIM_LIMIT = 80 * DEG;
+const WIDTH_MIN = 8 * DEG, WIDTH_MAX = 80 * DEG;
+const RAY_STEP = 1.5 * DEG;
+const EPS_ANG = 1e-4;
+const TRAIL = 14;
+const MOTH_WS = 62;           // moth wingspan (px at scale 1)
+const DEFAULTS = { count: 1, speed: 1, pull: 1, reach: 500, width: 28, edges: false, dust: true };
+const tw = (id) => (Kit.tweaks[id] !== undefined ? Kit.tweaks[id] : DEFAULTS[id]);
+
+const ngon = (n, r, a0) => Array.from({ length: n }, (_, i) => ({ x: Math.cos(a0 + (i * TAU) / n) * r, y: Math.sin(a0 + (i * TAU) / n) * r }));
+const box = (hx, hy) => [{ x: -hx, y: -hy }, { x: hx, y: -hy }, { x: hx, y: hy }, { x: -hx, y: hy }];
+const KINDS = {
+  square: { verts: box(0.8, 0.8), mat: 'wood' },
+  rect: { verts: box(1.15, 0.62), mat: 'wood' },
+  bar: { verts: box(1.6, 0.27), mat: 'wood' },
+  triangle: { verts: ngon(3, 1.08, -Math.PI / 2), mat: 'wood' },
+  hex: { verts: ngon(6, 1, 0), mat: 'stone' },
+  circle: { verts: ngon(16, 0.95, 0), mat: 'stone' },
+};
+// kind, cx, cy (room fractions), size (fraction of the room's short side), rotation (deg), glass color
+const DEFAULT_OBJECTS = [
+  ['hex', 0.25, 0.37, 0.075, 8, null],
+  ['circle', 0.41, 0.2, 0.065, 0, null],
+  ['rect', 0.6, 0.22, 0.058, 24, 'blue'],      // in the blue beam: blue shines through
+  ['triangle', 0.73, 0.33, 0.078, 12, null],
+  ['bar', 0.76, 0.6, 0.075, 78, null],
+  ['square', 0.6, 0.74, 0.058, -14, 'green'],  // in the red beam: casts a red shadow
+  ['square', 0.43, 0.8, 0.064, 16, null],
+  ['triangle', 0.3, 0.635, 0.07, -24, 'red'],  // in the red beam: red shines through
+  ['circle', 0.12, 0.17, 0.045, 0, null],
+];
+const NEW_OBJECT = {
+  square: { kind: 'square', size: 0.06 },
+  triangle: { kind: 'triangle', size: 0.068 },
+  circle: { kind: 'circle', size: 0.06 },
+  bar: { kind: 'bar', size: 0.07 },
+  glass: { kind: 'rect', size: 0.06 },
+};
+const MOTH_LOOKS = [
+  { fore: '#d3b285', foreDark: '#7d5c3a', band: '#a47b50', hind: '#e6c497', hindTint: '#eaa47e', body: '#a98257', bodyDark: '#5a4029', head: '#6b4c31', spot: '#3e2a1a', fur: '#e2c9a0' }, // tan
+  { fore: '#f390b4', foreDark: '#b9557e', band: '#f8dc78', hind: '#fdeeb5', hindTint: '#f7b9cd', body: '#f6d86f', bodyDark: '#c49a32', head: '#e9b94c', spot: '#a8406b', fur: '#fff3b8' }, // rosy maple
+  { fore: '#c4c1d2', foreDark: '#686479', band: '#9894ad', hind: '#e2dfeb', hindTint: '#cfc6e2', body: '#a19bb4', bodyDark: '#565169', head: '#5f5a72', spot: '#37344a', fur: '#ebe8f3' }, // silver
+];
+
+// ================================================================== state
+const S = {
+  ready: false,
+  scale: 1, band: 30, rc: 39, minDim: 600,
+  room: { x: 0, y: 0, w: 1, h: 1 },
+  rail: [], railLen: 1, roomPath: null, railPath: null, roomCorners: [],
+  lamps: [], obstacles: [], moths: [], motes: [],
+  color: 'red',
+  selLamp: null, selObj: null,
+  hover: { lamp: null, obj: null, handle: false, frame: false },
+  ghost: { x: 0, y: 0, nx: 0, ny: 1, angle: 0, on: false, id: 0, fx: { pulse: 0, jolt: 0 } },   // doubles as a lamp for drawing
+  drag: null,
+  dirty: true,
+  floorDirty: true,
+  nextId: 1,
+  lampPlacedAt: -9,
+  litToastShown: false,
+  litCount: 0,
+  cursor: '',
+  ui: {},
+};
+const hash = new Kit.SpatialHash(48);
+const railOut = { x: 0, y: 0, nx: 0, ny: 1 };
+const keyHold = new Map();
+const angBuf = [];
+const byNumber = (a, b) => a - b;
+const reachPx = () => tw('reach') * S.scale;
+const handleLen = () => clamp(72 * S.scale, 58, 110);
+
+// ================================================================== geometry: room, rail, paths
+function pathRoundRect(p, x, y, w, h, r) {
+  const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+  p.moveTo(x + rr, y);
+  p.arcTo(x + w, y, x + w, y + h, rr);
+  p.arcTo(x + w, y + h, x, y + h, rr);
+  p.arcTo(x, y + h, x, y, rr);
+  p.arcTo(x, y, x + w, y, rr);
+  p.closePath();
+}
+
+/** The lamp rail follows the room's inner edge: four straights joined by quarter arcs. */
+function buildRail() {
+  const { x, y, w, h } = S.room, r = S.rc, q = (Math.PI / 2) * r;
+  const P = [];
+  let len = 0;
+  const add = (p) => { p.s0 = len; len += p.len; P.push(p); };
+  add({ arc: false, ax: x + r, ay: y, bx: x + w - r, by: y, nx: 0, ny: 1, len: w - 2 * r });
+  add({ arc: true, cx: x + w - r, cy: y + r, a0: -Math.PI / 2, len: q });
+  add({ arc: false, ax: x + w, ay: y + r, bx: x + w, by: y + h - r, nx: -1, ny: 0, len: h - 2 * r });
+  add({ arc: true, cx: x + w - r, cy: y + h - r, a0: 0, len: q });
+  add({ arc: false, ax: x + w - r, ay: y + h, bx: x + r, by: y + h, nx: 0, ny: -1, len: w - 2 * r });
+  add({ arc: true, cx: x + r, cy: y + h - r, a0: Math.PI / 2, len: q });
+  add({ arc: false, ax: x, ay: y + h - r, bx: x, by: y + r, nx: 1, ny: 0, len: h - 2 * r });
+  add({ arc: true, cx: x + r, cy: y + r, a0: Math.PI, len: q });
+  S.rail = P;
+  S.railLen = len;
+}
+
+/** Point + inward normal at rail distance s. */
+function railAt(s, out = railOut) {
+  const L = S.railLen;
+  s = ((s % L) + L) % L;
+  let p = S.rail[S.rail.length - 1];
+  for (let i = 0; i < S.rail.length; i++) if (s <= S.rail[i].s0 + S.rail[i].len) { p = S.rail[i]; break; }
+  const k = s - p.s0;
+  if (!p.arc) {
+    const t = p.len > 0 ? k / p.len : 0;
+    out.x = p.ax + (p.bx - p.ax) * t; out.y = p.ay + (p.by - p.ay) * t;
+    out.nx = p.nx; out.ny = p.ny;
+  } else {
+    const a = p.a0 + k / S.rc, c = Math.cos(a), sn = Math.sin(a);
+    out.x = p.cx + c * S.rc; out.y = p.cy + sn * S.rc;
+    out.nx = -c; out.ny = -sn;
+  }
+  return out;
+}
+
+/** Rail distance of the rail point nearest to (px, py). */
+function railNearest(px, py) {
+  let best = Infinity, bs = 0;
+  for (const p of S.rail) {
+    let qx, qy, s;
+    if (!p.arc) {
+      const ex = p.bx - p.ax, ey = p.by - p.ay;
+      const t = p.len > 0 ? clamp(((px - p.ax) * ex + (py - p.ay) * ey) / (p.len * p.len), 0, 1) : 0;
+      qx = p.ax + ex * t; qy = p.ay + ey * t; s = p.s0 + t * p.len;
+    } else {
+      let a = (((Math.atan2(py - p.cy, px - p.cx) - p.a0) % TAU) + TAU) % TAU;
+      if (a > Math.PI / 2) a = a > Math.PI * 1.25 ? 0 : Math.PI / 2;
+      qx = p.cx + Math.cos(p.a0 + a) * S.rc; qy = p.cy + Math.sin(p.a0 + a) * S.rc;
+      s = p.s0 + a * S.rc;
+    }
+    const d = (qx - px) * (qx - px) + (qy - py) * (qy - py);
+    if (d < best) { best = d; bs = s; }
+  }
+  return bs;
+}
+
+function inRoomRect(x, y) {
+  const R = S.room;
+  return x >= R.x && x <= R.x + R.w && y >= R.y && y <= R.y + R.h;
+}
+
+/** Point inside the rounded room shrunk by m. */
+function inRoom(x, y, m = 0) {
+  const R = S.room, rr = Math.max(0, S.rc - m);
+  const x0 = R.x + m, x1 = R.x + R.w - m, y0 = R.y + m, y1 = R.y + R.h - m;
+  if (x < x0 || x > x1 || y < y0 || y > y1) return false;
+  const cx = clamp(x, x0 + rr, x1 - rr), cy = clamp(y, y0 + rr, y1 - rr);
+  return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= rr * rr;
+}
+
+/** Keep a circle (radius m) inside the rounded room; reflects velocity on contact. */
+function keepInRoom(b, m) {
+  const R = S.room, rr = Math.max(0, S.rc - m);
+  const x0 = R.x + m, x1 = R.x + R.w - m, y0 = R.y + m, y1 = R.y + R.h - m;
+  if (b.x < x0) { b.x = x0; if (b.vx < 0) b.vx *= -0.6; }
+  if (b.x > x1) { b.x = x1; if (b.vx > 0) b.vx *= -0.6; }
+  if (b.y < y0) { b.y = y0; if (b.vy < 0) b.vy *= -0.6; }
+  if (b.y > y1) { b.y = y1; if (b.vy > 0) b.vy *= -0.6; }
+  const cx = clamp(b.x, x0 + rr, x1 - rr), cy = clamp(b.y, y0 + rr, y1 - rr);
+  const dx = b.x - cx, dy = b.y - cy, d = Math.hypot(dx, dy);
+  if (d > rr && d > 0) {
+    const nx = dx / d, ny = dy / d;
+    b.x = cx + nx * rr; b.y = cy + ny * rr;
+    const vn = b.vx * nx + b.vy * ny;
+    if (vn > 0) { b.vx -= 1.6 * vn * nx; b.vy -= 1.6 * vn * ny; }
+  }
+}
+
+function inFrame(x, y) {
+  const pr = Kit.playRect;
+  if (x < pr.x || x > pr.x + pr.w || y < pr.y || y > pr.y + pr.h) return false;
+  return !inRoom(x, y, 5);
+}
+
+function layout() {
+  const pr = Kit.playRect;
+  const prev = S.room.w > 1 ? Object.assign({}, S.room) : null;
+  S.scale = clamp(Math.sqrt(pr.w * pr.h) / 1010, 0.7, 1.7);
+  S.band = clamp(Math.round(30 * S.scale), 26, 34);
+  const b = S.band;
+  S.room = { x: pr.x + b, y: pr.y + b, w: Math.max(60, pr.w - 2 * b), h: Math.max(60, pr.h - 2 * b) };
+  const R = S.room;
+  S.minDim = Math.min(R.w, R.h);
+  S.rc = Math.round(Math.min(b * 1.3, S.minDim / 4));
+  S.roomCorners = [R.x, R.y, R.x + R.w, R.y, R.x + R.w, R.y + R.h, R.x, R.y + R.h];
+  buildRail();
+  S.roomPath = new Path2D(); pathRoundRect(S.roomPath, R.x, R.y, R.w, R.h, S.rc);
+  S.railPath = new Path2D(); pathRoundRect(S.railPath, R.x - b / 2, R.y - b / 2, R.w + b, R.h + b, S.rc + b / 2);
+  for (const l of S.lamps) placeLamp(l);
+  for (const o of S.obstacles) { updateObstacle(o); clampObstacle(o); }
+  if (prev) {
+    for (const m of S.moths) {
+      m.x = R.x + ((m.x - prev.x) / prev.w) * R.w;
+      m.y = R.y + ((m.y - prev.y) / prev.h) * R.h;
+      m.tn = 0;
+    }
+  }
+  const moteN = clamp(Math.round((R.w * R.h) / 6500), 60, 240);
+  if (S.motes.length !== moteN) makeMotes(moteN);
+  buildMothSprites();
+  buildLampSprites();
+  buildBackground();
+  S.dirty = true;
+}
+
+// ================================================================== world: obstacles
+function popScale(o) { return o.pop >= 1 ? 1 : Math.max(0.02, U.easeOutBack(o.pop)); }
+
+function makeObstacle(kind, cx, cy, size, rot, glass) {
+  const def = KINDS[kind];
+  const rnd = U.mulberry32(S.nextId * 7919 + 13);
+  const o = {
+    id: S.nextId++, kind, glass: glass || null, mat: glass ? 'glass' : def.mat,
+    cx, cy, size, rot, pop: 1,
+    points: def.verts.map(() => ({ x: 0, y: 0 })),
+    bx: 0, by: 0, br: 0, r: 0, glow: 0,
+  };
+  // render-only data stays non-enumerable so the test API serialises cleanly
+  Object.defineProperty(o, 'fx', {
+    value: {
+      edgeLit: new Float32Array(def.verts.length * 3),
+      specks: Array.from({ length: 16 }, () => ({ x: rnd() * 1.6 - 0.8, y: rnd() * 1.6 - 0.8, r: 0.03 + rnd() * 0.06, light: rnd() < 0.5 })),
+      grain: rnd() * 10,
+      flash: 0,
+    },
+    enumerable: false,
+  });
+  updateObstacle(o);
+  return o;
+}
+
+function updateObstacle(o) {
+  const R = S.room, verts = KINDS[o.kind].verts;
+  const r = o.size * S.minDim * popScale(o);
+  const c = Math.cos(o.rot), s = Math.sin(o.rot);
+  const X = R.x + o.cx * R.w, Y = R.y + o.cy * R.h;
+  let br = 0;
+  for (let i = 0; i < verts.length; i++) {
+    const v = verts[i], px = (v.x * c - v.y * s) * r, py = (v.x * s + v.y * c) * r;
+    o.points[i].x = X + px; o.points[i].y = Y + py;
+    br = Math.max(br, Math.hypot(px, py));
+  }
+  o.bx = X; o.by = Y; o.br = br; o.r = r;
+}
+
+/** Shift an obstacle so it stays fully inside the room, clear of the frame. */
+function clampObstacle(o) {
+  const R = S.room, m = 10;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const p of o.points) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y); }
+  let dx = 0, dy = 0;
+  if (x0 < R.x + m) dx = R.x + m - x0; else if (x1 > R.x + R.w - m) dx = R.x + R.w - m - x1;
+  if (y0 < R.y + m) dy = R.y + m - y0; else if (y1 > R.y + R.h - m) dy = R.y + R.h - m - y1;
+  if (dx || dy) { o.cx += dx / R.w; o.cy += dy / R.h; updateObstacle(o); }
+}
+
+function findFreeSpot(x, y, r) {
+  for (let ring = 0; ring < 14; ring++) {
+    const n = ring === 0 ? 1 : 10;
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * TAU + ring * 0.7, d = ring * r * 0.9;
+      const px = x + Math.cos(a) * d, py = y + Math.sin(a) * d;
+      if (!inRoom(px, py, r + 14)) continue;
+      let ok = true;
+      for (const o of S.obstacles) if (U.dist(px, py, o.bx, o.by) < o.br + r + 8) { ok = false; break; }
+      if (ok) return { x: px, y: py };
+    }
+  }
+  return { x, y };
+}
+
+function addObject(type, at) {
+  if (S.obstacles.length >= MAX_OBJECTS) {
+    Kit.sfx('buzz');
+    Kit.toast('Sixteen objects max — remove one first', { tone: 'bad' });
+    return null;
+  }
+  const spec = NEW_OBJECT[type] || NEW_OBJECT.square;
+  const R = S.room, r = spec.size * S.minDim;
+  let x = R.x + R.w / 2, y = R.y + R.h / 2;
+  if (at) { x = at.x; y = at.y; } else if (Kit.mouse.inside && inRoom(Kit.mouse.x, Kit.mouse.y, 30)) { x = Kit.mouse.x; y = Kit.mouse.y; }
+  const spot = findFreeSpot(x, y, r);
+  const o = makeObstacle(spec.kind, (spot.x - R.x) / R.w, (spot.y - R.y) / R.h, spec.size, rand(-0.4, 0.4), type === 'glass' ? S.color : null);
+  o.pop = 0;
+  updateObstacle(o);
+  S.obstacles.push(o);
+  selectObj(o);
+  burst(o.bx, o.by, o.glass ? BASE[o.glass] : '#ffffff', 12, 160);
+  ring(o.bx, o.by, o.glass ? BASE[o.glass] : '#ffffff', r * 2.2);
+  Kit.sfx('pop', { pitch: rand(0.9, 1.1) });
+  S.dirty = true;
+  return o;
+}
+
+function removeObstacle(o) {
+  const i = S.obstacles.indexOf(o);
+  if (i < 0) return;
+  S.obstacles.splice(i, 1);
+  if (S.selObj === o) S.selObj = null;
+  if (S.hover.obj === o) S.hover.obj = null;
+  if (S.drag && S.drag.obj === o) S.drag = null;
+  poof(o.bx, o.by, o.r, o.glass ? BASE[o.glass] : '#b9b2c9');
+  Kit.sfx('remove', { pitch: 0.9 });
+  S.dirty = true;
+  refreshHint();
+}
+
+function rotateObstacle(o, da) {
+  o.rot += da;
+  updateObstacle(o); clampObstacle(o);
+  S.dirty = true;
+  Kit.sfx('click', { gap: 70, vol: 0.35, pitch: 0.8 + (((o.rot % TAU) + TAU) % TAU) / TAU * 0.6 });
+}
+
+function moveObstacleTo(o, x, y) {
+  const R = S.room;
+  o.cx = (x - R.x) / R.w; o.cy = (y - R.y) / R.h;
+  updateObstacle(o); clampObstacle(o);
+  S.dirty = true;
+}
+
+const blocks = (o, color) => o.glass !== color;
+
+// ================================================================== lamps
+function makeLamp(s, color) {
+  const l = {
+    id: S.nextId++, color, on: true,
+    u: s / S.railLen, aim: 0, width: clamp(tw('width') * DEG, WIDTH_MIN, WIDTH_MAX), widthDeg: 0,
+    x: 0, y: 0, nx: 0, ny: 1, ox: 0, oy: 0, angle: 0,
+  };
+  Object.defineProperty(l, 'fx', {
+    value: { poly: [], path: null, grad: null, gradKey: '', power: 1, pulse: 0, flick: 1, jolt: 0 },
+    enumerable: false,
+  });
+  placeLamp(l);
+  return l;
+}
+
+/** Recompute the lamp's world position, origin and absolute aim from its rail position and offsets. */
+function placeLamp(l) {
+  const p = railAt(l.u * S.railLen);
+  l.x = p.x; l.y = p.y; l.nx = p.nx; l.ny = p.ny;
+  l.ox = p.x + p.nx * 1.5; l.oy = p.y + p.ny * 1.5;
+  l.angle = Math.atan2(p.ny, p.nx) + l.aim;
+  l.widthDeg = Math.round((l.width / DEG) * 10) / 10;
+  S.dirty = true;
+}
+
+function setAim(l, a) {
+  const na = clamp(a, -AIM_LIMIT, AIM_LIMIT);
+  if (na === l.aim) return;
+  l.aim = na; placeLamp(l);
+  Kit.sfx('click', { gap: 60, vol: 0.28, pitch: 1 + l.aim * 0.35 });
+}
+
+function setWidth(l, w) {
+  const nw = clamp(w, WIDTH_MIN, WIDTH_MAX);
+  if (nw === l.width) return;
+  l.width = nw; placeLamp(l);
+  Kit.sfx('click', { gap: 60, vol: 0.28, pitch: 0.7 + (nw / WIDTH_MAX) * 0.8 });
+}
+
+function addLampAt(x, y, color, opts = {}) {
+  if (S.lamps.length >= MAX_LAMPS) {
+    Kit.sfx('buzz');
+    Kit.toast(Kit.pick('Five lamps max — remove one first', 'Five lights max — remove one first'), { tone: 'bad' });
+    return null;
+  }
+  const l = makeLamp(railNearest(x, y), COLORS.includes(color) ? color : S.color);
+  if (opts.aimAt) l.aim = clamp(angleDiff(Math.atan2(l.ny, l.nx), Math.atan2(opts.aimAt.y - l.oy, opts.aimAt.x - l.ox)), -AIM_LIMIT, AIM_LIMIT);
+  placeLamp(l);
+  S.lamps.push(l);
+  if (!opts.silent) {
+    l.fx.pulse = 1; l.fx.power = 0;
+    ring(l.x, l.y, BASE[l.color], 60 * S.scale);
+    burst(l.x + l.nx * 8, l.y + l.ny * 8, BASE[l.color], 10, 140);
+    Kit.sfx('place', { pitch: { red: 0.9, green: 1, blue: 1.12 }[l.color] });
+    selectLamp(l);
+    S.lampPlacedAt = Kit.realTime;
+  }
+  S.dirty = true;
+  updateCounts();
+  return l;
+}
+
+/** Place a lamp in the biggest free stretch of the rail. */
+function addLampFree() {
+  if (S.lamps.length >= MAX_LAMPS) return addLampAt(0, 0, S.color);
+  const L = S.railLen;
+  let best = 0, bestD = -1;
+  for (let i = 0; i < 96; i++) {
+    const s = (i / 96) * L;
+    let d = L;
+    for (const l of S.lamps) { const ds = Math.abs(s - l.u * L); d = Math.min(d, ds, L - ds); }
+    // prefer the middle of the long sides over corners
+    const p = railAt(s);
+    const corner = p.nx !== 0 && p.ny !== 0 && Math.abs(p.nx) !== 1 && Math.abs(p.ny) !== 1 ? 0.6 : 1;
+    if (d * corner > bestD) { bestD = d * corner; best = s; }
+  }
+  const p = railAt(best);
+  return addLampAt(p.x, p.y, S.color);
+}
+
+function removeLamp(l) {
+  const i = S.lamps.indexOf(l);
+  if (i < 0) return;
+  S.lamps.splice(i, 1);
+  for (const m of S.moths) if (m.target === l) loseLight(m);
+  if (S.selLamp === l) S.selLamp = null;
+  if (S.hover.lamp === l) S.hover.lamp = null;
+  if (S.drag && S.drag.lamp === l) S.drag = null;
+  poof(l.x, l.y, 16 * S.scale, BASE[l.color]);
+  Kit.sfx('remove');
+  S.dirty = true;
+  updateCounts();
+  refreshHint();
+}
+
+function clearLamps() {
+  if (!S.lamps.length) return;
+  for (const l of S.lamps.slice()) removeLamp(l);
+  Kit.sfx('whoosh', { pitch: 0.7 });
+}
+
+function toggleLamp(l) {
+  l.on = !l.on;
+  l.fx.pulse = 0.6;
+  if (!l.on) for (const m of S.moths) if (m.target === l) loseLight(m);
+  Kit.sfx('toggle', { pitch: l.on ? 1.25 : 0.75 });
+  S.dirty = true;
+}
+
+function setColor(c, fromUser) {
+  if (!COLORS.includes(c)) return;
+  S.color = c;
+  for (const k of COLORS) Kit.ui.setActive(S.ui.swatch[k], k === c);
+  if (S.ui.glassBtn) S.ui.glassBtn.style.color = BASE[c];
+  const l = S.selLamp;
+  if (l && l.color !== c) {
+    l.color = c; l.fx.pulse = 0.7;
+    for (const m of S.moths) if (m.target === l) m.switchT = 0;
+    burst(l.x + l.nx * 10, l.y + l.ny * 10, BASE[c], 8, 120);
+    S.dirty = true;
+  }
+  if (fromUser) Kit.sfx('bloop', { pitch: { red: 0.85, green: 1, blue: 1.18 }[c] });
+}
+
+// ================================================================== beams (visibility polygons)
+function castRay(ox, oy, dx, dy, color) {
+  const R = S.room;
+  let t = Infinity;
+  if (dx > 1e-9) t = (R.x + R.w - ox) / dx; else if (dx < -1e-9) t = (R.x - ox) / dx;
+  if (dy > 1e-9) t = Math.min(t, (R.y + R.h - oy) / dy); else if (dy < -1e-9) t = Math.min(t, (R.y - oy) / dy);
+  const obs = S.obstacles;
+  for (let k = 0; k < obs.length; k++) {
+    const o = obs[k];
+    if (o.glass === color) continue;
+    const px = o.bx - ox, py = o.by - oy, tc = px * dx + py * dy, br2 = o.br * o.br;
+    if (tc < -o.br) continue;
+    const perp2 = px * px + py * py - tc * tc;
+    if (perp2 > br2 || tc - Math.sqrt(br2 - perp2) > t) continue;
+    const pts = o.points, n = pts.length;
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+      const ax = pts[j].x, ay = pts[j].y, ex = pts[i].x - ax, ey = pts[i].y - ay;
+      const den = dx * ey - dy * ex;
+      if (den > -1e-12 && den < 1e-12) continue;
+      const qx = ax - ox, qy = ay - oy;
+      const tt = (qx * ey - qy * ex) / den;
+      if (tt <= 1e-6 || tt >= t) continue;
+      const u = (qx * dy - qy * dx) / den;
+      if (u >= 0 && u <= 1) t = tt;
+    }
+  }
+  return t;
+}
+
+function computeBeam(l) {
+  const fx = l.fx, poly = fx.poly, ox = l.ox, oy = l.oy, a0 = l.angle, hw = l.width / 2;
+  angBuf.length = 0;
+  const n = Math.max(2, Math.ceil(l.width / RAY_STEP));
+  for (let i = 0; i <= n; i++) angBuf.push(-hw + (l.width * i) / n);
+  const addVert = (vx, vy) => {
+    const d = angleDiff(a0, Math.atan2(vy - oy, vx - ox));
+    if (d > -hw && d < hw) angBuf.push(Math.max(-hw, d - EPS_ANG), d, Math.min(hw, d + EPS_ANG));
+  };
+  for (const o of S.obstacles) if (blocks(o, l.color)) for (const p of o.points) addVert(p.x, p.y);
+  const c = S.roomCorners;
+  for (let i = 0; i < 8; i += 2) addVert(c[i], c[i + 1]);
+  angBuf.sort(byNumber);
+  poly.length = 0;
+  poly.push(ox, oy);
+  let far = 0;
+  for (let i = 0; i < angBuf.length; i++) {
+    const a = a0 + angBuf[i], dx = Math.cos(a), dy = Math.sin(a);
+    const t = castRay(ox, oy, dx, dy, l.color);
+    poly.push(ox + dx * t, oy + dy * t);
+    if (t > far) far = t;
+  }
+  const path = new Path2D();
+  path.moveTo(poly[0], poly[1]);
+  for (let i = 2; i < poly.length; i += 2) path.lineTo(poly[i], poly[i + 1]);
+  path.closePath();
+  fx.path = path;
+  fx.far = Math.max(far, 40);
+  fx.grad = null;
+}
+
+/** Beam intensity at (px,py) from lamp l (0 when dark). margin widens the cone (hysteresis). */
+function litAmount(px, py, l, margin = 0) {
+  if (!l.on || !inRoomRect(px, py)) return 0;
+  const dx = px - l.ox, dy = py - l.oy, d = Math.hypot(dx, dy);
+  if (d < 1) return 1;
+  if (Math.abs(angleDiff(l.angle, Math.atan2(dy, dx))) > l.width / 2 + margin) return 0;
+  if (segBlocked(l.ox, l.oy, px, py, l.color)) return 0;
+  return 1 / (1 + d / reachPx());
+}
+
+function segBlocked(ax, ay, bx, by, color) {
+  const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy || 1;
+  const obs = S.obstacles;
+  for (let k = 0; k < obs.length; k++) {
+    const o = obs[k];
+    if (o.glass === color) continue;
+    const t = clamp(((o.bx - ax) * dx + (o.by - ay) * dy) / len2, 0, 1);
+    const cx = ax + dx * t - o.bx, cy = ay + dy * t - o.by;
+    if (cx * cx + cy * cy > o.br * o.br) continue;
+    const pts = o.points, n = pts.length;
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+      if (U.segIntersect(ax, ay, bx, by, pts[j].x, pts[j].y, pts[i].x, pts[i].y) >= 0) return true;
+    }
+  }
+  return false;
+}
+
+function isLitPoint(x, y, lamp) {
+  if (lamp) return litAmount(x, y, lamp) > 0;
+  for (const l of S.lamps) if (litAmount(x, y, l) > 0) return true;
+  return false;
+}
+
+/** Recompute every beam plus the derived lighting on object edges and glass. */
+function recomputeBeams() {
+  S.dirty = false;
+  S.floorDirty = true;
+  for (const l of S.lamps) computeBeam(l);
+  for (const o of S.obstacles) {
+    const el = o.fx.edgeLit, pts = o.points, n = pts.length;
+    el.fill(0);
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+      const ax = pts[j].x, ay = pts[j].y, bx = pts[i].x, by = pts[i].y;
+      const mx = (ax + bx) / 2, my = (ay + by) / 2;
+      let nx = by - ay, ny = -(bx - ax);
+      const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+      if (nx * (mx - o.bx) + ny * (my - o.by) < 0) { nx = -nx; ny = -ny; }
+      for (const l of S.lamps) {
+        if (!l.on || nx * (l.ox - mx) + ny * (l.oy - my) <= 0) continue;
+        const I = litAmount(mx + nx * 2, my + ny * 2, l);
+        if (I > 0) el[j * 3 + COLORS.indexOf(l.color)] += I;
+      }
+    }
+    let g = 0;
+    if (o.glass) {
+      for (const l of S.lamps) {
+        if (l.color !== o.glass) continue;
+        g = Math.max(g, litAmount(o.bx, o.by, l));
+        for (const p of pts) g = Math.max(g, litAmount(lerp(p.x, o.bx, 0.35), lerp(p.y, o.by, 0.35), l));
+      }
+    }
+    o.glow = g;
+  }
+}
+
+// ================================================================== creatures (moths)
+function makeMoth(x, y, look) {
+  const m = {
+    x, y, vx: 0, vy: 0, h: rand(0, TAU), wh: rand(0, TAU),
+    state: 'wander', target: null,
+    size: rand(0.9, 1.1), look: look != null ? look : U.randi(0, MOTH_LOOKS.length - 1),
+    p1: rand(0, TAU), p2: rand(0, TAU), p3: rand(0, TAU), flap: rand(0, TAU),
+    unlitT: 0, switchT: 0, lostT: 0, dazeT: 0, spin: 1,
+    orbitA: rand(0, TAU), orbitDir: Math.random() < 0.5 ? 1 : -1, bumpT: rand(0.5, 1.4),
+    glow: 0, glowColor: 'red', squash: 0, lastLit: -9,
+  };
+  Object.defineProperty(m, 'fx', { value: { trail: new Float32Array(TRAIL * 2), tn: 0, th: 0 }, enumerable: false });
+  return m;
+}
+
+function randomFreePoint(margin) {
+  const R = S.room;
+  for (let i = 0; i < 60; i++) {
+    const x = rand(R.x + margin, R.x + R.w - margin), y = rand(R.y + margin, R.y + R.h - margin);
+    if (!inRoom(x, y, margin)) continue;
+    let ok = true;
+    for (const o of S.obstacles) if (U.dist(x, y, o.bx, o.by) < o.br + margin) { ok = false; break; }
+    if (ok) return { x, y };
+  }
+  return { x: R.x + R.w / 2, y: R.y + R.h / 2 };
+}
+
+function setCreatureCount(n) {
+  n = clamp(Math.round(n), 1, MAX_MOTHS);
+  if (!S.ready) return;
+  let changed = false;
+  while (S.moths.length < n) {
+    const p = randomFreePoint(30 * S.scale);
+    const m = makeMoth(p.x, p.y);
+    m.squash = 1;
+    S.moths.push(m);
+    burst(p.x, p.y, '#ffffff', 6, 90);
+    changed = true;
+  }
+  while (S.moths.length > n) {
+    const m = S.moths.pop();
+    poof(m.x, m.y, 10 * S.scale, '#d8d0e8');
+    changed = true;
+  }
+  if (changed) Kit.sfx('bloop', { gap: 70, vol: 0.5, pitch: rand(1.1, 1.4) });
+  updateCounts();
+}
+
+function scatter() {
+  for (const m of S.moths) {
+    let ax = rand(-1, 1), ay = rand(-1, 1);
+    if (m.target) { ax += (m.x - m.target.x) * 0.02; ay += (m.y - m.target.y) * 0.02; }
+    const d = Math.hypot(ax, ay) || 1, sp = rand(260, 380) * S.scale;
+    loseLight(m);
+    m.dazeT = rand(0.9, 1.4); m.lostT = m.dazeT + 0.2;
+    m.vx = (ax / d) * sp; m.vy = (ay / d) * sp;
+  }
+  Kit.sfx('whoosh', { pitch: 1.2 });
+}
+
+function seekLight(m, l) {
+  const wasDark = !m.target;
+  m.target = l; m.state = 'seek'; m.unlitT = 0; m.switchT = 0; m.glowColor = l.color;
+  if (wasDark && Kit.time - m.lastLit > 1.2) {
+    burst(m.x, m.y, BASE[l.color], 9, 120);
+    Kit.sfx('chirp', { gap: 220, vol: 0.55, pitch: rand(0.9, 1.15) });
+    if (!S.litToastShown) {
+      S.litToastShown = true;
+      Kit.toast(Kit.pick('A moth spotted the light', 'An agent entered the light'), { tone: 'good' });
+    }
+  }
+  m.lastLit = Kit.time;
+}
+
+function loseLight(m) {
+  m.target = null; m.state = 'lost';
+  m.lostT = rand(0.6, 1); m.dazeT = 0.35; m.spin = Math.random() < 0.5 ? -1 : 1;
+}
+
+/** Decide which lamp (if any) a moth follows, with hysteresis so it commits to one beam. */
+function senseLight(m, dt) {
+  if (m.dazeT > 0) { m.dazeT -= dt; return; }
+  const orbitR = 30 * S.scale;
+  let best = null, bestI = 0, curI = 0;
+  for (const l of S.lamps) {
+    let I;
+    if (l === m.target) {
+      I = m.state === 'orbit' && l.on && U.dist(m.x, m.y, l.ox, l.oy) < orbitR * 3.2 ? 1 : litAmount(m.x, m.y, l, 10 * DEG);
+      curI = I;
+    } else I = litAmount(m.x, m.y, l);
+    if (I > bestI) { bestI = I; best = l; }
+  }
+  if (m.target) {
+    if (curI > 0) {
+      m.unlitT = 0;
+      m.lastLit = Kit.time;
+      if (best !== m.target && bestI > curI * 1.5) { m.switchT += dt; if (m.switchT > 0.6) seekLight(m, best); } else m.switchT = 0;
+    } else {
+      m.unlitT += dt;
+      if (m.unlitT > 0.3) { if (best) seekLight(m, best); else loseLight(m); }
+    }
+  } else if (best) seekLight(m, best);
+}
+
+// neighbour separation (module-level scratch keeps the hot loop allocation-free)
+let sepM = null, sepAx = 0, sepAy = 0, sepR = 0;
+function sepVisit(o) {
+  if (o === sepM) return;
+  const dx = sepM.x - o.x, dy = sepM.y - o.y, d2 = dx * dx + dy * dy;
+  if (d2 >= sepR * sepR || d2 < 1e-6) return;
+  const d = Math.sqrt(d2), f = (1 - d / sepR) / d;
+  sepAx += dx * f; sepAy += dy * f;
+}
+
+function avoidObstacles(m, look, strength, out) {
+  const sp = Math.hypot(m.vx, m.vy);
+  if (sp < 1) return;
+  const dx = m.vx / sp, dy = m.vy / sp, rad = 12 * S.scale;
+  for (const o of S.obstacles) {
+    const px = o.bx - m.x, py = o.by - m.y, along = px * dx + py * dy;
+    if (along < 0 || along > look + o.br) continue;
+    const side = -px * dy + py * dx;
+    if (Math.abs(side) > o.br + rad) continue;
+    const push = (1 - along / (look + o.br)) * strength * (side > 0 ? -1 : 1);
+    out.ax += -dy * push; out.ay += dx * push;
+  }
+}
+
+function pushOutOfObstacles(m, rad) {
+  for (const o of S.obstacles) {
+    const ddx = m.x - o.bx, ddy = m.y - o.by;
+    if (ddx * ddx + ddy * ddy > (o.br + rad) * (o.br + rad)) continue;
+    const pts = o.points, n = pts.length;
+    let best = Infinity, qx = 0, qy = 0;
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+      const ax = pts[j].x, ay = pts[j].y, ex = pts[i].x - ax, ey = pts[i].y - ay;
+      const t = clamp(((m.x - ax) * ex + (m.y - ay) * ey) / (ex * ex + ey * ey || 1), 0, 1);
+      const cx = ax + ex * t, cy = ay + ey * t, d2 = (m.x - cx) * (m.x - cx) + (m.y - cy) * (m.y - cy);
+      if (d2 < best) { best = d2; qx = cx; qy = cy; }
+    }
+    const inside = U.pointInPoly(m.x, m.y, pts);
+    const d = Math.sqrt(best);
+    let nx, ny, pen;
+    if (inside) {
+      if (d < 1e-6) { nx = ddx; ny = ddy; } else { nx = qx - m.x; ny = qy - m.y; }
+      const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl; pen = d + rad;
+    } else if (d < rad) {
+      nx = (m.x - qx) / (d || 1); ny = (m.y - qy) / (d || 1); pen = rad - d;
+    } else continue;
+    m.x += nx * pen; m.y += ny * pen;
+    const vn = m.vx * nx + m.vy * ny;
+    if (vn < 0) { m.vx -= 1.5 * vn * nx; m.vy -= 1.5 * vn * ny; }
+  }
+}
+
+const steer = { ax: 0, ay: 0 };
+function updateMoths(dt, t) {
+  const s = S.scale, spd = tw('speed'), pull = tw('pull');
+  const wanderV = 45 * s * spd, seekV = 170 * s * spd * Math.sqrt(pull), orbitR = 30 * s, rad = 12 * s;
+  const R = S.room, rcx = R.x + R.w / 2, rcy = R.y + R.h / 2;
+  sepR = 30 * s;
+  hash.cell = Math.max(24, sepR);
+  hash.clear();
+  for (const m of S.moths) hash.insert(m, m.x, m.y);
+  let lit = 0;
+  for (const m of S.moths) {
+    senseLight(m, dt);
+    steer.ax = 0; steer.ay = 0;
+    const l = m.target;
+    if (l && (m.state === 'seek' || m.state === 'orbit')) {
+      const fx = l.ox + l.nx * orbitR, fy = l.oy + l.ny * orbitR;
+      if (m.state === 'seek') {
+        let dx = fx - m.x, dy = fy - m.y;
+        const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
+        const taper = clamp(d / (170 * s), 0.25, 1);
+        const wob = (Math.sin(t * 9.3 + m.p1) * 0.6 + Math.sin(t * 23.7 + m.p2) * 0.4) * taper;
+        const v = seekV * (0.9 + 0.2 * Math.sin(t * 3.1 + m.p3)) * clamp(d / (70 * s), 0.55, 1);
+        const tx = dx * v - dy * wob * v * 0.75, ty = dy * v + dx * wob * v * 0.75;
+        const k = 4.5 * pull;
+        steer.ax += (tx - m.vx) * k; steer.ay += (ty - m.vy) * k;
+        avoidObstacles(m, 55 * s, 700 * s, steer);
+        if (Math.random() < dt * 1.2) { const j = rand(-1, 1) * 70 * s; m.vx += -dy * j; m.vy += dx * j; }
+        if (d < orbitR * 1.35) m.state = 'orbit';
+      } else {
+        m.orbitA += m.orbitDir * (4.6 + Math.sin(t * 1.7 + m.p1) * 1.6) * dt;
+        if (Math.random() < dt * 0.35) m.orbitDir *= -1;
+        m.bumpT -= dt;
+        const rr = orbitR * (0.72 + 0.36 * Math.sin(t * 3.3 + m.p2));
+        let gx = fx + Math.cos(m.orbitA) * rr, gy = fy + Math.sin(m.orbitA) * rr;
+        if (m.bumpT < 0) {
+          gx = l.x; gy = l.y;
+          if (U.dist(m.x, m.y, l.ox, l.oy) < 14 * s || m.bumpT < -0.6) bumpLamp(m, l);
+        }
+        steer.ax += (gx - m.x) * 26 - m.vx * 4.2 + rand(-1, 1) * 900 * s;
+        steer.ay += (gy - m.y) * 26 - m.vy * 4.2 + rand(-1, 1) * 900 * s;
+        if (U.dist(m.x, m.y, fx, fy) > orbitR * 3.4) m.state = 'seek';
+      }
+    } else if (m.state === 'lost') {
+      m.lostT -= dt;
+      const damp = Math.exp(-dt * 2.6);
+      m.vx *= damp; m.vy *= damp;
+      m.h += m.spin * 7 * dt;
+      if (m.lostT <= 0) { m.state = 'wander'; m.wh = m.h; }
+    } else {
+      m.wh += (Math.sin(t * 0.53 + m.p1) * 1.1 + Math.sin(t * 1.37 + m.p2) * 0.7) * dt;
+      const ex = (m.x - rcx) / (R.w / 2), ey = (m.y - rcy) / (R.h / 2);
+      if (ex * ex + ey * ey > 0.42) m.wh = U.angleLerp(m.wh, Math.atan2(rcy - m.y, rcx - m.x), 1 - Math.exp(-dt * 1.3));
+      const v = wanderV * (0.85 + 0.3 * Math.sin(t * 0.9 + m.p3));
+      steer.ax += (Math.cos(m.wh) * v - m.vx) * 2.5; steer.ay += (Math.sin(m.wh) * v - m.vy) * 2.5;
+      avoidObstacles(m, 50 * s, 220 * s, steer);
+    }
+    // separation keeps a swarm from collapsing into one dot
+    sepM = m; sepAx = 0; sepAy = 0;
+    hash.query(m.x, m.y, sepR, sepVisit);
+    const sepK = m.state === 'orbit' ? 2600 * s : 900 * s;
+    steer.ax += sepAx * sepK; steer.ay += sepAy * sepK;
+
+    m.vx += steer.ax * dt; m.vy += steer.ay * dt;
+    const maxV = (m.state === 'orbit' ? 330 : m.state === 'seek' ? 170 * 1.6 * Math.sqrt(pull) : 260) * s * spd;
+    const sp = Math.hypot(m.vx, m.vy);
+    if (sp > maxV) { m.vx *= maxV / sp; m.vy *= maxV / sp; }
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    pushOutOfObstacles(m, rad);
+    keepInRoom(m, rad);
+
+    if (m.state !== 'lost' && sp > 4) m.h = U.angleLerp(m.h, Math.atan2(m.vy, m.vx), 1 - Math.exp(-dt * 11));
+    const rate = m.state === 'orbit' ? 21 : m.state === 'seek' ? 16 : m.state === 'lost' ? 4.5 : 7.5;
+    m.flap += dt * TAU * rate * (0.9 + 0.2 * Math.sin(m.p3));
+    m.glow += ((m.target ? 1 : 0) - m.glow) * (1 - Math.exp(-dt * 5));
+    m.squash = Math.max(0, m.squash - dt * 4);
+    const f = m.fx;
+    f.trail[f.th * 2] = m.x; f.trail[f.th * 2 + 1] = m.y;
+    f.th = (f.th + 1) % TRAIL; f.tn = Math.min(TRAIL, f.tn + 1);
+    if (m.target) lit++;
+  }
+  if (lit !== S.litCount) { S.litCount = lit; updateCounts(); }
+}
+
+function bumpLamp(m, l) {
+  m.bumpT = rand(0.55, 1.5);
+  m.squash = 1;
+  m.vx = l.nx * 190 * S.scale + rand(-80, 80) * S.scale;
+  m.vy = l.ny * 190 * S.scale + rand(-80, 80) * S.scale;
+  l.fx.jolt = 1;
+  burst(m.x, m.y, BASE[l.color], 4, 90);
+  Kit.sfx('bite', { gap: 220, vol: 0.18, pitch: rand(1.2, 1.7) });
+}
+
+// ================================================================== particles + dust
+const PARTS = Array.from({ length: 700 }, () => ({ kind: 0, x: 0, y: 0, vx: 0, vy: 0, life: 0, max: 1, size: 1, color: '#fff' }));
+let partN = 0;
+function emit(kind, x, y, vx, vy, life, size, color) {
+  if (partN >= PARTS.length) return;
+  const p = PARTS[partN++];
+  p.kind = kind; p.x = x; p.y = y; p.vx = vx; p.vy = vy; p.life = p.max = life; p.size = size; p.color = color;
+}
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), v = rand(0.35, 1) * speed * S.scale;
+    emit(0, x, y, Math.cos(a) * v, Math.sin(a) * v, rand(0.35, 0.7), rand(2, 3.6) * S.scale, color);
+  }
+}
+function ring(x, y, color, radius) { emit(1, x, y, 0, 0, 0.55, radius, color); }
+function poof(x, y, r, color) {
+  for (let i = 0; i < 10; i++) {
+    const a = rand(0, TAU), v = rand(30, 90) * S.scale;
+    emit(2, x + Math.cos(a) * r * 0.5, y + Math.sin(a) * r * 0.5, Math.cos(a) * v, Math.sin(a) * v, rand(0.4, 0.7), rand(0.4, 0.75) * r, color);
+  }
+  ring(x, y, color, r * 2);
+}
+function updateParticles(dt) {
+  for (let i = 0; i < partN; i++) {
+    const p = PARTS[i];
+    p.life -= dt;
+    if (p.life <= 0) { PARTS[i] = PARTS[partN - 1]; PARTS[partN - 1] = p; partN--; i--; continue; }
+    const drag = Math.exp(-dt * (p.kind === 2 ? 4 : 3));
+    p.vx *= drag; p.vy *= drag;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+}
+
+function makeMotes(n) {
+  S.motes = Array.from({ length: n }, () => ({
+    u: Math.random(), v: Math.random(), du: rand(-1, 1) * 0.006, dv: rand(-1, 1) * 0.006,
+    ph: rand(0, TAU), f: rand(1.5, 4.5), sz: rand(0.6, 1.4), lr: 0, lg: 0, lb: 0,
+  }));
+}
+function updateMotes(dt, t) {
+  for (const d of S.motes) {
+    d.u += (d.du + Math.sin(t * 0.31 + d.ph) * 0.003) * dt;
+    d.v += (d.dv + Math.cos(t * 0.27 + d.ph * 1.3) * 0.003) * dt;
+    if (d.u < 0) d.u += 1; else if (d.u > 1) d.u -= 1;
+    if (d.v < 0) d.v += 1; else if (d.v > 1) d.v -= 1;
+  }
+}
+
+// ================================================================== input
+function updateHover(x, y) {
+  const h = S.hover, s = S.scale;
+  h.handle = false; h.lamp = null; h.obj = null; h.frame = false;
+  const sl = S.selLamp;
+  if (sl) {
+    const L = handleLen();
+    const hx = sl.ox + Math.cos(sl.angle) * L, hy = sl.oy + Math.sin(sl.angle) * L;
+    if (U.dist(x, y, hx, hy) < Math.max(14, 13 * s)) h.handle = true;
+  }
+  if (!h.handle) {
+    const hitR = Math.max(18, S.band * 0.75);
+    let bd = hitR;
+    for (const l of S.lamps) { const d = U.dist(x, y, l.x, l.y); if (d < bd) { bd = d; h.lamp = l; } }
+  }
+  if (!h.handle && !h.lamp) {
+    for (let i = S.obstacles.length - 1; i >= 0; i--) {
+      const o = S.obstacles[i];
+      if (U.dist(x, y, o.bx, o.by) > o.br + 4) continue;
+      if (U.pointInPoly(x, y, o.points)) { h.obj = o; break; }
+    }
+    if (!h.obj && inFrame(x, y)) {
+      h.frame = true;
+      const p = railAt(railNearest(x, y));
+      const g = S.ghost;
+      g.x = p.x; g.y = p.y; g.nx = p.nx; g.ny = p.ny; g.angle = Math.atan2(p.ny, p.nx);
+    }
+  }
+  S.ghost.on = h.frame;
+  let cur = 'default';
+  if (S.drag) cur = 'grabbing';
+  else if (h.handle || h.lamp || h.obj) cur = 'grab';
+  else if (h.frame) cur = S.lamps.length >= MAX_LAMPS ? 'not-allowed' : 'copy';
+  if (cur !== S.cursor) { S.cursor = cur; Kit.canvas.style.cursor = cur; }
+}
+
+function selectLamp(l) {
+  if (S.selLamp === l && !S.selObj) return;
+  S.selLamp = l; S.selObj = null;
+  if (l) { l.fx.pulse = Math.max(l.fx.pulse, 0.35); }
+  refreshHint();
+}
+function selectObj(o) {
+  S.selObj = o; S.selLamp = null;
+  if (o) o.fx.flash = 1;
+  refreshHint();
+}
+function deselect() {
+  if (!S.selLamp && !S.selObj) return;
+  S.selLamp = null; S.selObj = null;
+  refreshHint();
+}
+function cycleLamp(dir) {
+  if (!S.lamps.length) return;
+  const i = S.lamps.indexOf(S.selLamp);
+  const n = S.lamps.length;
+  const next = S.lamps[i < 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n];
+  selectLamp(next);
+  next.fx.pulse = 0.6;
+  Kit.sfx('click', { pitch: 1.3 });
+}
+function deleteSelected() {
+  if (S.selLamp) removeLamp(S.selLamp);
+  else if (S.selObj) removeObstacle(S.selObj);
+}
+
+function pointerDown(p) {
+  updateHover(p.x, p.y);
+  const h = S.hover;
+  if (p.button === 2) {
+    if (h.lamp) removeLamp(h.lamp);
+    else if (h.obj) removeObstacle(h.obj);
+    updateHover(p.x, p.y);
+    return;
+  }
+  if (p.button !== 0) return;
+  if (h.handle) {
+    S.drag = { kind: 'aim', lamp: S.selLamp };
+  } else if (h.lamp) {
+    selectLamp(h.lamp);
+    S.drag = { kind: 'lamp', lamp: h.lamp, sx: p.x, sy: p.y, moved: false };
+  } else if (h.obj) {
+    const o = h.obj;
+    selectObj(o);
+    S.drag = { kind: 'obj', obj: o, offx: o.bx - p.x, offy: o.by - p.y, sx: p.x, sy: p.y, moved: false };
+    Kit.sfx('click', { pitch: 0.7 });
+  } else if (h.frame) {
+    addLampAt(p.x, p.y, S.color);
+  } else {
+    deselect();
+  }
+  updateHover(p.x, p.y);
+}
+
+function pointerMove(p) {
+  const d = S.drag;
+  if (d) {
+    if (d.kind === 'aim') {
+      const l = d.lamp;
+      setAim(l, angleDiff(Math.atan2(l.ny, l.nx), Math.atan2(p.y - l.oy, p.x - l.ox)));
+    } else if (d.kind === 'lamp') {
+      if (!d.moved && U.dist(p.x, p.y, d.sx, d.sy) < 4) return;
+      d.moved = true;
+      const l = d.lamp, before = l.u;
+      l.u = railNearest(p.x, p.y) / S.railLen;
+      placeLamp(l);
+      if (Math.abs(before - l.u) > 0.002) Kit.sfx('click', { gap: 90, vol: 0.22, pitch: 0.8 + l.u * 0.6 });
+    } else if (d.kind === 'obj') {
+      if (!d.moved && U.dist(p.x, p.y, d.sx, d.sy) < 3) return;
+      d.moved = true;
+      moveObstacleTo(d.obj, p.x + d.offx, p.y + d.offy);
+    }
+    return;
+  }
+  updateHover(p.x, p.y);
+}
+
+function pointerUp(p) {
+  const d = S.drag;
+  if (d && d.moved) Kit.sfx('place', { pitch: d.kind === 'obj' ? 0.65 : 0.8, vol: 0.5 });
+  S.drag = null;
+  updateHover(p.x, p.y);
+}
+
+function wheel(p, e) {
+  updateHover(p.x, p.y);
+  let d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  if (e.deltaMode === 1) d *= 33;
+  const steps = clamp(d / 100, -3, 3);
+  if (!steps) return;
+  const h = S.hover;
+  const l = h.lamp || h.handle ? (h.lamp || S.selLamp) : (!h.obj ? S.selLamp : null);
+  if (l) {
+    if (S.selLamp !== l) selectLamp(l);
+    if (p.shift) setWidth(l, l.width - steps * 3 * DEG);
+    else setAim(l, l.aim + steps * 4 * DEG);
+  } else if (h.obj) {
+    rotateObstacle(h.obj, steps * 8 * DEG);
+  }
+}
+
+function dblclick(p) {
+  updateHover(p.x, p.y);
+  if (S.hover.lamp && Kit.realTime - S.lampPlacedAt > 0.5) toggleLamp(S.hover.lamp);
+}
+
+const STEP_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'KeyQ', 'KeyE']);
+/** One keyboard nudge; f = 1 for a tap, or a time-scaled fraction while the key is held. */
+function nudge(code, f) {
+  const l = S.selLamp, o = S.selObj;
+  if (l) {
+    if (code === 'ArrowLeft' || code === 'KeyQ') setAim(l, l.aim - 3 * DEG * f);
+    else if (code === 'ArrowRight' || code === 'KeyE') setAim(l, l.aim + 3 * DEG * f);
+    else if (code === 'ArrowUp') setWidth(l, l.width + 2 * DEG * f);
+    else if (code === 'ArrowDown') setWidth(l, l.width - 2 * DEG * f);
+  } else if (o) {
+    if (code === 'KeyQ') rotateObstacle(o, -6 * DEG * f);
+    else if (code === 'KeyE') rotateObstacle(o, 6 * DEG * f);
+    else {
+      const step = 6 * S.scale * f;
+      const dx = code === 'ArrowLeft' ? -step : code === 'ArrowRight' ? step : 0;
+      const dy = code === 'ArrowUp' ? -step : code === 'ArrowDown' ? step : 0;
+      moveObstacleTo(o, o.bx + dx, o.by + dy);
+    }
+  }
+}
+
+function keydown(e) {
+  const c = e.code;
+  const digit = /^(Digit|Numpad)([1-8])$/.exec(c);
+  if (digit) {
+    if (e.repeat) return true;
+    const n = +digit[2];
+    if (n <= 3) setColor(COLORS[n - 1], true);
+    else addObject(['square', 'triangle', 'circle', 'bar', 'glass'][n - 4]);
+    return true;
+  }
+  if (STEP_KEYS.has(c)) {
+    if (!e.repeat) { nudge(c, 1); keyHold.set(c, Kit.realTime); }
+    return true;
+  }
+  switch (c) {
+    case 'KeyL': if (!e.repeat) addLampFree(); return true;
+    case 'Tab': cycleLamp(e.shiftKey ? -1 : 1); return true;
+    case 'KeyO': if (S.selLamp && !e.repeat) toggleLamp(S.selLamp); return true;
+    case 'Delete': case 'Backspace': case 'KeyX': if (!e.repeat) deleteSelected(); return true;
+    default: return false;
+  }
+}
+function keyup(e) { keyHold.delete(e.code); }
+
+/** Continuous rotation / width / movement while a nudge key is held (runs on wall time, also when paused). */
+function pollKeys(rdt) {
+  for (const [code, t0] of keyHold) {
+    if (!Kit.keys.has(code)) { keyHold.delete(code); continue; }
+    if (Kit.realTime - t0 > 0.22) nudge(code, rdt * 25);
+  }
+}
+
+// ================================================================== rendering: shared layers
+const bgLayer = document.createElement('canvas');
+const floorLayer = document.createElement('canvas');
+const FLAP_FRAMES = 8;
+const RIM_BUCKETS = 3;
+// additive mix of the sprite light colors, indexed by bitmask red=1 green=2 blue=4
+const MIX = Array.from({ length: 8 }, (_, mask) => {
+  const sum = [0, 0, 0];
+  COLORS.forEach((c, i) => { if (mask & (1 << i)) { const v = U.hexToRgb(LIGHT[c]); sum[0] += v.r; sum[1] += v.g; sum[2] += v.b; } });
+  return '#' + sum.map((v) => Math.min(255, v).toString(16).padStart(2, '0')).join('');
+});
+const GLOW = 64, GLOW_COLS = 8, GLOW_ROWS = 4;
+const glowAtlas = document.createElement('canvas');
+glowAtlas.width = GLOW * GLOW_COLS; glowAtlas.height = GLOW * GLOW_ROWS;
+const glowSlots = new Map();
+let mothRes = 0;
+const mothAtlas = document.createElement('canvas');
+const lampAtlas = document.createElement('canvas');
+lampAtlas.res = 0;
+const LAMP_CELL = { x: -25, y: -14, w: 32, h: 28 };    // spotlight head bounds in lamp units
+const MOTH_CELL = { x: -44, y: -62, w: 74, h: 124 };   // frame bounds in moth units
+
+function drawGlow(ctx, hex, x, y, size) {
+  let i = glowSlots.get(hex);
+  if (i === undefined) {
+    i = glowSlots.size;
+    if (i >= GLOW_COLS * GLOW_ROWS) return;
+    glowSlots.set(hex, i);
+    const g = glowAtlas.getContext('2d'), h = GLOW / 2, cx = (i % GLOW_COLS) * GLOW + h, cy = Math.floor(i / GLOW_COLS) * GLOW + h;
+    const grd = g.createRadialGradient(cx, cy, 0, cx, cy, h - 1);
+    grd.addColorStop(0, U.rgba(U.mixHex(hex, '#ffffff', 0.6), 1));
+    grd.addColorStop(0.16, U.rgba(hex, 0.8));
+    grd.addColorStop(0.45, U.rgba(hex, 0.22));
+    grd.addColorStop(1, U.rgba(hex, 0));
+    g.fillStyle = grd;
+    g.fillRect(cx - h, cy - h, GLOW, GLOW);
+  }
+  ctx.drawImage(glowAtlas, (i % GLOW_COLS) * GLOW, Math.floor(i / GLOW_COLS) * GLOW, GLOW, GLOW, x - size / 2, y - size / 2, size, size);
+}
+
+function buildBackground() {
+  const W = Kit.W, H = Kit.H, dpr = Kit.dpr;
+  if (!W || !H) return;
+  bgLayer.width = Math.round(W * dpr); bgLayer.height = Math.round(H * dpr);
+  const g = bgLayer.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (Kit.isAbstract) paintBackgroundShapes(g, W, H); else paintBackgroundSprite(g, W, H);
+  S.floorDirty = true;
+}
+
+function paintBackgroundShapes(g, W, H) {
+  const pr = Kit.playRect, R = S.room;
+  g.fillStyle = SH.bg;
+  g.fillRect(0, 0, W, H);
+  const band = new Path2D();
+  pathRoundRect(band, pr.x, pr.y, pr.w, pr.h, 6);
+  pathRoundRect(band, R.x, R.y, R.w, R.h, S.rc);
+  g.fillStyle = SH.band;
+  g.fill(band, 'evenodd');
+}
+
+function paintBackgroundSprite(g, W, H) {
+  const pr = Kit.playRect, R = S.room, b = S.band, s = S.scale;
+  const rnd = U.mulberry32(1234);
+  g.fillStyle = '#070815';
+  g.fillRect(0, 0, W, H);
+
+  // ---- room: night floor
+  g.save();
+  g.clip(S.roomPath);
+  const cx = R.x + R.w * 0.5, cy = R.y + R.h * 0.45, diag = Math.hypot(R.w, R.h);
+  const bgG = g.createRadialGradient(cx, cy, 0, cx, cy, diag * 0.62);
+  bgG.addColorStop(0, '#17234d');
+  bgG.addColorStop(0.55, '#0d1636');
+  bgG.addColorStop(1, '#060a1d');
+  g.fillStyle = bgG;
+  g.fillRect(R.x, R.y, R.w, R.h);
+  // floorboards, barely there
+  const bh = Math.max(34, 52 * s);
+  let row = 0;
+  for (let y = R.y - rnd() * bh; y < R.y + R.h; y += bh, row++) {
+    g.fillStyle = row % 2 ? 'rgba(140,170,255,0.022)' : 'rgba(0,0,10,0.05)';
+    g.fillRect(R.x, y, R.w, bh);
+    g.fillStyle = 'rgba(0,0,12,0.38)';
+    g.fillRect(R.x, y, R.w, 1.4);
+    let x = R.x + rnd() * 300 * s;
+    while (x < R.x + R.w) { g.fillRect(x, y, 1.4, bh); x += (220 + rnd() * 260) * s; }
+  }
+  // grain speckle
+  for (let i = 0; i < (R.w * R.h) / 900; i++) {
+    g.fillStyle = rnd() < 0.5 ? 'rgba(160,180,255,0.035)' : 'rgba(0,0,0,0.08)';
+    g.fillRect(R.x + rnd() * R.w, R.y + rnd() * R.h, 1.5, 1.5);
+  }
+  // vignette + frame shade
+  const vg = g.createRadialGradient(cx, cy, diag * 0.22, cx, cy, diag * 0.62);
+  vg.addColorStop(0, 'rgba(2,3,12,0)');
+  vg.addColorStop(1, 'rgba(2,3,12,0.62)');
+  g.fillStyle = vg;
+  g.fillRect(R.x, R.y, R.w, R.h);
+  const sh = 26 * s;
+  const edge = (x0, y0, x1, y1, rx, ry, rw, rh) => {
+    const lg = g.createLinearGradient(x0, y0, x1, y1);
+    lg.addColorStop(0, 'rgba(0,0,6,0.55)');
+    lg.addColorStop(1, 'rgba(0,0,6,0)');
+    g.fillStyle = lg;
+    g.fillRect(rx, ry, rw, rh);
+  };
+  edge(0, R.y, 0, R.y + sh, R.x, R.y, R.w, sh);
+  edge(0, R.y + R.h, 0, R.y + R.h - sh, R.x, R.y + R.h - sh, R.w, sh);
+  edge(R.x, 0, R.x + sh, 0, R.x, R.y, sh, R.h);
+  edge(R.x + R.w, 0, R.x + R.w - sh, 0, R.x + R.w - sh, R.y, sh, R.h);
+  g.restore();
+
+  // ---- frame: dark walnut with mitred corners
+  const band = new Path2D();
+  pathRoundRect(band, pr.x, pr.y, pr.w, pr.h, 12);
+  pathRoundRect(band, R.x, R.y, R.w, R.h, S.rc);
+  g.save();
+  g.clip(band, 'evenodd');
+  const sides = [
+    { pts: [pr.x, pr.y, pr.x + pr.w, pr.y, R.x + R.w, R.y, R.x, R.y], horiz: true, o: pr.y, i: R.y, a: pr.x, z: pr.x + pr.w },
+    { pts: [pr.x, pr.y + pr.h, pr.x + pr.w, pr.y + pr.h, R.x + R.w, R.y + R.h, R.x, R.y + R.h], horiz: true, o: pr.y + pr.h, i: R.y + R.h, a: pr.x, z: pr.x + pr.w },
+    { pts: [pr.x, pr.y, pr.x, pr.y + pr.h, R.x, R.y + R.h, R.x, R.y], horiz: false, o: pr.x, i: R.x, a: pr.y, z: pr.y + pr.h },
+    { pts: [pr.x + pr.w, pr.y, pr.x + pr.w, pr.y + pr.h, R.x + R.w, R.y + R.h, R.x + R.w, R.y], horiz: false, o: pr.x + pr.w, i: R.x + R.w, a: pr.y, z: pr.y + pr.h },
+  ];
+  for (const sd of sides) {
+    g.save();
+    g.beginPath();
+    g.moveTo(sd.pts[0], sd.pts[1]);
+    for (let k = 2; k < 8; k += 2) g.lineTo(sd.pts[k], sd.pts[k + 1]);
+    g.closePath();
+    g.clip();
+    const lg = sd.horiz ? g.createLinearGradient(0, sd.o, 0, sd.i) : g.createLinearGradient(sd.o, 0, sd.i, 0);
+    lg.addColorStop(0, '#24150b');
+    lg.addColorStop(0.18, '#4f321d');
+    lg.addColorStop(0.5, '#3f2716');
+    lg.addColorStop(0.82, '#55371f');
+    lg.addColorStop(1, '#1e1209');
+    g.fillStyle = lg;
+    g.fillRect(pr.x, pr.y, pr.w, pr.h);
+    // wood grain along the length of the side
+    const thick = sd.i - sd.o;
+    const lines = Math.round(Math.abs(thick) / 2.2);
+    for (let k = 0; k < lines; k++) {
+      const off = sd.o + thick * ((k + rnd() * 0.8) / lines);
+      const ph = rnd() * TAU, ph2 = rnd() * TAU, amp = 0.6 + rnd() * 1.4;
+      g.strokeStyle = rnd() < 0.7 ? `rgba(18,8,2,${0.18 + rnd() * 0.22})` : `rgba(255,205,150,${0.04 + rnd() * 0.05})`;
+      g.lineWidth = 0.6 + rnd() * 0.9;
+      g.beginPath();
+      for (let q = sd.a; q <= sd.z + 20; q += 18) {
+        const w = off + Math.sin(q * 0.011 + ph) * amp + Math.sin(q * 0.047 + ph2) * amp * 0.35;
+        if (q === sd.a) { if (sd.horiz) g.moveTo(q, w); else g.moveTo(w, q); } else if (sd.horiz) g.lineTo(q, w); else g.lineTo(w, q);
+      }
+      g.stroke();
+    }
+    g.restore();
+  }
+  // mitre seams
+  g.strokeStyle = 'rgba(10,5,1,0.7)';
+  g.lineWidth = 1.2;
+  g.beginPath();
+  g.moveTo(pr.x, pr.y); g.lineTo(R.x + S.rc * 0.3, R.y + S.rc * 0.3);
+  g.moveTo(pr.x + pr.w, pr.y); g.lineTo(R.x + R.w - S.rc * 0.3, R.y + S.rc * 0.3);
+  g.moveTo(pr.x + pr.w, pr.y + pr.h); g.lineTo(R.x + R.w - S.rc * 0.3, R.y + R.h - S.rc * 0.3);
+  g.moveTo(pr.x, pr.y + pr.h); g.lineTo(R.x + S.rc * 0.3, R.y + R.h - S.rc * 0.3);
+  g.stroke();
+  // brass lamp rail sitting in a groove
+  g.strokeStyle = '#120a04';
+  g.lineWidth = Math.max(4, b * 0.2);
+  g.stroke(S.railPath);
+  g.strokeStyle = '#8a6326';
+  g.lineWidth = Math.max(2.2, b * 0.1);
+  g.stroke(S.railPath);
+  g.save();
+  g.translate(-0.6, -0.8);
+  g.strokeStyle = 'rgba(255,222,150,0.55)';
+  g.lineWidth = 0.9;
+  g.stroke(S.railPath);
+  g.restore();
+  // screws
+  const screw = (x, y) => {
+    const r = Math.max(2.4, b * 0.1);
+    const sg = g.createRadialGradient(x - r * 0.4, y - r * 0.4, 0, x, y, r);
+    sg.addColorStop(0, '#f3d79a'); sg.addColorStop(0.6, '#a57a35'); sg.addColorStop(1, '#4a3212');
+    g.fillStyle = sg;
+    g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+    const a = rnd() * Math.PI;
+    g.strokeStyle = 'rgba(40,24,6,0.85)'; g.lineWidth = 0.9;
+    g.beginPath(); g.moveTo(x - Math.cos(a) * r * 0.7, y - Math.sin(a) * r * 0.7); g.lineTo(x + Math.cos(a) * r * 0.7, y + Math.sin(a) * r * 0.7); g.stroke();
+  };
+  const q = b * 0.2;
+  screw(pr.x + q + 2, pr.y + q + 2); screw(pr.x + pr.w - q - 2, pr.y + q + 2);
+  screw(pr.x + q + 2, pr.y + pr.h - q - 2); screw(pr.x + pr.w - q - 2, pr.y + pr.h - q - 2);
+  const stepX = Math.max(180, pr.w / Math.round(pr.w / 260)), stepY = Math.max(180, pr.h / Math.round(pr.h / 260));
+  for (let x = pr.x + stepX; x < pr.x + pr.w - stepX * 0.5; x += stepX) { screw(x, pr.y + q); screw(x, pr.y + pr.h - q); }
+  for (let y = pr.y + stepY; y < pr.y + pr.h - stepY * 0.5; y += stepY) { screw(pr.x + q, y); screw(pr.x + pr.w - q, y); }
+  g.restore();
+  // bevels
+  g.save();
+  g.strokeStyle = 'rgba(255,214,160,0.16)';
+  g.lineWidth = 1.5;
+  g.beginPath(); pathRoundRect(g, pr.x + 1, pr.y + 1, pr.w - 2, pr.h - 2, 11); g.stroke();
+  g.strokeStyle = 'rgba(0,0,0,0.6)';
+  g.lineWidth = 3;
+  g.stroke(S.roomPath);
+  g.strokeStyle = 'rgba(255,210,150,0.2)';
+  g.lineWidth = 1;
+  g.beginPath(); pathRoundRect(g, R.x - 2.5, R.y - 2.5, R.w + 5, R.h + 5, S.rc + 2.5); g.stroke();
+  g.restore();
+}
+
+// ---- procedural moth sprites (units: moth faces +x, wingspan 108 units)
+function paintSprite(wu, hu, ox, oy, res, paint) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.ceil(wu * res)); c.height = Math.max(2, Math.ceil(hu * res));
+  const g = c.getContext('2d');
+  g.scale(c.width / wu, c.height / hu);
+  g.translate(-ox, -oy);
+  paint(g, res);
+  c.ux = ox; c.uy = oy; c.uw = wu; c.uh = hu;
+  return c;
+}
+
+function paintWings(g, v, res) {
+  g.shadowColor = 'rgba(25,12,4,0.5)';
+  g.shadowBlur = 1.6 * res;
+  // hindwing
+  g.beginPath();
+  g.moveTo(-3, -2);
+  g.bezierCurveTo(-1, -20, -12, -38, -25, -38);
+  g.bezierCurveTo(-37, -38, -41, -24, -36, -13);
+  g.bezierCurveTo(-31, -4, -18, -1, -9, -1);
+  g.closePath();
+  const hg = g.createRadialGradient(-6, -4, 1, -14, -18, 34);
+  hg.addColorStop(0, v.hindTint); hg.addColorStop(0.55, v.hind); hg.addColorStop(1, v.foreDark);
+  g.fillStyle = hg;
+  g.fill();
+  g.shadowBlur = 0;
+  g.save();
+  g.clip();
+  g.fillStyle = v.spot;
+  g.beginPath(); g.arc(-25, -23, 4.3, 0, TAU); g.fill();
+  g.fillStyle = v.hindTint;
+  g.beginPath(); g.arc(-25, -23, 2.6, 0, TAU); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.8)';
+  g.beginPath(); g.arc(-25.6, -23.8, 1, 0, TAU); g.fill();
+  g.restore();
+  // forewing
+  g.shadowBlur = 1.6 * res;
+  g.beginPath();
+  g.moveTo(6, -2);
+  g.bezierCurveTo(10, -18, 8, -40, 0, -54);
+  g.bezierCurveTo(-8, -56, -22, -45, -28, -30);
+  g.bezierCurveTo(-20, -20, -12, -8, -6, -2);
+  g.closePath();
+  const fg = g.createLinearGradient(2, -4, -12, -52);
+  fg.addColorStop(0, v.fore); fg.addColorStop(0.62, v.fore); fg.addColorStop(1, v.foreDark);
+  g.fillStyle = fg;
+  g.fill();
+  g.shadowBlur = 0;
+  g.save();
+  g.clip();
+  g.strokeStyle = v.band; g.globalAlpha = 0.85; g.lineWidth = 7.5; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(9, -24); g.quadraticCurveTo(-6, -38, -24, -33); g.stroke();
+  g.globalAlpha = 0.38; g.strokeStyle = v.foreDark; g.lineWidth = 0.7;
+  for (const [x, y] of [[-2, -52], [-10, -50], [-17, -45], [-23, -37]]) { g.beginPath(); g.moveTo(1, -4); g.quadraticCurveTo(x * 0.4 + 3, y * 0.6, x, y); g.stroke(); }
+  g.globalAlpha = 1;
+  g.fillStyle = v.foreDark;
+  for (let i = 0; i < 6; i++) { const t = i / 5; g.beginPath(); g.arc(lerp(-3, -25, t), lerp(-51, -33, t) + Math.sin(t * 3) * 1.5, 1, 0, TAU); g.fill(); }
+  g.fillStyle = v.spot;
+  g.beginPath(); g.arc(-3, -37, 3.4, 0, TAU); g.fill();
+  g.fillStyle = v.band;
+  g.beginPath(); g.arc(-3, -37, 1.7, 0, TAU); g.fill();
+  g.restore();
+  g.strokeStyle = 'rgba(255,255,255,0.35)'; g.lineWidth = 1.1;
+  g.beginPath(); g.moveTo(6.5, -4); g.bezierCurveTo(10, -18, 8, -40, 0.5, -53); g.stroke();
+}
+
+function paintBody(g, v) {
+  // feathery antennae
+  g.lineCap = 'round';
+  for (const sd of [-1, 1]) {
+    const x0 = 12, y0 = 1.6 * sd, cx = 21, cy = 2 * sd, x1 = 27, y1 = 12.5 * sd;
+    g.strokeStyle = v.bodyDark; g.lineWidth = 1.1;
+    g.beginPath(); g.moveTo(x0, y0); g.quadraticCurveTo(cx, cy, x1, y1); g.stroke();
+    g.lineWidth = 0.55;
+    for (let i = 1; i <= 8; i++) {
+      const t = i / 9, it = 1 - t;
+      const px = it * it * x0 + 2 * it * t * cx + t * t * x1, py = it * it * y0 + 2 * it * t * cy + t * t * y1;
+      const tx = 2 * it * (cx - x0) + 2 * t * (x1 - cx), ty = 2 * it * (cy - y0) + 2 * t * (y1 - cy);
+      const tl = Math.hypot(tx, ty) || 1, nx = -ty / tl, ny = tx / tl, len = 2.6 * (1 - t * 0.55);
+      g.beginPath(); g.moveTo(px - nx * len, py - ny * len); g.lineTo(px + nx * len, py + ny * len); g.stroke();
+    }
+  }
+  // abdomen
+  const ag = g.createLinearGradient(0, -5.6, 0, 5.6);
+  ag.addColorStop(0, v.bodyDark); ag.addColorStop(0.45, v.body); ag.addColorStop(1, v.bodyDark);
+  g.fillStyle = ag;
+  g.beginPath(); g.ellipse(-12, 0, 14.5, 5.6, 0, 0, TAU); g.fill();
+  g.strokeStyle = v.bodyDark; g.globalAlpha = 0.55; g.lineWidth = 0.8;
+  for (const x of [-6, -10.5, -15, -19.5, -23.5]) { g.beginPath(); g.ellipse(x, 0, 1.5, 5 - Math.abs(x + 12) * 0.12, 0, -Math.PI / 2, Math.PI / 2); g.stroke(); }
+  g.globalAlpha = 1;
+  // furry thorax
+  const rnd = U.mulberry32(99);
+  g.lineWidth = 1.3;
+  for (let i = 0; i < 46; i++) {
+    const a = rnd() * TAU, r0 = 3 + rnd() * 2, r1 = 6.6 + rnd() * 2.4;
+    g.strokeStyle = rnd() < 0.6 ? v.fur : v.body;
+    g.beginPath(); g.moveTo(2 + Math.cos(a) * r0, Math.sin(a) * r0); g.lineTo(2 + Math.cos(a) * r1, Math.sin(a) * r1 * 0.95); g.stroke();
+  }
+  const tg = g.createRadialGradient(3.5, -1.5, 0.5, 2, 0, 7.5);
+  tg.addColorStop(0, v.fur); tg.addColorStop(0.65, v.body); tg.addColorStop(1, v.bodyDark);
+  g.fillStyle = tg;
+  g.beginPath(); g.ellipse(2, 0, 6.8, 6.3, 0, 0, TAU); g.fill();
+  // head + big eyes
+  g.fillStyle = v.head;
+  g.beginPath(); g.arc(10, 0, 4.3, 0, TAU); g.fill();
+  for (const sd of [-1, 1]) {
+    g.fillStyle = '#1a0f12';
+    g.beginPath(); g.arc(11.6, 2.8 * sd, 2, 0, TAU); g.fill();
+    g.fillStyle = 'rgba(255,255,255,0.9)';
+    g.beginPath(); g.arc(12.2, 2.8 * sd - 0.6, 0.7, 0, TAU); g.fill();
+  }
+}
+
+function buildMothSprites() {
+  const res = ((MOTH_WS * S.scale) / 108) * Kit.dpr * 1.25;
+  if (Math.abs(res - mothRes) < 0.01 && mothAtlas.width) return;
+  mothRes = res;
+  // wings + body are painted once, then composed into flap frames (wings squashed toward the body)
+  // wings + body are painted once per look, then composed into flap frames (wings squashed toward
+  // the body) inside one atlas so every moth draw shares a texture
+  const cw = Math.ceil(MOTH_CELL.w * res), ch = Math.ceil(MOTH_CELL.h * res);
+  mothAtlas.width = cw * FLAP_FRAMES; mothAtlas.height = ch * MOTH_LOOKS.length;
+  mothAtlas.cw = cw; mothAtlas.ch = ch;
+  const g = mothAtlas.getContext('2d');
+  MOTH_LOOKS.forEach((v, row) => {
+    const wing = paintSprite(58, 64, -43, -60, res, (wg, r) => paintWings(wg, v, r));
+    const body = paintSprite(60, 32, -28, -16, res, (bg) => paintBody(bg, v));
+    for (let k = 0; k < FLAP_FRAMES; k++) {
+      const f = 0.2 + (0.8 * k) / (FLAP_FRAMES - 1);
+      g.setTransform(cw / MOTH_CELL.w, 0, 0, ch / MOTH_CELL.h, k * cw - MOTH_CELL.x * (cw / MOTH_CELL.w), row * ch - MOTH_CELL.y * (ch / MOTH_CELL.h));
+      for (const sy of [f, -f]) {
+        g.save();
+        g.scale(1, sy);
+        g.drawImage(wing, wing.ux, wing.uy, wing.uw, wing.uh);
+        g.restore();
+      }
+      g.drawImage(body, body.ux, body.uy, body.uw, body.uh);
+    }
+  });
+
+}
+
+function polyPath(ctx, pts, rr) {
+  const n = pts.length;
+  ctx.beginPath();
+  if (rr <= 0.5 || n > 8) {
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < n; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  } else {
+    const a = pts[n - 1], b = pts[0];
+    ctx.moveTo((a.x + b.x) / 2, (a.y + b.y) / 2);
+    for (let i = 0; i < n; i++) { const p = pts[i], q = pts[(i + 1) % n]; ctx.arcTo(p.x, p.y, (p.x + q.x) / 2, (p.y + q.y) / 2, rr); }
+  }
+  ctx.closePath();
+}
+
+function cornerRadius(o) { return Math.min(7 * S.scale, o.r * 0.22); }
+
+// ================================================================== rendering: sprites
+function lampGradient(l, g) {
+  const fx = l.fx, key = reachPx() + l.color;
+  if (fx.grad && fx.gradKey === key) return fx.grad;
+  const far = fx.far, reach = reachPx(), col = LIGHT[l.color];
+  const gr = g.createRadialGradient(l.ox, l.oy, 0, l.ox, l.oy, far);
+  const stops = [0, 0.06, 0.3, 1];
+  for (const t of stops) {
+    const a = Math.min(1, 1.05 / Math.pow(1 + (t * far) / reach, 0.7));
+    const c = t < 0.1 ? U.mixHex(col, '#ffffff', (1 - t / 0.1) * 0.55) : col;
+    gr.addColorStop(t, U.rgba(c, a * (t === 0 ? 1 : 0.92)));
+  }
+  fx.grad = gr; fx.gradKey = key;
+  return gr;
+}
+
+/** Sprites: the night floor with every beam, object and lamp mount baked in. The layer is only
+ *  repainted when the scene changes, so a still scene costs one blit per frame. */
+function paintLitFloor() {
+  S.floorDirty = false;
+  const dpr = Kit.dpr, W = bgLayer.width, H = bgLayer.height;
+  if (!W || !H) return;
+  if (floorLayer.width !== W || floorLayer.height !== H) { floorLayer.width = W; floorLayer.height = H; }
+  const f = floorLayer.getContext('2d');
+  f.setTransform(1, 0, 0, 1, 0, 0);
+  f.globalCompositeOperation = 'source-over';
+  f.globalAlpha = 1;
+  f.drawImage(bgLayer, 0, 0);
+  f.setTransform(dpr, 0, 0, dpr, 0, 0);
+  f.save();
+  f.clip(S.roomPath);
+  f.globalCompositeOperation = 'lighter';
+  for (const l of S.lamps) {
+    const vis = lampVis(l);
+    if (!l.fx.path || vis <= 0.01) continue;
+    f.globalAlpha = clamp(vis, 0, 1);
+    f.fillStyle = lampGradient(l, f);
+    f.fill(l.fx.path);
+  }
+  f.restore();
+  // objects and lamp mounts only change when the lighting does, so they live in this layer too
+  paintObstacles(f);
+  for (const l of S.lamps) paintLampMount(f, l, 1);
+}
+
+/** Each object's look depends only on its shape, size and rotation, so it is painted once into its own canvas. */
+function obstacleSprite(o) {
+  const fx = o.fx, dpr = Kit.dpr, s = S.scale;
+  const key = `${o.rot.toFixed(4)}|${o.r.toFixed(2)}|${o.glass}|${dpr}|${s}`;
+  if (fx.sprite && fx.spriteKey === key) return fx.sprite;
+  const c = fx.sprite || document.createElement('canvas');
+  const E = o.br + 12 * s + 4;
+  c.width = c.height = Math.ceil(2 * E * dpr);
+  const g = c.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, dpr * (E - o.bx), dpr * (E - o.by));
+  const rr = cornerRadius(o);
+  if (o.mat === 'glass') paintGlass(g, o, rr);
+  else {
+    g.save();
+    g.translate(4 * s, 6 * s);
+    polyPath(g, o.points, rr);
+    g.fillStyle = 'rgba(1,2,10,0.42)';
+    g.fill();
+    g.restore();
+    drawSolid(g, o, rr);
+  }
+  c.E = E;
+  fx.sprite = c; fx.spriteKey = key;
+  return c;
+}
+
+function paintObstacles(ctx) {
+  for (const o of S.obstacles) {
+    const c = obstacleSprite(o);
+    ctx.drawImage(c, o.bx - c.E, o.by - c.E, 2 * c.E, 2 * c.E);
+    if (o.glass && o.glow > 0) glassGlow(ctx, o, cornerRadius(o));
+  }
+  drawLitRims(ctx);
+}
+
+function drawObjectFlashes(ctx) {
+  for (const o of S.obstacles) {
+    if (o.fx.flash <= 0) continue;
+    ctx.globalAlpha = o.fx.flash * (Kit.isAbstract ? 0.5 : 0.6);
+    ctx.fillStyle = '#ffffff';
+    polyPath(ctx, o.points, Kit.isAbstract ? 0 : cornerRadius(o));
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawSolid(ctx, o, rr) {
+  const r = o.r, x = o.bx, y = o.by, wood = o.mat === 'wood';
+  polyPath(ctx, o.points, rr);
+  const gr = ctx.createLinearGradient(x - r, y - r, x + r, y + r);
+  if (wood) { gr.addColorStop(0, '#b98955'); gr.addColorStop(0.5, '#8a5e35'); gr.addColorStop(1, '#4d311b'); } else { gr.addColorStop(0, '#9b98ab'); gr.addColorStop(0.5, '#6c697e'); gr.addColorStop(1, '#3a3848'); }
+  ctx.fillStyle = gr;
+  ctx.fill();
+  ctx.save();
+  ctx.clip();
+  ctx.translate(x, y);
+  ctx.rotate(o.rot);
+  if (wood) {
+    ctx.strokeStyle = 'rgba(60,30,10,0.35)';
+    ctx.lineWidth = Math.max(0.8, r * 0.035);
+    const g0 = o.fx.grain;
+    for (let k = -6; k <= 6; k++) {
+      const yy = k * r * 0.17;
+      ctx.beginPath();
+      ctx.moveTo(-r * 1.8, yy);
+      ctx.bezierCurveTo(-r * 0.6, yy + Math.sin(g0 + k) * r * 0.08, r * 0.4, yy - Math.cos(g0 + k * 1.7) * r * 0.1, r * 1.8, yy + Math.sin(g0 * 2 + k) * r * 0.05);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(60,30,10,0.4)';
+    ctx.beginPath(); ctx.ellipse(Math.sin(g0) * r * 0.3, Math.cos(g0) * r * 0.2, r * 0.13, r * 0.07, 0, 0, TAU); ctx.stroke();
+  } else {
+    for (const sp of o.fx.specks) {
+      ctx.fillStyle = sp.light ? 'rgba(220,220,240,0.22)' : 'rgba(20,18,30,0.3)';
+      ctx.beginPath(); ctx.arc(sp.x * r, sp.y * r, sp.r * r, 0, TAU); ctx.fill();
+    }
+  }
+  ctx.restore();
+  // bevel: light top-left rim, dark bottom-right rim
+  const bv = ctx.createLinearGradient(x - r, y - r, x + r, y + r);
+  bv.addColorStop(0, wood ? 'rgba(255,225,180,0.6)' : 'rgba(235,235,255,0.55)');
+  bv.addColorStop(0.45, 'rgba(255,255,255,0)');
+  bv.addColorStop(0.6, 'rgba(0,0,0,0)');
+  bv.addColorStop(1, 'rgba(0,0,0,0.55)');
+  polyPath(ctx, o.points, rr);
+  ctx.strokeStyle = bv;
+  ctx.lineWidth = Math.max(2, 3 * S.scale);
+  ctx.stroke();
+}
+
+/** Glass lit by its own color glows. */
+function glassGlow(ctx, o, rr) {
+  const col = LIGHT[o.glass], gl = o.glow;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  polyPath(ctx, o.points, rr);
+  ctx.fillStyle = U.rgba(col, Math.min(0.55, gl * 0.7));
+  ctx.fill();
+  ctx.strokeStyle = U.rgba(col, Math.min(0.5, gl * 0.6));
+  ctx.lineWidth = 9 * S.scale;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function paintGlass(ctx, o, rr) {
+  const base = BASE[o.glass], s = S.scale;
+  polyPath(ctx, o.points, rr);
+  ctx.fillStyle = U.rgba(base, 0.22);
+  ctx.fill();
+  ctx.save();
+  ctx.clip();
+  ctx.translate(o.bx, o.by);
+  ctx.rotate(o.rot - 0.6);
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  ctx.fillRect(-o.r * 0.55, -o.r * 2, o.r * 0.22, o.r * 4);
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.fillRect(-o.r * 0.18, -o.r * 2, o.r * 0.1, o.r * 4);
+  ctx.restore();
+  polyPath(ctx, o.points, rr);
+  ctx.strokeStyle = U.rgba(U.mixHex(base, '#ffffff', 0.25), 0.9);
+  ctx.lineWidth = 2 * s;
+  ctx.stroke();
+}
+
+function drawLitRims(ctx) {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 2.6 * S.scale;
+  for (let c = 0; c < 3; c++) {
+    for (let b = 0; b < RIM_BUCKETS; b++) {
+      ctx.beginPath();
+      let any = false;
+      for (const o of S.obstacles) {
+        const el = o.fx.edgeLit, pts = o.points, n = pts.length, rr = cornerRadius(o);
+        for (let i = 0, j = n - 1; i < n; j = i++) {
+          const I = el[j * 3 + c];
+          if (I <= 0 || Math.min(RIM_BUCKETS - 1, Math.floor(I * 1.5 * RIM_BUCKETS)) !== b) continue;
+          const ax = pts[j].x, ay = pts[j].y, bx = pts[i].x, by = pts[i].y, len = Math.hypot(bx - ax, by - ay) || 1;
+          const k = n > 8 ? 0 : Math.min(0.45, rr / len);
+          ctx.moveTo(lerp(ax, bx, k), lerp(ay, by, k));
+          ctx.lineTo(lerp(bx, ax, k), lerp(by, ay, k));
+          any = true;
+        }
+      }
+      if (!any) continue;
+      ctx.strokeStyle = U.rgba(LIGHT[COLORS[c]], (b + 1) / RIM_BUCKETS);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawMotes(ctx, t) {
+  const R = S.room, s = S.scale, lamps = S.lamps;
+  ctx.fillStyle = 'rgba(190,205,255,0.09)';
+  ctx.beginPath();
+  for (const d of S.motes) {
+    const x = R.x + d.u * R.w, y = R.y + d.v * R.h;
+    d.lr = d.lg = d.lb = 0;
+    for (const l of lamps) {
+      const vis = lampVis(l);
+      if (vis <= 0.01) continue;
+      const I = litAmount(x, y, l) * vis;
+      if (I <= 0) continue;
+      if (l.color === 'red') d.lr += I; else if (l.color === 'green') d.lg += I; else d.lb += I;
+    }
+    if (d.lr + d.lg + d.lb <= 0) ctx.rect(x, y, 1.6 * d.sz, 1.6 * d.sz);
+  }
+  ctx.fill();
+  // lit motes sparkle in the additive mix of the beams they float in
+  ctx.globalCompositeOperation = 'lighter';
+  for (const d of S.motes) {
+    const top = Math.max(d.lr, d.lg, d.lb);
+    if (top <= 0) continue;
+    const mask = (d.lr > 0 ? 1 : 0) | (d.lg > 0 ? 2 : 0) | (d.lb > 0 ? 4 : 0);
+    const x = R.x + d.u * R.w, y = R.y + d.v * R.h;
+    const tw2 = 0.45 + 0.55 * Math.pow(0.5 + 0.5 * Math.sin(t * d.f + d.ph), 2);
+    const size = (8 + 8 * Math.min(1, top)) * s * d.sz;
+    ctx.globalAlpha = Math.min(1, top * 1.8) * tw2;
+    drawGlow(ctx, MIX[mask], x, y, size);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/** Visible brightness of a lamp: switch fade plus the flicker while it warms up (sprites only). */
+function lampVis(l) { return l.fx.power * l.fx.flick; }
+
+function flapOf(m) { return 0.2 + 0.8 * Math.pow(0.5 + 0.5 * Math.cos(m.flap), 0.8); }
+
+function drawMothsSprite(ctx) {
+  const s = S.scale, dpr = Kit.dpr, moths = S.moths;
+  // shadows on the floor (moths fly above it): two batched layers fake a soft edge
+  for (let pass = 0; pass < 2; pass++) {
+    ctx.beginPath();
+    for (const m of moths) {
+      const ws = MOTH_WS * s * m.size, f = flapOf(m), q = pass ? 0.62 : 1;
+      ctx.moveTo(m.x + 7 * s + ws * 0.13 * q, m.y + 12 * s);
+      ctx.ellipse(m.x + 7 * s, m.y + 12 * s, ws * 0.13 * q, ws * (0.12 + 0.24 * f) * q, m.h, 0, TAU);
+    }
+    ctx.fillStyle = 'rgba(0,0,8,0.2)';
+    ctx.fill();
+  }
+  // glowing trails (a faint long tail plus a brighter recent part), batched per light color
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (const c of COLORS) {
+    for (let part = 0; part < 2; part++) {
+      ctx.beginPath();
+      let any = false;
+      for (const m of moths) {
+        if (m.glow < 0.3 || m.glowColor !== c) continue;
+        const fx = m.fx, n = fx.tn, i0 = part ? Math.floor(n / 2) : 0;
+        for (let i = i0; i < n; i++) {
+          const a = (fx.th - n + i + TRAIL * 2) % TRAIL;
+          if (i === i0) ctx.moveTo(fx.trail[a * 2], fx.trail[a * 2 + 1]); else ctx.lineTo(fx.trail[a * 2], fx.trail[a * 2 + 1]);
+        }
+        any = true;
+      }
+      if (!any) continue;
+      ctx.strokeStyle = LIGHT[c];
+      ctx.globalAlpha = part ? 0.4 : 0.18;
+      ctx.lineWidth = (part ? 3.2 : 1.6) * s;
+      ctx.stroke();
+    }
+  }
+  // halo: full size out in the beam, small while circling inside the lamp's own glow
+  for (const m of moths) {
+    if (m.glow < 0.03) continue;
+    ctx.globalAlpha = 0.55 * m.glow;
+    drawGlow(ctx, LIGHT[m.glowColor], m.x, m.y, MOTH_WS * s * (m.state === 'orbit' ? 1 : 1.7));
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  // one pre-composed flap frame per moth, all from the same atlas
+  const A = mothAtlas, C = MOTH_CELL;
+  for (const m of moths) {
+    const fi = clamp(Math.round(((flapOf(m) - 0.2) / 0.8) * (FLAP_FRAMES - 1)), 0, FLAP_FRAMES - 1);
+    const k = ((MOTH_WS * s * m.size) / 108) * dpr, sq = 1 + m.squash * 0.25;
+    const c = Math.cos(m.h) * k, sn = Math.sin(m.h) * k, kx = 1 / sq, ky = sq;
+    ctx.setTransform(c * kx, sn * kx, -sn * ky, c * ky, m.x * dpr, m.y * dpr);
+    // crop the frame to its wing span so folded wings sample fewer pixels
+    const ext = Math.min(-C.y, 61 * (0.2 + (0.8 * fi) / (FLAP_FRAMES - 1)) + 3), py = A.ch / C.h;
+    ctx.drawImage(A, fi * A.cw, m.look * A.ch + (-C.y - ext) * py, A.cw, 2 * ext * py, C.x, -ext, C.w, 2 * ext);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+/** A small spotlight clamped to the brass rail; lens at the lamp origin. */
+/** Brass clamp on the rail and the arm that holds the spotlight head. */
+function paintLampMount(ctx, l, alpha) {
+  const s = S.scale, b = S.band;
+  const gx = l.x - l.nx * b * 0.5, gy = l.y - l.ny * b * 0.5;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#3d2a10'; ctx.lineWidth = 6 * s;
+  ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(l.x, l.y); ctx.stroke();
+  ctx.strokeStyle = '#c99a48'; ctx.lineWidth = 3 * s;
+  ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(l.x, l.y); ctx.stroke();
+  ctx.translate(gx, gy);
+  ctx.rotate(Math.atan2(l.ny, l.nx));
+  U.roundRect(ctx, -4.5 * s, -9 * s, 9 * s, 18 * s, 3 * s);
+  const cg = ctx.createLinearGradient(0, -9 * s, 0, 9 * s);
+  cg.addColorStop(0, '#f0cf86'); cg.addColorStop(0.5, '#a97b33'); cg.addColorStop(1, '#5a3e14');
+  ctx.fillStyle = cg; ctx.fill();
+  ctx.strokeStyle = 'rgba(30,18,4,0.8)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = '#3a2708';
+  ctx.beginPath(); ctx.arc(0, -5 * s, 1.3 * s, 0, TAU); ctx.arc(0, 5 * s, 1.3 * s, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+/** Spotlight head in local units (faces +x, lens at the origin). */
+function paintLampHead(g, color, on) {
+  const col = LIGHT[color];
+  g.beginPath();
+  g.moveTo(-19, -6.5);
+  g.lineTo(1, -11.5);
+  g.quadraticCurveTo(5, 0, 1, 11.5);
+  g.lineTo(-19, 6.5);
+  g.quadraticCurveTo(-23, 0, -19, -6.5);
+  g.closePath();
+  const hg = g.createLinearGradient(0, -11, 0, 11);
+  hg.addColorStop(0, '#10151f'); hg.addColorStop(0.32, '#46536b'); hg.addColorStop(0.55, '#26303f'); hg.addColorStop(1, '#0c1018');
+  g.fillStyle = hg; g.fill();
+  g.strokeStyle = '#06080d'; g.lineWidth = 1; g.stroke();
+  g.fillStyle = 'rgba(255,255,255,0.12)';
+  g.fillRect(-16, -6.8, 14, 1.4);
+  g.strokeStyle = '#d8ab55'; g.lineWidth = 2.4;
+  g.beginPath(); g.ellipse(2.2, 0, 3.2, 11.6, 0, 0, TAU); g.stroke();
+  g.beginPath(); g.ellipse(2.7, 0, 2.3, 9.6, 0, 0, TAU);
+  if (on) {
+    const lg = g.createRadialGradient(3, 0, 0, 3, 0, 10);
+    lg.addColorStop(0, '#ffffff'); lg.addColorStop(0.45, U.mixHex(col, '#ffffff', 0.45)); lg.addColorStop(1, col);
+    g.fillStyle = lg;
+  } else g.fillStyle = U.mixHex(col, '#1a1f29', 0.78);
+  g.fill();
+  g.fillStyle = '#b8893c';
+  g.beginPath(); g.arc(-20.5, 0, 3, 0, TAU); g.fill();
+}
+
+function buildLampSprites() {
+  const res = S.scale * 1.3 * 1.35 * Kit.dpr;
+  if (Math.abs(res - lampAtlas.res) < 0.01) return;
+  const cw = Math.ceil(LAMP_CELL.w * res), ch = Math.ceil(LAMP_CELL.h * res);
+  lampAtlas.width = cw * 2; lampAtlas.height = ch * 3;
+  lampAtlas.res = res; lampAtlas.cw = cw; lampAtlas.ch = ch;
+  const g = lampAtlas.getContext('2d');
+  COLORS.forEach((c, row) => [false, true].forEach((on, col) => {
+    g.setTransform(cw / LAMP_CELL.w, 0, 0, ch / LAMP_CELL.h, col * cw - LAMP_CELL.x * (cw / LAMP_CELL.w), row * ch - LAMP_CELL.y * (ch / LAMP_CELL.h));
+    paintLampHead(g, c, on);
+  }));
+}
+
+/** The head (from the atlas, cross-faded off/on while switching) plus its additive halo. */
+function drawLampHead(ctx, l, alpha, color, power, t) {
+  const s = S.scale, fx = l.fx, dpr = Kit.dpr, A = lampAtlas, C = LAMP_CELL;
+  const k = s * 1.3 * (1 + fx.pulse * 0.28);
+  const a = l.angle + fx.jolt * Math.sin(t * 60) * 0.06;
+  const c = Math.cos(a) * k * dpr, sn = Math.sin(a) * k * dpr, row = COLORS.indexOf(color);
+  ctx.setTransform(c, sn, -sn, c, l.x * dpr, l.y * dpr);
+  if (power < 0.98) { ctx.globalAlpha = alpha; ctx.drawImage(A, 0, row * A.ch, A.cw, A.ch, C.x, C.y, C.w, C.h); }
+  if (power > 0.02) { ctx.globalAlpha = alpha * power; ctx.drawImage(A, A.cw, row * A.ch, A.cw, A.ch, C.x, C.y, C.w, C.h); }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (power > 0.02) {
+    const lx = l.x + Math.cos(l.angle) * 3 * k, ly = l.y + Math.sin(l.angle) * 3 * k;
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = alpha * power * (0.8 + 0.06 * Math.sin(t * 9 + l.id));
+    drawGlow(ctx, LIGHT[color], lx, ly, 130 * s * (1 + fx.pulse * 0.3));
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawParticlesSprite(ctx) {
+  ctx.save();
+  for (let i = 0; i < partN; i++) {
+    const p = PARTS[i], k = p.life / p.max;
+    if (p.kind === 0) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = k;
+      const sz = p.size * 4 * (0.5 + k * 0.5);
+      drawGlow(ctx, p.color, p.x, p.y, sz);
+    } else if (p.kind === 1) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = k * 0.8;
+      ctx.strokeStyle = p.color; ctx.lineWidth = 2.5 * S.scale * k + 0.5;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size * U.easeOutCubic(1 - k) + 2, 0, TAU); ctx.stroke();
+    } else {
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = k * 0.35;
+      ctx.fillStyle = U.mixHex(p.color, '#c8c2d8', 0.5);
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (1.4 - k * 0.6), 0, TAU); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+// ================================================================== rendering: shapes
+function drawBeamsShapes(ctx) {
+  ctx.save();
+  ctx.clip(S.roomPath);
+  ctx.globalCompositeOperation = 'lighter';
+  for (const l of S.lamps) {
+    if (!l.fx.path || l.fx.power <= 0.01) continue;
+    ctx.globalAlpha = 0.5 * l.fx.power;
+    ctx.fillStyle = BASE[l.color];
+    ctx.fill(l.fx.path);
+  }
+  ctx.restore();
+}
+
+function drawObstaclesShapes(ctx) {
+  for (const o of S.obstacles) {
+    polyPath(ctx, o.points, 0);
+    if (o.glass) {
+      ctx.fillStyle = U.rgba(BASE[o.glass], 0.35);
+      ctx.fill();
+      ctx.strokeStyle = BASE[o.glass];
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    } else {
+      ctx.fillStyle = SH.obj;
+      ctx.fill();
+    }
+  }
+}
+
+function drawAgentsShapes(ctx) {
+  const s = S.scale, r = 9 * s;
+  ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+  ctx.lineWidth = 2 * s;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (const m of S.moths) {
+    if (m.glow < 0.05) continue;
+    const fx = m.fx, n = fx.tn;
+    for (let i = 0; i < n; i++) {
+      const a = (fx.th - n + i + TRAIL * 2) % TRAIL;
+      if (i === 0) ctx.moveTo(fx.trail[a * 2], fx.trail[a * 2 + 1]); else ctx.lineTo(fx.trail[a * 2], fx.trail[a * 2 + 1]);
+    }
+  }
+  ctx.stroke();
+  for (const c of COLORS) {
+    ctx.strokeStyle = BASE[c];
+    ctx.lineWidth = 2.5 * s;
+    ctx.beginPath();
+    for (const m of S.moths) {
+      if (m.glow < 0.3 || m.glowColor !== c) continue;
+      ctx.moveTo(m.x + r + 4.5 * s, m.y);
+      ctx.arc(m.x, m.y, r + 4.5 * s, 0, TAU);
+    }
+    ctx.stroke();
+  }
+  // direction ticks, then bodies; a dark outline keeps them readable on white overlaps
+  ctx.beginPath();
+  for (const m of S.moths) {
+    const c = Math.cos(m.h), sn = Math.sin(m.h);
+    ctx.moveTo(m.x + c * r, m.y + sn * r);
+    ctx.lineTo(m.x + c * (r + 8 * s), m.y + sn * (r + 8 * s));
+  }
+  ctx.strokeStyle = SH.bg;
+  ctx.lineWidth = 6 * s;
+  ctx.stroke();
+  ctx.strokeStyle = SH.white;
+  ctx.lineWidth = 3 * s;
+  ctx.stroke();
+  ctx.beginPath();
+  for (const m of S.moths) {
+    const q = 1 + m.squash * 0.25;
+    ctx.moveTo(m.x + r * q, m.y);
+    ctx.arc(m.x, m.y, r * q, 0, TAU);
+  }
+  ctx.strokeStyle = SH.bg;
+  ctx.lineWidth = 3 * s;
+  ctx.stroke();
+  ctx.fillStyle = SH.white;
+  ctx.fill();
+}
+
+function drawLampShapes(ctx, l, alpha, color, on) {
+  const s = S.scale, k = 1 + l.fx.pulse * 0.3, half = 11 * s * k;
+  ctx.globalAlpha = alpha;
+  if (on) {
+    ctx.fillStyle = BASE[color];
+    ctx.fillRect(l.x - half, l.y - half, half * 2, half * 2);
+  } else {
+    ctx.fillStyle = SH.dark;
+    ctx.fillRect(l.x - half, l.y - half, half * 2, half * 2);
+    ctx.strokeStyle = BASE[color];
+    ctx.lineWidth = 2;
+    ctx.strokeRect(l.x - half + 1, l.y - half + 1, half * 2 - 2, half * 2 - 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawParticlesShapes(ctx) {
+  ctx.save();
+  for (let i = 0; i < partN; i++) {
+    const p = PARTS[i], k = p.life / p.max;
+    ctx.globalAlpha = p.kind === 2 ? k * 0.4 : k;
+    if (p.kind === 1) {
+      ctx.strokeStyle = p.color; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.size * U.easeOutCubic(1 - k) + 2, 0, TAU); ctx.stroke();
+    } else {
+      ctx.fillStyle = p.kind === 2 ? SH.mid : p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.kind === 2 ? p.size * 0.6 : p.size * 0.8, 0, TAU); ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+// ================================================================== rendering: overlays (both views)
+function drawOverlays(ctx, t) {
+  const s = S.scale, abs = Kit.isAbstract;
+  const ui = abs ? SH.white : ACCENT;
+  // beam edges
+  if (tw('edges')) {
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([6, 5]);
+    for (const l of S.lamps) {
+      if (!l.fx.path || !l.on) continue;
+      ctx.strokeStyle = U.rgba(abs ? BASE[l.color] : U.mixHex(LIGHT[l.color], '#ffffff', 0.4), 0.9);
+      ctx.stroke(l.fx.path);
+    }
+    ctx.restore();
+  }
+  // objects: hover + selection
+  const ho = S.hover.obj, so = S.selObj;
+  if (ho && ho !== so) {
+    polyPath(ctx, ho.points, abs ? 0 : cornerRadius(ho));
+    ctx.strokeStyle = abs ? SH.mid : 'rgba(255,255,255,0.75)'; ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  if (so) {
+    ctx.save();
+    polyPath(ctx, so.points, abs ? 0 : cornerRadius(so));
+    ctx.strokeStyle = ui; ctx.lineWidth = 2.5;
+    ctx.setLineDash([8, 6]); ctx.lineDashOffset = -t * 30;
+    ctx.stroke();
+    ctx.restore();
+  }
+  // rail highlight + ghost lamp
+  const g = S.ghost;
+  if (g.on && !S.drag) {
+    const full = S.lamps.length >= MAX_LAMPS;
+    ctx.save();
+    ctx.strokeStyle = full ? 'rgba(154,154,166,0.5)' : abs ? 'rgba(255,255,255,0.4)' : 'rgba(255,220,130,0.8)';
+    ctx.lineWidth = Math.max(3, S.band * 0.14);
+    ctx.stroke(S.railPath);
+    if (!abs && !full) {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.8;
+      drawGlow(ctx, ACCENT, g.x - g.nx * S.band * 0.5, g.y - g.ny * S.band * 0.5, 90 * s);
+    }
+    ctx.restore();
+    const color = full ? null : S.color;
+    if (abs) {
+      const half = 11 * s;
+      ctx.save();
+      ctx.strokeStyle = full ? SH.mid : BASE[color];
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(g.x - half, g.y - half, half * 2, half * 2);
+      ctx.restore();
+    } else {
+      paintLampMount(ctx, g, full ? 0.3 : 0.55);
+      drawLampHead(ctx, g, full ? 0.3 : 0.55, color || 'red', 0, t);
+    }
+    if (!full) {
+      // preview of the cone a new lamp would throw
+      const w = clamp(tw('width'), 8, 80) * DEG / 2, L = 120 * s;
+      ctx.save();
+      ctx.strokeStyle = abs ? BASE[color] : U.rgba(LIGHT[color], 0.8);
+      ctx.globalAlpha = 0.7;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      ctx.moveTo(g.x + Math.cos(g.angle - w) * L, g.y + Math.sin(g.angle - w) * L);
+      ctx.lineTo(g.x, g.y);
+      ctx.lineTo(g.x + Math.cos(g.angle + w) * L, g.y + Math.sin(g.angle + w) * L);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+  // lamp hover ring
+  const hl = S.hover.lamp;
+  if (hl && hl !== S.selLamp) {
+    ctx.save();
+    ctx.strokeStyle = abs ? SH.mid : 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(hl.x, hl.y, 22 * s, 0, TAU); ctx.stroke();
+    ctx.restore();
+  }
+  // selected lamp: ring, cone guides, aim knob
+  const l = S.selLamp;
+  if (l) {
+    const L = handleLen(), hw = l.width / 2;
+    const hx = l.ox + Math.cos(l.angle) * L, hy = l.oy + Math.sin(l.angle) * L;
+    ctx.save();
+    ctx.strokeStyle = ui; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(l.x, l.y, 22 * s, 0, TAU); ctx.stroke();
+    ctx.setLineDash([6, 6]); ctx.lineDashOffset = -t * 24; ctx.globalAlpha = 0.6;
+    ctx.beginPath(); ctx.arc(l.x, l.y, 28 * s, 0, TAU); ctx.stroke();
+    ctx.globalAlpha = 0.55; ctx.lineDashOffset = 0; ctx.setLineDash([4, 5]); ctx.lineWidth = 1.5;
+    ctx.strokeStyle = abs ? SH.white : 'rgba(255,255,255,0.85)';
+    ctx.beginPath();
+    ctx.moveTo(l.ox + Math.cos(l.angle - hw) * L * 1.3, l.oy + Math.sin(l.angle - hw) * L * 1.3);
+    ctx.lineTo(l.ox, l.oy);
+    ctx.lineTo(l.ox + Math.cos(l.angle + hw) * L * 1.3, l.oy + Math.sin(l.angle + hw) * L * 1.3);
+    ctx.moveTo(l.ox, l.oy); ctx.lineTo(hx, hy);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    const hot = S.hover.handle || (S.drag && S.drag.kind === 'aim');
+    const kr = (hot ? 11 : 9) * s;
+    if (hot) { ctx.fillStyle = abs ? 'rgba(255,255,255,0.25)' : 'rgba(255,209,102,0.3)'; ctx.beginPath(); ctx.arc(hx, hy, kr * 1.8, 0, TAU); ctx.fill(); }
+    ctx.fillStyle = ui;
+    ctx.strokeStyle = abs ? SH.bg : '#2a1d00';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(hx, hy, kr, 0, TAU); ctx.fill(); ctx.stroke();
+    // little rotate arrows on the knob
+    ctx.strokeStyle = abs ? SH.bg : '#2a1d00'; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(hx, hy, kr * 0.5, l.angle + 0.5, l.angle + 2.6); ctx.stroke();
+    ctx.beginPath(); ctx.arc(hx, hy, kr * 0.5, l.angle + 3.6, l.angle + 5.7); ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function render(ctx, rdt) {
+  if (!S.ready) return;
+  const t = Kit.time, rt = Kit.realTime, abs = Kit.isAbstract;
+  pollKeys(rdt);
+  // wall-clock animations keep feedback alive while paused
+  for (const l of S.lamps) {
+    const fx = l.fx;
+    const target = l.on ? 1 : 0;
+    if (fx.power !== target) {
+      S.floorDirty = true;
+      fx.power = clamp(fx.power + (target ? rdt * 3.2 : -rdt * 5), 0, 1);
+      fx.flick = target && fx.power < 1 && !abs ? (Math.random() < 0.35 ? 0.25 : 1) : 1;
+    } else fx.flick = 1;
+    fx.pulse = Math.max(0, fx.pulse - rdt * 2.6);
+    fx.jolt = Math.max(0, fx.jolt - rdt * 5);
+  }
+  for (const o of S.obstacles) {
+    if (o.pop < 1) { o.pop = Math.min(1, o.pop + rdt / 0.45); updateObstacle(o); if (o.pop >= 1) clampObstacle(o); S.dirty = true; }
+    if (o.fx.flash > 0) o.fx.flash = Math.max(0, o.fx.flash - rdt * 3.5);
+  }
+  updateParticles(rdt);
+  if (S.dirty) recomputeBeams();
+
+  if (abs) {
+    ctx.drawImage(bgLayer, 0, 0, Kit.W, Kit.H);
+    drawBeamsShapes(ctx);
+    drawObstaclesShapes(ctx);
+    drawObjectFlashes(ctx);
+    drawAgentsShapes(ctx);
+    drawParticlesShapes(ctx);
+    for (const l of S.lamps) drawLampShapes(ctx, l, 1, l.color, l.on);
+  } else {
+    if (S.floorDirty) paintLitFloor();
+    ctx.drawImage(floorLayer, 0, 0, Kit.W, Kit.H);
+    drawObjectFlashes(ctx);
+    if (tw('dust')) drawMotes(ctx, rt);
+    drawMothsSprite(ctx);
+    drawParticlesSprite(ctx);
+    for (const l of S.lamps) drawLampHead(ctx, l, 1, l.color, lampVis(l), rt);
+  }
+  drawOverlays(ctx, rt);
+}
+
+// ================================================================== simulation entry points
+function update(dt, t) {
+  if (!S.ready) return;
+  if (S.dirty) recomputeBeams();
+  updateMoths(dt, t);
+  updateMotes(dt, t);
+}
+
+function updateCounts() {
+  const n = S.lamps.length;
+  Kit.setStat('lamps', `${n}/${MAX_LAMPS}`, { neutral: true });
+  if (S.ui.readout) S.ui.readout.textContent = `${Kit.pick('Lamps', 'Lights')} ${n}/${MAX_LAMPS}`;
+  if (S.ui.addLampBtn) S.ui.addLampBtn.disabled = n >= MAX_LAMPS;
+  if (S.ui.clearBtn) S.ui.clearBtn.disabled = n === 0;
+  S.litCount = S.moths.filter((m) => m.target).length;
+  Kit.setStat('lit', `${S.litCount}/${S.moths.length}`, { neutral: true });
+}
+
+function refreshHint() {
+  if (S.selLamp) Kit.setHint('Drag the knob or press ← → to aim. ↑ ↓ width, O on or off.');
+  else if (S.selObj) Kit.setHint('Drag to move it. Wheel or Q E rotates. Delete removes it.');
+  else Kit.setHint(null);
+}
+
+/** Default scene: a red lamp on the left, a blue one top-right, one moth drifting in the dark middle. */
+function buildDefaultScene() {
+  const R = S.room;
+  S.lamps = []; S.obstacles = []; S.moths = [];
+  S.selLamp = null; S.selObj = null; S.drag = null;
+  partN = 0;
+  for (const [kind, cx, cy, size, rot, glass] of DEFAULT_OBJECTS) {
+    const o = makeObstacle(kind, cx, cy, size, rot * DEG, glass);
+    clampObstacle(o);
+    S.obstacles.push(o);
+  }
+  addLampAt(R.x, R.y + R.h * 0.52, 'red', { silent: true });
+  addLampAt(R.x + R.w * 0.8, R.y, 'blue', { silent: true, aimAt: { x: R.x + R.w * 0.42, y: R.y + R.h * 0.64 } });
+  recomputeBeams();
+  // the hero moth starts in a dark patch near the middle, heading for the nearest beam
+  const cx = R.x + R.w * 0.5, cy = R.y + R.h * 0.5, s = S.scale;
+  let start = { x: cx, y: cy, a: rand(0, TAU) }, found = false;
+  for (let rr = 0; rr <= 200 * s && !found; rr += 25 * s) {
+    for (let i = 0; i < 16 && !found; i++) {
+      const a = (i / 16) * TAU, x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
+      if (isLitPoint(x, y) || S.obstacles.some((o) => U.dist(x, y, o.bx, o.by) < o.br + 20 * s)) continue;
+      for (let j = 0; j < 24; j++) {
+        const b = (j / 24) * TAU, d = 110 * s;
+        if (isLitPoint(x + Math.cos(b) * d, y + Math.sin(b) * d)) { start = { x, y, a: b }; found = true; break; }
+      }
+    }
+  }
+  const hero = makeMoth(start.x, start.y, 1);
+  hero.size = 1.08;
+  hero.h = hero.wh = start.a;
+  hero.p1 = -Kit.time * 0.53; hero.p2 = -Kit.time * 1.37;
+  hero.vx = Math.cos(start.a) * 40 * s; hero.vy = Math.sin(start.a) * 40 * s;
+  S.moths.push(hero);
+  S.ready = true;
+  setCreatureCount(tw('count'));
+  updateCounts();
+  refreshHint();
+}
+
+// ================================================================== UI wiring
+const GLASS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="4" width="14" height="16" rx="1.5" fill="currentColor" fill-opacity="0.3"/><path d="M9 8.5l-1.6 2.8M13 8.5l-4.2 7.2"/></svg>';
+
+function setup() {
+  S.ui.swatch = {};
+  const gColor = Kit.ui.group({ sprite: 'Lamp color', abstract: 'Light color' });
+  COLORS.forEach((c, i) => {
+    S.ui.swatch[c] = Kit.ui.button({
+      parent: gColor, label: NAME[c], swatch: BASE[c], key: String(i + 1),
+      tip: { sprite: `${NAME[c]} light for new lamps and the selected one`, abstract: `${NAME[c]} for new lights and the selected one` },
+      onClick: () => setColor(c, true),
+    });
+  });
+  const gLamps = Kit.ui.group(null);
+  S.ui.readout = Kit.ui.readout(gLamps);
+  S.ui.addLampBtn = Kit.ui.button({ parent: gLamps, icon: 'plus', iconOnly: true, key: 'L', tip: { sprite: 'Hang a lamp in a free spot', abstract: 'Add a light in a free spot' }, onClick: () => addLampFree() });
+  S.ui.clearBtn = Kit.ui.button({ parent: gLamps, icon: 'trash', iconOnly: true, tip: { sprite: 'Take down all lamps', abstract: 'Remove all lights' }, onClick: clearLamps });
+  const gObj = Kit.ui.group('Add object');
+  const objTips = {
+    square: { sprite: 'Add a wooden block', abstract: 'Add a square' },
+    triangle: { sprite: 'Add a wooden wedge', abstract: 'Add a triangle' },
+    circle: { sprite: 'Add a round stone', abstract: 'Add a circle' },
+    bar: { sprite: 'Add a plank', abstract: 'Add a bar' },
+  };
+  ['square', 'triangle', 'circle', 'bar'].forEach((k, i) => {
+    Kit.ui.button({ parent: gObj, icon: k, iconOnly: true, key: String(4 + i), tip: objTips[k], onClick: () => addObject(k) });
+  });
+  S.ui.glassBtn = Kit.ui.button({
+    parent: gObj, icon: GLASS_ICON, iconOnly: true, key: '8',
+    tip: { sprite: 'Add colored glass: only its own color shines through', abstract: 'Add a colored object: only its own color passes' },
+    onClick: () => addObject('glass'),
+  });
+  setColor(S.color, false);
+}
+
+function viewChanged() {
+  buildBackground();
+  updateCounts();
+}
+
+Kit.init({
+  id: 'beam',
+  number: '01',
+  accent: '#ffd166',
+  accentInk: '#2a1d00',
+  title: { sprite: 'Moths & Lamps', abstract: 'Beam' },
+  hint: {
+    sprite: 'Click the frame to hang a lamp. Drag stones to cast shadows.',
+    abstract: 'Click the frame to add a light. Drag objects to cast shadows.',
+  },
+  about: {
+    sprite: 'On a summer night every moth heads for the lamp whose light reaches it. Hang colored lamps on the frame, then slide stones, blocks and glass around to cast shadows and steer the swarm.',
+    abstract: 'Agents move toward any light that reaches them. Add colored lights on the frame, then move the objects to stop the light and steer the agents. Colored objects let only their own color through.',
+  },
+  controls: [
+    { keys: ['Click frame', 'L'], label: { sprite: 'Hang a lamp (up to five)', abstract: 'Add a light (up to five)' } },
+    { keys: ['1', '2', '3'], label: { sprite: 'Lamp color: red, green, blue', abstract: 'Light color: red, green, blue' } },
+    { keys: ['Drag'], label: { sprite: 'Slide a lamp along the frame or move a stone', abstract: 'Slide a light along the frame or move an object' } },
+    { keys: ['Knob', 'Wheel', '← →'], label: { sprite: 'Aim the selected lamp', abstract: 'Aim the selected light' } },
+    { keys: ['Shift+wheel', '↑ ↓'], label: 'Make the beam wider or narrower' },
+    { keys: ['O', 'Double-click'], label: { sprite: 'Switch a lamp on or off', abstract: 'Switch a light on or off' } },
+    { keys: ['Tab', 'Esc'], label: { sprite: 'Select the next lamp, or deselect', abstract: 'Select the next light, or deselect' } },
+    { keys: ['4–8'], label: { sprite: 'Add a block, wedge, stone, plank or glass', abstract: 'Add a square, triangle, circle, bar or colored object' } },
+    { keys: ['Wheel', 'Q E', 'Arrows'], label: 'Rotate or nudge the selected object' },
+    { keys: ['Delete', 'Right-click'], label: 'Remove what is selected or clicked' },
+  ],
+  stats: [
+    { id: 'lamps', label: { sprite: 'Lamps', abstract: 'Lights' }, value: '0/5' },
+    { id: 'lit', label: { sprite: 'Moths lit', abstract: 'Agents in light' }, value: '0/1' },
+  ],
+  tweaks: [
+    { type: 'section', label: { sprite: 'Moths', abstract: 'Agents' } },
+    { type: 'range', id: 'count', label: 'How many', min: 1, max: MAX_MOTHS, step: 1, value: DEFAULTS.count, onInput: (v) => setCreatureCount(v) },
+    { type: 'range', id: 'speed', label: 'Flying speed', min: 0.4, max: 2, step: 0.1, value: DEFAULTS.speed, format: (v) => v.toFixed(1) + '×' },
+    { type: 'range', id: 'pull', label: 'Attraction', min: 0.3, max: 2.5, step: 0.1, value: DEFAULTS.pull, format: (v) => v.toFixed(1) + '×', note: { sprite: 'How hard moths rush toward a lamp.', abstract: 'How hard agents rush toward a light.' } },
+    { type: 'button', label: { sprite: 'Scatter moths', abstract: 'Scatter agents' }, onClick: scatter },
+    { type: 'section', label: { sprite: 'Lamps', abstract: 'Lights' } },
+    { type: 'range', id: 'reach', label: 'Beam reach', min: 200, max: 1200, step: 50, value: DEFAULTS.reach, format: (v) => v + ' px', onInput: () => { S.dirty = true; }, note: 'How far the light stays strong.' },
+    { type: 'range', id: 'width', label: 'Beam width', min: 8, max: 80, step: 1, value: DEFAULTS.width, format: (v) => v + '°', onInput: (v) => { if (S.selLamp) setWidth(S.selLamp, v * DEG); }, note: { sprite: 'For new lamps and the selected one.', abstract: 'For new lights and the selected one.' } },
+    { type: 'toggle', id: 'edges', label: 'Show beam edges', value: DEFAULTS.edges },
+    { type: 'toggle', id: 'dust', label: 'Dust in the air', value: DEFAULTS.dust, when: () => !Kit.isAbstract },
+  ],
+  setup,
+  reset: buildDefaultScene,
+  update,
+  render,
+  resize: () => layout(),
+  viewChanged,
+  pointerDown,
+  pointerMove,
+  pointerUp,
+  pointerLeave: () => { S.hover.lamp = null; S.hover.obj = null; S.hover.handle = false; S.hover.frame = false; S.ghost.on = false; },
+  wheel,
+  dblclick,
+  keydown,
+  keyup,
+  escape: deselect,
+});
+
+// ================================================================== test API
+window.__toy = {
+  get lamps() { return S.lamps; },
+  get creatures() { return S.moths; },
+  get obstacles() { return S.obstacles; },
+  get room() { return Object.assign({}, S.room); },
+  get frameBand() { return S.band; },
+  addLamp: (x, y, color) => addLampAt(x, y, color || S.color),
+  removeLamp,
+  litBy: (c) => (c && c.target) || null,
+  isLitPoint,
+  setCreatureCount: (n) => Kit.setTweak('count', clamp(Math.round(n), 1, MAX_MOTHS)),
+  // extras for tests and debugging
+  get selectedLamp() { return S.selLamp; },
+  get selectedObject() { return S.selObj; },
+  get color() { return S.color; },
+  setColor: (c) => setColor(c, true),
+  selectLamp: (l) => selectLamp(l),
+  addObject: (type, x, y) => addObject(type, x != null ? { x, y } : null),
+  removeObstacle,
+  beamPolygon: (l) => l.fx.poly.slice(),
+  refresh: () => { for (const l of S.lamps) placeLamp(l); for (const o of S.obstacles) updateObstacle(o); recomputeBeams(); },
+  railPoint: (s) => Object.assign({}, railAt(s)),
+  get railLength() { return S.railLen; },
+};
+</script>
+</body>
+</html>
