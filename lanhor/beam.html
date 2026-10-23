@@ -90,6 +90,7 @@ const S = {
   floorDirty: true,
   obsRev: 0,          // bumped whenever object geometry or the room changes
   baseLamps: new Set(), baseValid: false,
+  floorWasDirty: false, floorStale: false,
   nextId: 1,
   lampPlacedAt: -9,
   litToastShown: false,
@@ -784,6 +785,28 @@ function avoidObstacles(m, look, strength, out) {
   }
 }
 
+function insideObstacle(x, y) {
+  for (const o of S.obstacles) {
+    if ((x - o.bx) * (x - o.bx) + (y - o.by) * (y - o.by) <= o.br * o.br && U.pointInPoly(x, y, o.points)) return true;
+  }
+  return false;
+}
+
+/** Move a moth by its velocity without ever leaving it inside an object: fast moths move in
+ *  sub-steps shorter than their radius, so they cannot skip through a thin object in one frame. */
+function moveMoth(m, dt, rad) {
+  const px = m.x, py = m.y;
+  const n = Math.min(8, Math.ceil((Math.hypot(m.vx, m.vy) * dt) / (rad * 0.6)) || 1);
+  for (let k = 0; k < n; k++) {
+    m.x += (m.vx * dt) / n; m.y += (m.vy * dt) / n;
+    pushOutOfObstacles(m, rad);
+    keepInRoom(m, rad);
+  }
+  // pushed out of one object into another, or against the wall: settle, else step back
+  for (let k = 0; k < 2 && insideObstacle(m.x, m.y); k++) { pushOutOfObstacles(m, rad); keepInRoom(m, rad); }
+  if (insideObstacle(m.x, m.y) && !insideObstacle(px, py)) { m.x = px; m.y = py; m.vx *= -0.4; m.vy *= -0.4; }
+}
+
 function pushOutOfObstacles(m, rad) {
   for (const o of S.obstacles) {
     const ddx = m.x - o.bx, ddy = m.y - o.by;
@@ -877,9 +900,7 @@ function updateMoths(dt, t) {
     const maxV = (m.state === 'orbit' ? 330 : m.state === 'seek' ? 170 * 1.6 * Math.sqrt(pull) : 260) * s * spd;
     const sp = Math.hypot(m.vx, m.vy);
     if (sp > maxV) { m.vx *= maxV / sp; m.vy *= maxV / sp; }
-    m.x += m.vx * dt; m.y += m.vy * dt;
-    pushOutOfObstacles(m, rad);
-    keepInRoom(m, rad);
+    moveMoth(m, dt, rad);
 
     if (m.state !== 'lost' && sp > 4) m.h = U.angleLerp(m.h, Math.atan2(m.vy, m.vx), 1 - Math.exp(-dt * 11));
     const rate = m.state === 'orbit' ? 21 : m.state === 'seek' ? 16 : m.state === 'lost' ? 4.5 : 7.5;
@@ -1175,9 +1196,9 @@ lampAtlas.res = 0;
 const LAMP_CELL = { x: -25, y: -14, w: 32, h: 28 };    // spotlight head bounds in lamp units
 const MOTH_CELL = { x: -44, y: -62, w: 74, h: 124 };   // frame bounds in moth units
 
-/** Glow drawn at a size that repeats every frame (moth halos, steady lamp halos): cached at that
- *  exact pixel size and blitted unscaled at whole device pixels, which skips per-frame resampling.
- *  Expects the canvas's base DPR transform. */
+/** Glow drawn at a size that repeats every frame (moth halos, steady lamp halos, dust motes): cached
+ *  at that whole pixel size and blitted unscaled at whole device pixels, which skips per-frame
+ *  resampling. Expects the canvas's base DPR transform. */
 const glowSized = new Map();
 function drawGlowSized(ctx, hex, x, y, size) {
   const d = Kit.dpr, px = Math.max(2, Math.round(size * d)), key = hex + px;
@@ -1185,7 +1206,7 @@ function drawGlowSized(ctx, hex, x, y, size) {
   if (!c) {
     const i = glowSlot(hex);
     if (i < 0) return;
-    if (glowSized.size >= 64) glowSized.clear();
+    if (glowSized.size >= 400) glowSized.clear();
     c = document.createElement('canvas');
     c.width = c.height = px;
     c.getContext('2d').drawImage(glowAtlas, (i % GLOW_COLS) * GLOW, Math.floor(i / GLOW_COLS) * GLOW, GLOW, GLOW, 0, 0, px, px);
@@ -1582,11 +1603,11 @@ function beamChanged(l, key) {
   return p.path !== l.fx.path || p.vis !== lampVis(l) || p.key !== key;
 }
 
-/** Sprites: the night floor with every beam, object and lamp mount baked in. The layer is only
- *  repainted when the lighting changes, so a still scene costs one blit per frame. Beams that hold
- *  still stay baked in baseLayer (background + those beams): aiming, sliding or switching one lamp
- *  re-rasters only its own beam. */
-function paintLitFloor() {
+/** Sprites: the night floor with every beam, object and lamp mount, painted into f. Beams that
+ *  hold still stay baked in baseLayer (background + those beams), so aiming, sliding or switching
+ *  one lamp re-rasters only its own beam; `moving` (the lighting changed last frame too) is when
+ *  re-baking the base pays off. */
+function paintLitFloor(f, moving) {
   S.floorDirty = false;
   const dpr = Kit.dpr, W = bgLayer.width, H = bgLayer.height;
   if (!W || !H) return;
@@ -1594,7 +1615,7 @@ function paintLitFloor() {
   const key = reachPx() + '';
   let rebuild = !S.baseValid;
   for (const l of S.baseLamps) if (!S.lamps.includes(l) || beamChanged(l, key)) rebuild = true;
-  for (const l of S.lamps) if (!S.baseLamps.has(l) && !beamChanged(l, key)) rebuild = true;
+  if (moving) for (const l of S.lamps) if (!S.baseLamps.has(l) && !beamChanged(l, key)) rebuild = true;
   if (rebuild) {
     const b = baseLayer.getContext('2d');
     b.setTransform(1, 0, 0, 1, 0, 0);
@@ -1607,7 +1628,6 @@ function paintLitFloor() {
     for (const l of S.lamps) if (!beamChanged(l, key)) { fillBeam(b, l); S.baseLamps.add(l); }
     S.baseValid = true;
   }
-  const f = floorLayer.getContext('2d');
   f.setTransform(1, 0, 0, 1, 0, 0);
   f.globalCompositeOperation = 'source-over';
   f.globalAlpha = 1;
@@ -1666,7 +1686,7 @@ function obstacleSprite(o) {
   // blit only the painted part (shape + bevel + drop shadow), not the transparent margin
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (const p of o.points) { x0 = Math.min(x0, p.x - o.bx); x1 = Math.max(x1, p.x - o.bx); y0 = Math.min(y0, p.y - o.by); y1 = Math.max(y1, p.y - o.by); }
-  const pad = 3 * s + 3, k = c.width / (2 * E);
+  const pad = 3 * s + 3, k = dpr;
   c.sx = clamp(Math.floor((E + x0 - pad) * k), 0, c.width); c.sy = clamp(Math.floor((E + y0 - pad) * k), 0, c.height);
   c.sw = clamp(Math.ceil((E + x1 + pad + 4 * s) * k), 0, c.width) - c.sx; c.sh = clamp(Math.ceil((E + y1 + pad + 6 * s) * k), 0, c.height) - c.sy;
   fx.sprite = c; fx.spriteKey = key;
@@ -1674,9 +1694,13 @@ function obstacleSprite(o) {
 }
 
 function paintObstacles(ctx) {
+  const d = Kit.dpr;
   for (const o of S.obstacles) {
-    const c = obstacleSprite(o), k = (2 * c.E) / c.width;
-    ctx.drawImage(c, c.sx, c.sy, c.sw, c.sh, o.bx - c.E + c.sx * k, o.by - c.E + c.sy * k, c.sw * k, c.sh * k);
+    // sprites are painted at device resolution: an unscaled blit at whole device pixels skips resampling
+    const c = obstacleSprite(o);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(c, c.sx, c.sy, c.sw, c.sh, Math.round((o.bx - c.E) * d) + c.sx, Math.round((o.by - c.E) * d) + c.sy, c.sw, c.sh);
+    ctx.setTransform(d, 0, 0, d, 0, 0);
     if (o.glass && o.glow > 0) glassGlow(ctx, o, cornerRadius(o));
   }
   drawLitRims(ctx);
@@ -1831,7 +1855,7 @@ function drawMotes(ctx, t) {
     const tw2 = 0.45 + 0.55 * Math.pow(0.5 + 0.5 * Math.sin(t * d.f + d.ph), 2);
     const size = (8 + 8 * Math.min(1, top)) * s * d.sz;
     ctx.globalAlpha = Math.min(1, top * 1.8) * tw2;
-    drawGlow(ctx, MIX[mask], x, y, size);
+    drawGlowSized(ctx, MIX[mask], x, y, size);
   }
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
@@ -2274,8 +2298,14 @@ function render(ctx, rdt) {
     drawParticlesShapes(ctx);
     for (const l of S.lamps) drawLampShapes(ctx, l, 1, l.color, l.on);
   } else {
-    if (S.floorDirty) paintLitFloor();
-    ctx.drawImage(floorLayer, 0, 0, Kit.W, Kit.H);
+    // a still floor is one blit of floorLayer; while the lighting changes every frame (drags, aiming)
+    // the floor is composed straight onto the screen and baked again once it holds still
+    const dirty = S.floorDirty, moving = dirty && S.floorWasDirty;
+    S.floorWasDirty = dirty;
+    if (moving) { paintLitFloor(ctx, true); S.floorStale = true; } else {
+      if (dirty || S.floorStale) { paintLitFloor(floorLayer.getContext('2d'), false); S.floorStale = false; }
+      ctx.drawImage(floorLayer, 0, 0, Kit.W, Kit.H);
+    }
     drawObjectFlashes(ctx);
     if (tw('dust')) drawMotes(ctx, rt);
     drawMothsSprite(ctx);

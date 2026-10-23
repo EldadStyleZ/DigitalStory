@@ -474,34 +474,56 @@
     for (const p of plazas) {
       const t = openNear(p);
       if (t < 0) continue;
-      const d = f.dist[t], score = d < 10 ? d + 1000 : d;
+      // the nearest plaza with room for four spaced cubes, else the farthest one
+      const d = f.dist[t], score = d >= 16 ? d : 1000 - d;
       if (score < gs) { gs = score; goal = t; }
     }
     if (goal < 0) return;
-    const path = [];
-    for (let cur = goal; f.dist[cur] > 0; cur = downhill(cur, f.dist)) path.push(cur);
-    path.reverse();
+    // the string-pulled way home (goal → nest), reversed and sampled every 0.25 tiles; its legs keep
+    // a wide line of sight, so cubes on it see each other and stay off the hedge corners
     const tc = (t) => [(t % cols) + 0.5, ((t / cols) | 0) + 0.5];
-    let [px, py] = [b.tx, b.ty];
-    let idx = -1;
-    const stops = [];
-    for (let k = 0; k < 4; k++) {
-      let pick = -1;
-      for (let j = idx + 1; j < path.length; j++) {
-        const [x, y] = tc(path[j]), d = Math.hypot(x - px, y - py);
-        if (d > 6) break;
-        if (d >= 3.4 && losWide(px, py, x, y, 0.25)) pick = j;
+    const way = [];
+    for (let cur = goal, n = 0; cur !== b.tile && n < 400; cur = f.wp[cur], n++) way.push(tc(cur));
+    way.push([b.tx, b.ty]);
+    way.reverse();
+    const pts = [];
+    for (let i = 1; i < way.length; i++) {
+      const [x0, y0] = way[i - 1], [x1, y1] = way[i], n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 0.25));
+      for (let k = 1; k <= n; k++) pts.push([x0 + ((x1 - x0) * k) / n, y0 + ((y1 - y0) * k) / n]);
+    }
+    // four cubes spread over the way, each within `gap` of the previous one and in its sight; a one-step
+    // lookahead keeps a cube from landing just before a corner (which would force a tiny next hop)
+    const gap = U.clamp((pts.length * 0.25) / 4, 3, 6);
+    const at = (i) => (i < 0 ? [b.tx, b.ty] : pts[i]);
+    const seen = (i) => {
+      const [x0, y0] = at(i), out = [];
+      for (let j = i + 1; j < pts.length; j++) {
+        const [x, y] = pts[j], d = Math.hypot(x - x0, y - y0);
+        if (d > gap) break;
+        if (losWide(x0, y0, x, y, 0.3)) out.push(j);
       }
-      if (pick < 0) pick = Math.min(path.length - 1, idx + 3);
-      if (pick <= idx) break;
-      const [x, y] = tc(path[pick]);
-      if (addCube(x, y)) stops.push(pick);
-      px = x; py = y; idx = pick;
+      return out;
+    };
+    const hop = (i, j) => Math.hypot(at(j)[0] - at(i)[0], at(j)[1] - at(i)[1]);
+    const stops = [];
+    for (let k = 0, idx = -1; k < 4; k++) {
+      const cand = seen(idx);
+      if (!cand.length) break;
+      let pick = cand[cand.length - 1], best = -1;
+      if (k < 3) {
+        for (const j of cand) {
+          const nx = seen(j), score = Math.min(hop(idx, j), nx.length ? hop(j, nx[nx.length - 1]) : 0);
+          if (score >= best) { best = score; pick = j; }
+        }
+      }
+      const c = addCube(pts[pick][0], pts[pick][1]);
+      if (!c) break;
+      stops.push(c);
+      idx = pick;
     }
     if (stops.length >= 2) {
-      const j = Math.round((stops[stops.length - 2] + stops[stops.length - 1]) / 2);
-      const [x, y] = tc(path[j]);
-      addFlag(x, y);
+      const c0 = stops[stops.length - 2], c1 = stops[stops.length - 1];
+      addFlag((c0.tx + c1.tx) / 2, (c0.ty + c1.ty) / 2);
     }
   }
 
@@ -531,7 +553,8 @@
       if (d2 > r2) continue;
       scanC[m] = c; scanD[m] = d2; m++;
     }
-    for (let tries = 0; tries < m && tries < 48; tries++) {
+    // nearest first, with no cap: a far visible cube must still win over any number of hidden near ones
+    for (let tries = 0; tries < m; tries++) {
       let k = -1, bd = Infinity;
       for (let i = 0; i < m; i++) if (scanD[i] < bd) { bd = scanD[i]; k = i; }
       if (k < 0) break;
