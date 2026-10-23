@@ -18,6 +18,7 @@
   const PITCH = 4;                    // maze cell pitch in tiles: 1 wall + 3 corridor
   const COLONY = ['#ff3b30', '#0a84ff', '#ffd60a', '#34c759', '#af52de'];
   const COLONY_NAME = ['Red', 'Blue', 'Yellow', 'Green', 'Purple'];
+  const NUM = ['no', 'one', 'two', 'three', 'four', 'five'];
   const DEF = { nests: 3, perNest: 25, speed: 3, vision: 14, bites: 20, trail: true, sight: false };
   const MAX_FLAGS = 3;
   const ANT_R = 0.22;                 // collision radius, tiles
@@ -49,6 +50,7 @@
   let T = 20, OX = 0, OY = 0;         // tile size (px) and map origin
   const bases = [], ants = [], cubes = [], flags = [];
   let simTime = 0, totalBites = 0, nextCubeId = 1;
+  let fxTime = 0;                     // real-time clock for feedback, so it plays even while paused
   let tool = 'sugar';
   const seenOnce = { wall: false, eaten: false, flagHit: false, flagFull: false };
   let ui = {};
@@ -309,7 +311,7 @@
       this.phase = Math.random() * TAU; this.pause = 0;
       this.mx = base.tx; this.my = base.ty; this.millT = 0;
       this.sepX = 0; this.sepY = 0; this.unstuck = 0; this.stuckT = 0; this.bestM = Infinity;
-      this.flagMask = 0; this.trailAcc = 0;
+      this.flagMask = 0; this.trailAcc = 0; this.seekT = 0;
     }
     get x() { return OX + this.tx * T; }
     set x(v) { this.tx = (v - OX) / T; }
@@ -318,13 +320,13 @@
   }
 
   class Cube {
-    constructor(tx, ty) { this.id = nextCubeId++; this.tx = tx; this.ty = ty; this.bites = 0; this.born = simTime; this.hit = 0; this.dead = false; this.r = Math.random(); }
+    constructor(tx, ty) { this.id = nextCubeId++; this.tx = tx; this.ty = ty; this.bites = 0; this.born = fxTime; this.hit = 0; this.dead = false; this.r = Math.random(); }
     get x() { return OX + this.tx * T; }
     get y() { return OY + this.ty * T; }
   }
 
   class Flag {
-    constructor(tx, ty, slot) { this.slot = slot; this.bit = 1 << slot; this.tx = tx; this.ty = ty; this.count = 0; this.born = simTime; this.hit = 0; }
+    constructor(tx, ty, slot) { this.slot = slot; this.bit = 1 << slot; this.tx = tx; this.ty = ty; this.count = 0; this.born = fxTime; this.hit = 0; }
     get x() { return OX + this.tx * T; }
     get y() { return OY + this.ty * T; }
   }
@@ -384,7 +386,7 @@
     clearFx();
     if (!opts.quiet) {
       Kit.sfx('whoosh', { pitch: 1.25 });
-      Kit.toast(word('New map', 'New map') + ' · seed ' + seed, { tone: 'info' });
+      Kit.toast('New map · seed ' + seed, { tone: 'info' });
     }
     if (ui.seedNote) { ui.seedNote.label = 'Map seed ' + seed; Kit.rebuildTweaks(); }
     layout({ crossfade: !opts.quiet });
@@ -552,7 +554,7 @@
       }
       setState(a, 'seek');
     }
-    if (a.target !== c) { a.bestM = Infinity; a.stuckT = 0; }
+    if (a.target !== c) { a.bestM = Infinity; a.stuckT = 0; a.seekT = 0; }
     a.target = c; a.lost = 0;
   }
   function giveUp(a) {
@@ -720,7 +722,9 @@
       const dx = gx - a.tx, dy = gy - a.ty, d = Math.sqrt(dx * dx + dy * dy);
       a.nz += ((Math.random() * 2 - 1) * 7 - a.nz * 3) * h;
       let want = d > 1e-4 ? Math.atan2(dy, dx) : a.h;
-      want += (Math.sin(simTime * a.zf + a.zp) * 0.3 + a.nz * 0.1) * U.clamp(d - 0.4, 0, 1);
+      // the zig-zag eases in after a new target, so a fresh line of sight is not wobbled away
+      const zig = a.state === 'seek' ? Math.min(1, (a.seekT += h) / 0.8) : 1;
+      want += (Math.sin(simTime * a.zf + a.zp) * 0.3 + a.nz * 0.1) * U.clamp(d - 0.4, 0, 1) * zig;
       const dA = U.angleDiff(a.h, want);
       const turn = Math.max(7, spd * 2.8) * h;
       a.h += dA > turn ? turn : dA < -turn ? -turn : dA;
@@ -778,6 +782,10 @@
     computeSeparation();
     const n = Math.max(1, Math.ceil((dt * (tw('speed') + 5)) / 0.3));
     for (let k = 0; k < n; k++) stepAnts(dt / n);
+  }
+  /** Feedback runs on real time: pop-ins, squash, pulses and particles. */
+  function tickFx(dt) {
+    fxTime += dt;
     for (const c of cubes) c.hit = Math.max(0, c.hit - dt * 5);
     for (const f of flags) f.hit = Math.max(0, f.hit - dt * 4);
     for (const b of bases) b.pulse = Math.max(0, b.pulse - dt * 2.5);
@@ -1033,7 +1041,7 @@
   // ================================================================ layout and static layers
   let layer = null, layerPrev = null, fadeT = 0;
   const FADE = 0.45;
-  let cubeSpr = [], cubeBad = null, cubeGhost = null;
+  let cubeSpr = [], cubeBad = null;
 
   function layout(opts = {}) {
     if (!grid) return;
@@ -1110,9 +1118,8 @@
     // wall shadows (blurred, offset)
     const walls = [];
     for (let t = 0; t < cols * rows; t++) if (grid[t]) walls.push(t);
-    const sh = makeCanvas(layer.width, layer.height);
+    const sh = makeCanvas(Math.ceil(W), Math.ceil(H)); // blurred anyway, so CSS resolution is enough
     const s2 = sh.getContext('2d');
-    s2.setTransform(Kit.dpr, 0, 0, Kit.dpr, 0, 0);
     s2.beginPath();
     for (const t of walls) for (let k = 0; k < 3; k++) { const b = hedgeBlob(t, k); blobPath(s2, OX + b[0] * T, OY + b[1] * T, b[2] * T); }
     s2.fillStyle = '#000'; s2.fill();
@@ -1259,7 +1266,6 @@
   }
   function buildCubeSprites() {
     cubeSpr = [0, 1, 2, 3, 4].map((s) => cubeCanvas(s, false));
-    cubeGhost = cubeSpr[0];
     cubeBad = cubeCanvas(0, true);
   }
 
@@ -1377,7 +1383,7 @@
   }
 
   function cubeScale(c) {
-    const age = simTime - c.born;
+    const age = fxTime - c.born;
     const pop = age < 0.4 ? U.easeOutBack(U.clamp(age / 0.4, 0, 1)) : 1;
     return (0.55 + 0.45 * (1 - c.bites / tw('bites'))) * pop;
   }
@@ -1401,13 +1407,13 @@
     }
     ctx.fillStyle = '#fbf6ea'; ctx.fill();
     for (const c of cubes) {
-      const sc = cubeScale(c), age = simTime - c.born, px = OX + c.tx * T, py = OY + c.ty * T;
+      const sc = cubeScale(c), age = fxTime - c.born, px = OX + c.tx * T, py = OY + c.ty * T;
       const stage = Math.min(4, Math.floor((c.bites / max) * 5));
       const drop = age < 0.22 ? (1 - age / 0.22) * T * 0.9 : 0;
       const sq = c.hit * 0.14, w = T * CUBE_SPR * sc * (1 + sq), h = T * CUBE_SPR * sc * (1 - sq);
       ctx.drawImage(cubeSpr[stage], px - w / 2, py - h / 2 - drop + (T * CUBE_SPR * sc - h) * 0.5, w, h);
       // twinkle
-      const tk = (simTime * 0.8 + c.r * 9) % 3.2;
+      const tk = (fxTime * 0.8 + c.r * 9) % 3.2;
       if (tk < 0.4) {
         const k = Math.sin((tk / 0.4) * Math.PI), sx = px - T * 0.16 * sc, sy = py - T * 0.52 * sc, r = T * 0.3 * k;
         star(ctx, sx, sy, r, 'rgba(255,255,255,0.95)');
@@ -1437,7 +1443,7 @@
   function drawFlagsSprite(ctx) {
     const t = Kit.realTime;
     for (const f of flags) {
-      const x = OX + f.tx * T, y = OY + f.ty * T, age = simTime - f.born;
+      const x = OX + f.tx * T, y = OY + f.ty * T, age = fxTime - f.born;
       const pop = age < 0.45 ? U.easeOutBack(U.clamp(age / 0.45, 0, 1)) : 1, hov = hover.flag === f;
       ctx.fillStyle = 'rgba(255,214,10,0.08)';
       ctx.beginPath(); ctx.arc(x, y, FLAG_R * T * pop, 0, TAU); ctx.fill();
@@ -1525,23 +1531,19 @@
       ctx.beginPath(); ctx.arc(x, y, T * (1.1 + b.pulse * 0.12), 0, TAU); ctx.fill();
       if (hover.base === b) { ctx.strokeStyle = SHAPE.white; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, T * 1.35, 0, TAU); ctx.stroke(); }
     }
-    // goals: zone ring + diamond + count
+    // goals: zone ring + diamond (count is drawn above the agents)
     for (const f of flags) {
-      const x = OX + f.tx * T, y = OY + f.ty * T, age = simTime - f.born;
+      const x = OX + f.tx * T, y = OY + f.ty * T, age = fxTime - f.born;
       const pop = age < 0.45 ? U.easeOutBack(U.clamp(age / 0.45, 0, 1)) : 1, s = T * 0.6 * pop * (1 + f.hit * 0.25);
       ctx.strokeStyle = hover.flag === f ? SHAPE.white : SHAPE.mid; ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.arc(x, y, FLAG_R * T * pop, 0, TAU); ctx.stroke();
       ctx.fillStyle = SHAPE.yellow;
       ctx.beginPath(); ctx.moveTo(x, y - s); ctx.lineTo(x + s, y); ctx.lineTo(x, y + s); ctx.lineTo(x - s, y); ctx.closePath(); ctx.fill();
-      const fs = Math.round(U.clamp(T * 0.66, 12, 18));
-      ctx.font = `600 ${fs}px Rubik, system-ui, sans-serif`;
-      ctx.fillStyle = SHAPE.white; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText(String(f.count), x + s + T * 0.25, y);
     }
     // attractors: white square + hit ring
     const max = tw('bites');
     for (const c of cubes) {
-      const x = OX + c.tx * T, y = OY + c.ty * T, age = simTime - c.born;
+      const x = OX + c.tx * T, y = OY + c.ty * T, age = fxTime - c.born;
       const pop = age < 0.35 ? U.easeOutBack(U.clamp(age / 0.35, 0, 1)) : 1;
       const s = T * 0.62 * pop * (1 + c.hit * 0.2);
       ctx.fillStyle = SHAPE.white; ctx.fillRect(x - s / 2, y - s / 2, s, s);
@@ -1584,6 +1586,14 @@
       }
     }
     ctx.globalAlpha = 1;
+    const fs = Math.round(U.clamp(T * 0.66, 12, 18));
+    for (const f of flags) {
+      const x = OX + f.tx * T, y = OY + f.ty * T, sc = 1 + f.hit * 0.3;
+      ctx.font = `600 ${Math.round(fs * sc)}px Rubik, system-ui, sans-serif`;
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+      ctx.lineWidth = 4; ctx.strokeStyle = SHAPE.floor; ctx.strokeText(String(f.count), x + T * 0.85, y);
+      ctx.fillStyle = SHAPE.white; ctx.fillText(String(f.count), x + T * 0.85, y);
+    }
   }
 
   // ================================================================ rendering — shared overlays
@@ -1634,7 +1644,7 @@
       const x = OX + hover.cube.tx * T, y = OY + hover.cube.ty * T;
       ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(x, y, T * 0.78, 0, TAU); ctx.stroke();
-      label(ctx, x, y - T * 0.95, word('Right-click to remove', 'Right-click to remove'));
+      label(ctx, x, y - T * 0.95, 'Right-click to remove');
     } else if (hover.flag && tool !== 'flag') {
       const x = OX + hover.flag.tx * T, y = OY + hover.flag.ty * T;
       label(ctx, x, y + T * 2.6, 'Right-click to remove');
@@ -1670,7 +1680,7 @@
         ctx.fillStyle = bad ? SHAPE.red : SHAPE.white; ctx.fillRect(gx - s / 2, gy - s / 2, s, s);
       } else {
         const s = T * CUBE_SPR;
-        ctx.drawImage(bad ? cubeBad : cubeGhost, gx - s / 2, gy - s / 2, s, s);
+        ctx.drawImage(bad ? cubeBad : cubeSpr[0], gx - s / 2, gy - s / 2, s, s);
       }
       ctx.globalAlpha = 1;
       // vision preview: which ants could see a cube here
@@ -1701,6 +1711,7 @@
       ctx.drawImage(layerPrev, 0, 0, Kit.W, Kit.H);
       ctx.globalAlpha = 1;
     }
+    tickFx(Math.min(rdt, 0.1));
     computeHover();
     if (Kit.isAbstract) renderShapes(ctx); else renderSprite(ctx);
     drawOverlay(ctx);
@@ -1726,12 +1737,12 @@
   }
 
   function setup() {
-    const gPlace = Kit.ui.group({ sprite: 'Place', abstract: 'Place' });
+    const gPlace = Kit.ui.group('Place');
     ui.bSugar = Kit.ui.button({ parent: gPlace, label: { sprite: 'Sugar', abstract: 'Attractor' }, icon: ICON_CUBE, key: '1', tip: { sprite: 'Sugar: click to drop, drag for a trail', abstract: 'Attractor: click to drop, drag for a line' }, onClick: () => setTool('sugar') });
     ui.bFlag = Kit.ui.button({ parent: gPlace, label: { sprite: 'Flag', abstract: 'Goal' }, icon: 'flag', key: '2', tip: { sprite: 'Flag: counts the ants that reach it', abstract: 'Goal: counts the agents that reach it' }, onClick: () => setTool('flag') });
     const gMap = Kit.ui.group(null);
-    ui.bClear = Kit.ui.button({ parent: gMap, label: 'Clear', icon: 'trash', key: 'C', tip: { sprite: 'Remove all sugar', abstract: 'Remove all attractors' }, onClick: () => clearCubes(true) });
-    ui.bNew = Kit.ui.button({ parent: gMap, label: 'New map', icon: 'shuffle', key: 'N', tip: 'Make a new maze', onClick: () => newMap() });
+    Kit.ui.button({ parent: gMap, label: 'Clear', icon: 'trash', key: 'C', tip: { sprite: 'Remove all sugar', abstract: 'Remove all attractors' }, onClick: () => clearCubes(true) });
+    Kit.ui.button({ parent: gMap, label: 'New map', icon: 'shuffle', key: 'N', tip: 'Make a new maze', onClick: () => newMap() });
     ui.bSight = Kit.ui.button({ parent: gMap, label: 'Sight lines', icon: 'eye', key: 'L', tip: { sprite: 'Show what each ant is heading to', abstract: 'Show what each agent is heading to' }, onClick: toggleSight });
     Kit.ui.setActive(ui.bSugar, true);
     Kit.ui.setActive(ui.bFlag, false);
@@ -1791,11 +1802,11 @@
     about: {
       get sprite() {
         const n = bases.length || tw('nests');
-        return `${n === 1 ? 'An ant colony lives' : n + ' ant colonies live'} in a garden maze. Drop sugar and every ant that can see a cube walks to the closest one, takes one bite, then looks for the next. Lay a trail of cubes to lead them anywhere. When the trail ends, each ant walks back to its own nest. A cube lasts ${tw('bites')} bites.`;
+        return `${n === 1 ? 'An ant colony lives' : NUM[n][0].toUpperCase() + NUM[n].slice(1) + ' ant colonies live'} in a garden maze. Drop sugar and every ant that can see a cube walks to the closest one, takes one bite, then looks for the next. Lay a trail of cubes to lead them anywhere. When the trail ends, each ant walks back to its own nest. A cube lasts ${tw('bites')} bites.`;
       },
       get abstract() {
         const n = bases.length || tw('nests');
-        return `Agents start at ${n === 1 ? 'one base' : n + ' bases'} in a maze. Drop attractors and every agent that can see one moves to the closest, hits it once, then looks for the next. Lay a line of attractors to lead them anywhere. When the line ends, each agent goes back to its own base. An attractor lasts ${tw('bites')} hits.`;
+        return `Agents start at ${n === 1 ? 'one base' : NUM[n] + ' bases'} in a maze. Drop attractors and every agent that can see one moves to the closest, hits it once, then looks for the next. Lay a line of attractors to lead them anywhere. When the line ends, each agent goes back to its own base. An attractor lasts ${tw('bites')} hits.`;
       },
     },
     controls: [
