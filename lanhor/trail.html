@@ -29,7 +29,7 @@
   const CUBE_MARGIN = 0.42;           // cubes keep this far from walls
   const CUBE_SPR = 1.5;               // cube sprite box, tiles
   const PAINT_STEP = 2;               // tiles between painted cubes
-  const TRAIL_CAP = 9000, TRAIL_LIFE = 4.5, TRAIL_BUCKETS = 3;
+  const TRAIL_CAP = 6000, TRAIL_LIFE = 4, TRAIL_BUCKETS = 3;
   const TRAIL_ALPHA = [0.5, 0.3, 0.14];
   const PART_CAP = 600;
   const SHAPE = { bg: '#1c1c22', floor: '#0d0d10', wall: '#2c2c34', mid: '#5a5a66', light: '#9a9aa6', white: '#ffffff', red: '#ff3b30', yellow: '#ffd60a' };
@@ -761,7 +761,7 @@
       }
       if (a.state !== 'home' && moved > 0) {
         a.trailAcc += moved;
-        if (a.trailAcc >= 0.34) { a.trailAcc = 0; pushTrail(a.tx - c * 0.3, a.ty - s * 0.3, b.index); }
+        if (a.trailAcc >= 0.42) { a.trailAcc = 0; pushTrail(a.tx - c * 0.3, a.ty - s * 0.3, b.index); }
       }
       // watchdog: no progress for a while → ignore the crowd briefly and wiggle free
       if (a.state !== 'home' && a.pause <= 0) {
@@ -1278,8 +1278,8 @@
   const ABDOMEN = COLONY.map((c) => U.mixHex(c, ANT_DARK, 0.22));
   const TRAIL_COL = COLONY.map((c) => U.mixHex(c, '#fff1d6', 0.55));
 
-  const GAIT = 6;                     // walk-cycle frames per sprite set
-  let antSpr = [], antBox = 0;        // antSpr[colony][frame + carry * GAIT]; antBox in CSS px
+  const GAIT = 6, DIRS = 32;          // walk-cycle frames and headings per sprite atlas
+  let antSpr = [], antBox = 0, antCell = 0; // antSpr[colony] atlas; antBox CSS px, antCell device px
 
   /** One ant in body-length units: thorax at the origin, facing +x. */
   function paintAnt(g, ci, phase, carry, lw) {
@@ -1316,34 +1316,42 @@
       g.strokeStyle = 'rgba(90,70,50,0.6)'; g.lineWidth = lw * 0.5; g.strokeRect(0.31, -0.085, 0.17, 0.17);
     }
   }
+  /** Per-colony atlas of pre-rotated ants: column = heading, row = gait frame (+GAIT when carrying).
+   *  Rotated blits are slow on a 2D canvas, so rotation happens once here. */
   function buildAntSprites() {
     const L = T * 1.05;
     antBox = Math.ceil(L * 1.3);
-    const px = Math.max(8, Math.ceil(antBox * Kit.dpr)), k = (px / antBox) * L;
-    const lw = Math.max(1, T * 0.055) / L;
-    antSpr = COLONY.map((_, ci) => {
-      const set = [];
+    const cell = Math.max(8, Math.ceil(antBox * Kit.dpr)), big = cell * 2;
+    const k = (big / antBox) * L, lw = Math.max(1, T * 0.055) / L;
+    const src = makeCanvas(big, big), sg = src.getContext('2d');
+    antCell = cell;
+    antSpr = bases.map((b) => {
+      const atlas = makeCanvas(cell * DIRS, cell * GAIT * 2), ag = atlas.getContext('2d');
       for (let carry = 0; carry < 2; carry++) for (let f = 0; f < GAIT; f++) {
-        const cv = makeCanvas(px, px), g = cv.getContext('2d');
-        g.setTransform(k, 0, 0, k, px / 2, px / 2);
-        paintAnt(g, ci, (f / GAIT) * TAU, carry === 1, lw);
-        set[f + carry * GAIT] = cv;
+        sg.setTransform(1, 0, 0, 1, 0, 0); sg.clearRect(0, 0, big, big);
+        sg.setTransform(k, 0, 0, k, big / 2, big / 2);
+        paintAnt(sg, b.index, (f / GAIT) * TAU, carry === 1, lw);
+        const row = f + carry * GAIT;
+        for (let d = 0; d < DIRS; d++) {
+          const ang = (d / DIRS) * TAU, c = Math.cos(ang), s = Math.sin(ang);
+          ag.setTransform(c, s, -s, c, d * cell + cell / 2, row * cell + cell / 2);
+          ag.drawImage(src, -cell / 2, -cell / 2, cell, cell);
+        }
       }
-      return set;
+      return atlas;
     });
   }
 
   function drawAntsSprite(ctx) {
-    const dpr = Kit.dpr, h = antBox / 2;
+    const cell = antCell;
     for (let i = 0; i < ants.length; i++) {
       const a = ants[i];
       if (a.vis <= 0.02) continue;
-      const f = Math.floor(((a.phase % TAU) + TAU) % TAU / TAU * GAIT) % GAIT;
-      const c = Math.cos(a.h) * a.vis * dpr, s = Math.sin(a.h) * a.vis * dpr;
-      ctx.setTransform(c, s, -s, c, (OX + a.tx * T) * dpr, (OY + a.ty * T) * dpr);
-      ctx.drawImage(antSpr[a.base.index][f + (a.carry ? GAIT : 0)], -h, -h, antBox, antBox);
+      const f = Math.floor((((a.phase % TAU) + TAU) % TAU / TAU) * GAIT) % GAIT;
+      const d = ((Math.round((a.h / TAU) * DIRS) % DIRS) + DIRS) % DIRS;
+      const sz = antBox * a.vis;
+      ctx.drawImage(antSpr[a.base.index], d * cell, (f + (a.carry ? GAIT : 0)) * cell, cell, cell, OX + a.tx * T - sz / 2, OY + a.ty * T - sz / 2, sz, sz);
     }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
   const bucketN = new Int32Array(COLONY.length * TRAIL_BUCKETS);
