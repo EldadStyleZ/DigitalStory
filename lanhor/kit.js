@@ -126,7 +126,7 @@
   /** Uniform-grid spatial hash for neighbour queries. */
   class SpatialHash {
     constructor(cell = 32) { this.cell = cell; this.map = new Map(); }
-    clear() { this.map.clear(); }
+    clear() { for (const b of this.map.values()) b.length = 0; } // keep buckets: no per-frame allocation
     key(cx, cy) { return (cx + 32768) * 65536 + (cy + 32768); }
     insert(obj, x, y) {
       const k = this.key(Math.floor(x / this.cell), Math.floor(y / this.cell));
@@ -426,6 +426,9 @@
     if (v === Kit.view && !opts.force) return;
     Kit.view = v;
     LS.set('lanhor-view', v);
+    // drop anything still showing the old view's words
+    Kit.dom.toasts.replaceChildren();
+    Kit.dom.tip.classList.remove('is-on');
     applyViewText();
     if (Kit.cfg.viewChanged) Kit.cfg.viewChanged(v);
     if (!opts.silent) {
