@@ -87,6 +87,8 @@ const S = {
   drag: null,
   dirty: true,
   floorDirty: true,
+  obsRev: 0,          // bumped whenever object geometry or the room changes
+  baseLamps: new Set(), baseValid: false,
   nextId: 1,
   lampPlacedAt: -9,
   litToastShown: false,
@@ -98,6 +100,7 @@ const hash = new Kit.SpatialHash(48);
 const railOut = { x: 0, y: 0, nx: 0, ny: 1 };
 const keyHold = new Map();
 const angBuf = [];
+let polyBuf = [];
 const byNumber = (a, b) => a - b;
 const reachPx = () => tw('reach') * S.scale;
 const handleLen = () => clamp(72 * S.scale, 58, 110);
@@ -221,6 +224,7 @@ function layout() {
   S.rc = Math.round(Math.min(b * 1.3, S.minDim / 4));
   S.roomCorners = [R.x, R.y, R.x + R.w, R.y, R.x + R.w, R.y + R.h, R.x, R.y + R.h];
   buildRail();
+  S.obsRev++;
   S.roomPath = new Path2D(); pathRoundRect(S.roomPath, R.x, R.y, R.w, R.h, S.rc);
   S.outsidePath = new Path2D(); S.outsidePath.rect(0, 0, Kit.W, Kit.H); S.outsidePath.addPath(S.roomPath);
   S.railPath = new Path2D(); pathRoundRect(S.railPath, R.x - b / 2, R.y - b / 2, R.w + b, R.h + b, S.rc + b / 2);
@@ -268,6 +272,7 @@ function makeObstacle(kind, cx, cy, size, rot, glass) {
 }
 
 function updateObstacle(o) {
+  S.obsRev++;
   const R = S.room, verts = KINDS[o.kind].verts;
   const r = o.size * S.minDim * popScale(o);
   const c = Math.cos(o.rot), s = Math.sin(o.rot);
@@ -334,6 +339,7 @@ function removeObstacle(o) {
   const i = S.obstacles.indexOf(o);
   if (i < 0) return;
   S.obstacles.splice(i, 1);
+  S.obsRev++;
   if (S.selObj === o) S.selObj = null;
   if (S.hover.obj === o) S.hover.obj = null;
   if (S.drag && S.drag.obj === o) S.drag = null;
@@ -367,7 +373,11 @@ function makeLamp(s, color) {
     x: 0, y: 0, nx: 0, ny: 1, ox: 0, oy: 0, angle: 0,
   };
   Object.defineProperty(l, 'fx', {
-    value: { poly: [], path: null, grad: null, gradKey: '', power: 1, pulse: 0, flick: 1, jolt: 0 },
+    value: {
+      inKey: [0, 0, 0, 0, '', -1],                 // inputs of the last computeBeam
+      poly: [], polyColor: '', path: null, far: 40, grad: null, gradKey: '', power: 1, pulse: 0, flick: 1, jolt: 0,
+      painted: { path: null, vis: -1, key: '' },   // what the sprite floor currently shows for this beam
+    },
     enumerable: false,
   });
   placeLamp(l);
@@ -512,8 +522,16 @@ function castRay(ox, oy, dx, dy, color) {
   return t;
 }
 
+function samePoly(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 function computeBeam(l) {
-  const fx = l.fx, poly = fx.poly, ox = l.ox, oy = l.oy, a0 = l.angle, hw = l.width / 2;
+  const fx = l.fx, poly = polyBuf, ox = l.ox, oy = l.oy, a0 = l.angle, hw = l.width / 2, k = fx.inKey;
+  if (fx.path && k[0] === ox && k[1] === oy && k[2] === a0 && k[3] === l.width && k[4] === l.color && k[5] === S.obsRev) return;
+  k[0] = ox; k[1] = oy; k[2] = a0; k[3] = l.width; k[4] = l.color; k[5] = S.obsRev;
   angBuf.length = 0;
   const n = Math.max(2, Math.ceil(l.width / RAY_STEP));
   for (let i = 0; i <= n; i++) angBuf.push(-hw + (l.width * i) / n);
@@ -534,6 +552,9 @@ function computeBeam(l) {
     poly.push(ox + dx * t, oy + dy * t);
     if (t > far) far = t;
   }
+  // an unchanged beam keeps its path, so the sprite floor can leave it baked
+  if (fx.path && fx.polyColor === l.color && samePoly(poly, fx.poly)) return;
+  polyBuf = fx.poly; fx.poly = poly; fx.polyColor = l.color;
   const path = new Path2D();
   path.moveTo(poly[0], poly[1]);
   for (let i = 2; i < poly.length; i += 2) path.lineTo(poly[i], poly[i + 1]);
@@ -1106,6 +1127,7 @@ function pollKeys(rdt) {
 // ================================================================== rendering: shared layers
 const bgLayer = document.createElement('canvas');
 const floorLayer = document.createElement('canvas');
+const baseLayer = document.createElement('canvas');   // background + the beams that hold still (sprites)
 const FLAP_FRAMES = 8;
 const RIM_BUCKETS = 3;
 // additive mix of the sprite light colors, indexed by bitmask red=1 green=2 blue=4
@@ -1125,11 +1147,39 @@ lampAtlas.res = 0;
 const LAMP_CELL = { x: -25, y: -14, w: 32, h: 28 };    // spotlight head bounds in lamp units
 const MOTH_CELL = { x: -44, y: -62, w: 74, h: 124 };   // frame bounds in moth units
 
+/** Glow drawn at a size that repeats every frame (moth halos, steady lamp halos): cached at that
+ *  exact pixel size and blitted unscaled at whole device pixels, which skips per-frame resampling.
+ *  Expects the canvas's base DPR transform. */
+const glowSized = new Map();
+function drawGlowSized(ctx, hex, x, y, size) {
+  const d = Kit.dpr, px = Math.max(2, Math.round(size * d)), key = hex + px;
+  let c = glowSized.get(key);
+  if (!c) {
+    const i = glowSlot(hex);
+    if (i < 0) return;
+    if (glowSized.size >= 64) glowSized.clear();
+    c = document.createElement('canvas');
+    c.width = c.height = px;
+    c.getContext('2d').drawImage(glowAtlas, (i % GLOW_COLS) * GLOW, Math.floor(i / GLOW_COLS) * GLOW, GLOW, GLOW, 0, 0, px, px);
+    glowSized.set(key, c);
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(c, Math.round(x * d - px / 2), Math.round(y * d - px / 2));
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+}
+
 function drawGlow(ctx, hex, x, y, size) {
+  const i = glowSlot(hex);
+  if (i < 0) return;
+  ctx.drawImage(glowAtlas, (i % GLOW_COLS) * GLOW, Math.floor(i / GLOW_COLS) * GLOW, GLOW, GLOW, x - size / 2, y - size / 2, size, size);
+}
+
+/** Atlas slot of the soft glow for a colour, painted on first use (-1 when the atlas is full). */
+function glowSlot(hex) {
   let i = glowSlots.get(hex);
   if (i === undefined) {
     i = glowSlots.size;
-    if (i >= GLOW_COLS * GLOW_ROWS) return;
+    if (i >= GLOW_COLS * GLOW_ROWS) return -1;
     glowSlots.set(hex, i);
     const g = glowAtlas.getContext('2d'), h = GLOW / 2, cx = (i % GLOW_COLS) * GLOW + h, cy = Math.floor(i / GLOW_COLS) * GLOW + h;
     const grd = g.createRadialGradient(cx, cy, 0, cx, cy, h - 1);
@@ -1140,7 +1190,7 @@ function drawGlow(ctx, hex, x, y, size) {
     g.fillStyle = grd;
     g.fillRect(cx - h, cy - h, GLOW, GLOW);
   }
-  ctx.drawImage(glowAtlas, (i % GLOW_COLS) * GLOW, Math.floor(i / GLOW_COLS) * GLOW, GLOW, GLOW, x - size / 2, y - size / 2, size, size);
+  return i;
 }
 
 function buildBackground() {
@@ -1151,6 +1201,7 @@ function buildBackground() {
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   if (Kit.isAbstract) paintBackgroundShapes(g, W, H); else paintBackgroundSprite(g, W, H);
   S.floorDirty = true;
+  S.baseValid = false;
 }
 
 function paintBackgroundShapes(g, W, H) {
@@ -1489,34 +1540,62 @@ function lampGradient(l, g) {
   return gr;
 }
 
+/** Additive gradient fill of one beam. Beam polygons stop at the room's bounding rectangle, so
+ *  they are drawn unclipped and restoreRoomCorners() fixes the rounded corners afterwards
+ *  (far cheaper than clipping every full-room gradient fill). */
+function fillBeam(g, l) {
+  const vis = lampVis(l);
+  if (!l.fx.path || vis <= 0.01) return;
+  g.globalAlpha = clamp(vis, 0, 1);
+  g.fillStyle = lampGradient(l, g);
+  g.fill(l.fx.path);
+}
+
+function beamChanged(l, key) {
+  const p = l.fx.painted;
+  return p.path !== l.fx.path || p.vis !== lampVis(l) || p.key !== key;
+}
+
 /** Sprites: the night floor with every beam, object and lamp mount baked in. The layer is only
- *  repainted when the scene changes, so a still scene costs one blit per frame. */
+ *  repainted when the lighting changes, so a still scene costs one blit per frame. Beams that hold
+ *  still stay baked in baseLayer (background + those beams): aiming, sliding or switching one lamp
+ *  re-rasters only its own beam. */
 function paintLitFloor() {
   S.floorDirty = false;
   const dpr = Kit.dpr, W = bgLayer.width, H = bgLayer.height;
   if (!W || !H) return;
-  if (floorLayer.width !== W || floorLayer.height !== H) { floorLayer.width = W; floorLayer.height = H; }
+  for (const c of [floorLayer, baseLayer]) if (c.width !== W || c.height !== H) { c.width = W; c.height = H; S.baseValid = false; }
+  const key = reachPx() + '';
+  let rebuild = !S.baseValid;
+  for (const l of S.baseLamps) if (!S.lamps.includes(l) || beamChanged(l, key)) rebuild = true;
+  for (const l of S.lamps) if (!S.baseLamps.has(l) && !beamChanged(l, key)) rebuild = true;
+  if (rebuild) {
+    const b = baseLayer.getContext('2d');
+    b.setTransform(1, 0, 0, 1, 0, 0);
+    b.globalCompositeOperation = 'source-over';
+    b.globalAlpha = 1;
+    b.drawImage(bgLayer, 0, 0);
+    b.setTransform(dpr, 0, 0, dpr, 0, 0);
+    b.globalCompositeOperation = 'lighter';
+    S.baseLamps.clear();
+    for (const l of S.lamps) if (!beamChanged(l, key)) { fillBeam(b, l); S.baseLamps.add(l); }
+    S.baseValid = true;
+  }
   const f = floorLayer.getContext('2d');
   f.setTransform(1, 0, 0, 1, 0, 0);
   f.globalCompositeOperation = 'source-over';
   f.globalAlpha = 1;
-  f.drawImage(bgLayer, 0, 0);
+  f.drawImage(baseLayer, 0, 0);
   f.setTransform(dpr, 0, 0, dpr, 0, 0);
-  // beam polygons stop at the room's bounding rectangle, so they need no clip except in the
-  // rounded corners; repainting those slivers is far cheaper than clipping every gradient fill
   f.globalCompositeOperation = 'lighter';
-  let lit = false;
   for (const l of S.lamps) {
-    const vis = lampVis(l);
-    if (!l.fx.path || vis <= 0.01) continue;
-    f.globalAlpha = clamp(vis, 0, 1);
-    f.fillStyle = lampGradient(l, f);
-    f.fill(l.fx.path);
-    lit = true;
+    if (!S.baseLamps.has(l)) fillBeam(f, l);
+    const p = l.fx.painted;
+    p.path = l.fx.path; p.vis = lampVis(l); p.key = key;
   }
   f.globalCompositeOperation = 'source-over';
   f.globalAlpha = 1;
-  if (lit) restoreRoomCorners(f);
+  restoreRoomCorners(f);
   // objects and lamp mounts only change when the lighting does, so they live in this layer too
   paintObstacles(f);
   for (const l of S.lamps) paintLampMount(f, l, 1);
@@ -1558,14 +1637,20 @@ function obstacleSprite(o) {
     drawSolid(g, o, rr);
   }
   c.E = E;
+  // blit only the painted part (shape + bevel + drop shadow), not the transparent margin
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (const p of o.points) { x0 = Math.min(x0, p.x - o.bx); x1 = Math.max(x1, p.x - o.bx); y0 = Math.min(y0, p.y - o.by); y1 = Math.max(y1, p.y - o.by); }
+  const pad = 3 * s + 3, k = c.width / (2 * E);
+  c.sx = clamp(Math.floor((E + x0 - pad) * k), 0, c.width); c.sy = clamp(Math.floor((E + y0 - pad) * k), 0, c.height);
+  c.sw = clamp(Math.ceil((E + x1 + pad + 4 * s) * k), 0, c.width) - c.sx; c.sh = clamp(Math.ceil((E + y1 + pad + 6 * s) * k), 0, c.height) - c.sy;
   fx.sprite = c; fx.spriteKey = key;
   return c;
 }
 
 function paintObstacles(ctx) {
   for (const o of S.obstacles) {
-    const c = obstacleSprite(o);
-    ctx.drawImage(c, o.bx - c.E, o.by - c.E, 2 * c.E, 2 * c.E);
+    const c = obstacleSprite(o), k = (2 * c.E) / c.width;
+    ctx.drawImage(c, c.sx, c.sy, c.sw, c.sh, o.bx - c.E + c.sx * k, o.by - c.E + c.sy * k, c.sw * k, c.sh * k);
     if (o.glass && o.glow > 0) glassGlow(ctx, o, cornerRadius(o));
   }
   drawLitRims(ctx);
@@ -1688,19 +1773,24 @@ function drawLitRims(ctx) {
   ctx.restore();
 }
 
+let motePhase = 0;
 function drawMotes(ctx, t) {
-  const R = S.room, s = S.scale, lamps = S.lamps;
+  const R = S.room, s = S.scale, lamps = S.lamps, motes = S.motes;
+  motePhase = (motePhase + 1) % 3;
   ctx.fillStyle = 'rgba(190,205,255,0.09)';
   ctx.beginPath();
-  for (const d of S.motes) {
-    const x = R.x + d.u * R.w, y = R.y + d.v * R.h;
-    d.lr = d.lg = d.lb = 0;
-    for (const l of lamps) {
-      const vis = lampVis(l);
-      if (vis <= 0.01) continue;
-      const I = litAmount(x, y, l) * vis;
-      if (I <= 0) continue;
-      if (l.color === 'red') d.lr += I; else if (l.color === 'green') d.lg += I; else d.lb += I;
+  for (let k = 0; k < motes.length; k++) {
+    const d = motes[k], x = R.x + d.u * R.w, y = R.y + d.v * R.h;
+    // the light test is spread over three frames; a mote drifts far less than a pixel meanwhile
+    if (k % 3 === motePhase) {
+      d.lr = d.lg = d.lb = 0;
+      for (const l of lamps) {
+        const vis = lampVis(l);
+        if (vis <= 0.01) continue;
+        const I = litAmount(x, y, l) * vis;
+        if (I <= 0) continue;
+        if (l.color === 'red') d.lr += I; else if (l.color === 'green') d.lg += I; else d.lb += I;
+      }
     }
     if (d.lr + d.lg + d.lb <= 0) ctx.rect(x, y, 1.6 * d.sz, 1.6 * d.sz);
   }
@@ -1767,7 +1857,7 @@ function drawMothsSprite(ctx) {
   for (const m of moths) {
     if (m.glow < 0.03) continue;
     ctx.globalAlpha = 0.55 * m.glow;
-    drawGlow(ctx, LIGHT[m.glowColor], m.x, m.y, MOTH_WS * s * (m.state === 'orbit' ? 1 : 1.7));
+    drawGlowSized(ctx, LIGHT[m.glowColor], m.x, m.y, MOTH_WS * s * (m.state === 'orbit' ? 1 : 1.7));
   }
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
@@ -1865,7 +1955,7 @@ function drawLampHead(ctx, l, alpha, color, power, t) {
     const lx = l.x + Math.cos(l.angle) * 3 * k, ly = l.y + Math.sin(l.angle) * 3 * k;
     ctx.globalCompositeOperation = 'lighter';
     ctx.globalAlpha = alpha * power * (0.8 + 0.06 * Math.sin(t * 9 + l.id));
-    drawGlow(ctx, LIGHT[color], lx, ly, 130 * s * (1 + fx.pulse * 0.3));
+    (fx.pulse > 0 ? drawGlow : drawGlowSized)(ctx, LIGHT[color], lx, ly, 130 * s * (1 + fx.pulse * 0.3));
     ctx.globalCompositeOperation = 'source-over';
   }
   ctx.globalAlpha = 1;
@@ -2306,7 +2396,7 @@ Kit.init({
   tweaks: [
     { type: 'section', label: { sprite: 'Moths', abstract: 'Agents' } },
     { type: 'range', id: 'count', label: 'How many', min: 1, max: MAX_MOTHS, step: 1, value: DEFAULTS.count, onInput: (v) => setCreatureCount(v) },
-    { type: 'range', id: 'speed', label: 'Flying speed', min: 0.4, max: 2, step: 0.1, value: DEFAULTS.speed, format: (v) => v.toFixed(1) + '×' },
+    { type: 'range', id: 'speed', label: { sprite: 'Flying speed', abstract: 'Agent speed' }, min: 0.4, max: 2, step: 0.1, value: DEFAULTS.speed, format: (v) => v.toFixed(1) + '×' },
     { type: 'range', id: 'pull', label: 'Attraction', min: 0.3, max: 2.5, step: 0.1, value: DEFAULTS.pull, format: (v) => v.toFixed(1) + '×', note: { sprite: 'How hard moths rush toward a lamp.', abstract: 'How hard agents rush toward a light.' } },
     { type: 'button', label: { sprite: 'Scatter moths', abstract: 'Scatter agents' }, onClick: scatter },
     { type: 'section', label: { sprite: 'Lamps', abstract: 'Lights' } },
