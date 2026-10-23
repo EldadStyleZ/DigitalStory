@@ -78,7 +78,7 @@ const S = {
   ready: false,
   scale: 1, band: 30, rc: 39, minDim: 600,
   room: { x: 0, y: 0, w: 1, h: 1 },
-  rail: [], railLen: 1, roomPath: null, railPath: null, roomCorners: [],
+  rail: [], railLen: 1, roomPath: null, outsidePath: null, railPath: null, roomCorners: [],
   lamps: [], obstacles: [], moths: [], motes: [],
   color: 'red',
   selLamp: null, selObj: null,
@@ -222,6 +222,7 @@ function layout() {
   S.roomCorners = [R.x, R.y, R.x + R.w, R.y, R.x + R.w, R.y + R.h, R.x, R.y + R.h];
   buildRail();
   S.roomPath = new Path2D(); pathRoundRect(S.roomPath, R.x, R.y, R.w, R.h, S.rc);
+  S.outsidePath = new Path2D(); S.outsidePath.rect(0, 0, Kit.W, Kit.H); S.outsidePath.addPath(S.roomPath);
   S.railPath = new Path2D(); pathRoundRect(S.railPath, R.x - b / 2, R.y - b / 2, R.w + b, R.h + b, S.rc + b / 2);
   for (const l of S.lamps) placeLamp(l);
   for (const o of S.obstacles) { updateObstacle(o); clampObstacle(o); }
@@ -1501,20 +1502,38 @@ function paintLitFloor() {
   f.globalAlpha = 1;
   f.drawImage(bgLayer, 0, 0);
   f.setTransform(dpr, 0, 0, dpr, 0, 0);
-  f.save();
-  f.clip(S.roomPath);
+  // beam polygons stop at the room's bounding rectangle, so they need no clip except in the
+  // rounded corners; repainting those slivers is far cheaper than clipping every gradient fill
   f.globalCompositeOperation = 'lighter';
+  let lit = false;
   for (const l of S.lamps) {
     const vis = lampVis(l);
     if (!l.fx.path || vis <= 0.01) continue;
     f.globalAlpha = clamp(vis, 0, 1);
     f.fillStyle = lampGradient(l, f);
     f.fill(l.fx.path);
+    lit = true;
   }
-  f.restore();
+  f.globalCompositeOperation = 'source-over';
+  f.globalAlpha = 1;
+  if (lit) restoreRoomCorners(f);
   // objects and lamp mounts only change when the lighting does, so they live in this layer too
   paintObstacles(f);
   for (const l of S.lamps) paintLampMount(f, l, 1);
+}
+
+/** Copy the background back into the four slivers between the room's rounded corners and its bounding rectangle. */
+function restoreRoomCorners(f) {
+  const R = S.room, d = Kit.dpr, k = S.rc + 2;
+  for (const [x, y] of [[R.x - 1, R.y - 1], [R.x + R.w + 1 - k, R.y - 1], [R.x + R.w + 1 - k, R.y + R.h + 1 - k], [R.x - 1, R.y + R.h + 1 - k]]) {
+    f.save();
+    f.beginPath();
+    f.rect(x, y, k, k);
+    f.clip();
+    f.clip(S.outsidePath, 'evenodd');
+    f.drawImage(bgLayer, x * d, y * d, k * d, k * d, x, y, k, k);
+    f.restore();
+  }
 }
 
 /** Each object's look depends only on its shape, size and rotation, so it is painted once into its own canvas. */
