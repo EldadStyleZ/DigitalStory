@@ -1774,6 +1774,10 @@
   }
 
   function viewChanged(v) {
+    // toasts and an open tooltip still carry the old view's words; drop them so Shapes never shows "sugar"
+    for (const n of [...Kit.dom.toasts.children]) n.remove();
+    Kit.dom.tip.classList.remove('is-on');
+    Kit.dom.tip.textContent = '';
     if (ui.bSugar) {
       setIcon(ui.bSugar, v === 'abstract' ? Kit.icons.square : ICON_CUBE);
       setIcon(ui.bFlag, v === 'abstract' ? ICON_DIAMOND : Kit.icons.flag);

@@ -1686,9 +1686,9 @@ function obstacleSprite(o) {
   // blit only the painted part (shape + bevel + drop shadow), not the transparent margin
   let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
   for (const p of o.points) { x0 = Math.min(x0, p.x - o.bx); x1 = Math.max(x1, p.x - o.bx); y0 = Math.min(y0, p.y - o.by); y1 = Math.max(y1, p.y - o.by); }
-  const pad = 3 * s + 3, k = dpr;
-  c.sx = clamp(Math.floor((E + x0 - pad) * k), 0, c.width); c.sy = clamp(Math.floor((E + y0 - pad) * k), 0, c.height);
-  c.sw = clamp(Math.ceil((E + x1 + pad + 4 * s) * k), 0, c.width) - c.sx; c.sh = clamp(Math.ceil((E + y1 + pad + 6 * s) * k), 0, c.height) - c.sy;
+  const pad = 3 * s + 3;
+  c.sx = clamp(Math.floor((E + x0 - pad) * dpr), 0, c.width); c.sy = clamp(Math.floor((E + y0 - pad) * dpr), 0, c.height);
+  c.sw = clamp(Math.ceil((E + x1 + pad + 4 * s) * dpr), 0, c.width) - c.sx; c.sh = clamp(Math.ceil((E + y1 + pad + 6 * s) * dpr), 0, c.height) - c.sy;
   fx.sprite = c; fx.spriteKey = key;
   return c;
 }
