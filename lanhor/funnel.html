@@ -774,7 +774,7 @@ function lineClear(ax, ay, bx, by) {
 
 // contact with one funnel during a sub-step. Writes the new state to C; returns 0 outside, 1 inside, 2 just left by the spout
 const C = { x: 0, y: 0, vx: 0, vy: 0, u: 0 };
-function funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, wasIn) {
+function funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, wasIn, fromMouth) {
   const c = f.c, s = f.s, dx = x - f.x, dy = y - f.y;
   let lx = dx * c + dy * s;
   const ly0 = -dx * s + dy * c, sg = ly0 < 0 ? -1 : 1;
@@ -805,12 +805,12 @@ function funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, wasIn) {
   let code = 0;
   if (lx >= -F_HALF && lx <= F_HALF && ay < hwAt(lx)) {
     // inside the cone: carried toward the spout, gently centered; a stuck particle gets nudged out (out of the
-    // spout while the funnel works; at power 0 out of the nearer end, so an idle funnel pumps nothing)
+    // spout while the funnel works; at power 0 back the way it came, so an idle funnel pumps nothing either way)
     code = 1;
     const P = f.power, acc = S.speed * S.speed;
     let push = CARRY_ACC * acc * P;
     if (tIn > STUCK_T) {
-      const dir = P > 0 || lx > 0 ? 1 : -1;
+      const dir = P > 0 || !fromMouth ? 1 : -1;
       push += dir * 520 * (tIn - STUCK_T + 0.3);
       if (lvx * dir < 0) lvx *= 0.8;
     }
@@ -838,8 +838,7 @@ function simulate(dt) {
   for (let i = 0; i < N; i++) {
     let x = PX[i], y = PY[i], vx = VX[i], vy = VY[i];
     const x0 = x, y0 = y;
-    let slot = INF[i], tIn = INT[i], ax = 0, ay = 0, pulled = 0, near = slot >= 0, u = 0;
-    const nearR = F_BOUND + (Math.hypot(vx, vy) + 500) * dt, nearR2 = nearR * nearR;
+    let slot = INF[i], tIn = INT[i], ax = 0, ay = 0, pulled = 0, near = slot >= 0, u = 0, dmin2 = 1e18;
     if (slot < 0) {
       // gas-like random walk at cruising speed
       let v = Math.hypot(vx, vy);
@@ -852,7 +851,7 @@ function simulate(dt) {
     }
     for (let q = 0; q < nf; q++) {
       const f = FA[q], dx = x - f.x, dy = y - f.y, lx = dx * f.c + dy * f.s;
-      if (dx * dx + dy * dy < nearR2) near = true;
+      dmin2 = Math.min(dmin2, dx * dx + dy * dy);
       const P = f.power;
       if (P <= 0) continue;
       if (lx < -F_HALF) {          // red side: pull toward the mouth
@@ -870,6 +869,8 @@ function simulate(dt) {
         }
       }
     }
+    // funnel walls are checked for every particle that can reach a funnel this step, counting the pull it gets now
+    if (!near) { const rch = F_BOUND + (Math.hypot(vx, vy) + Math.hypot(ax, ay) * dt + 500) * dt; near = dmin2 < rch * rch; }
     // sub-steps no longer than about one radius, so nothing tunnels through a wall
     const vEst = Math.hypot(vx, vy) + Math.hypot(ax, ay) * dt + (near ? carryV + 600 * dt : 0);
     const n = Math.min(120, Math.ceil((vEst * dt) / maxStep) || 1), h = dt / n;
@@ -882,7 +883,7 @@ function simulate(dt) {
         for (let q = 0; q < nf; q++) {
           const f = FA[q], dx = x - f.x, dy = y - f.y;
           if (dx * dx + dy * dy > B2) continue;
-          const code = funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, slot === f.slot);
+          const code = funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, slot === f.slot, ENTRY[i] === 1);
           x = C.x; y = C.y; vx = C.vx; vy = C.vy;
           if (code === 1) { inSlot = f.slot; u = C.u; }
           else if (code === 2) {   // out of the spout: the blue kick
