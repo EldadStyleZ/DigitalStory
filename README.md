@@ -5,7 +5,7 @@ Each toy tests a different pull. Built for the Digital Story course at Bezalel A
 
 | # | Sprites name | Shapes name | The pull |
 |---|---|---|---|
-| 01 | Moths & Lamps | Beam | Agents gather where the light is strongest (overlapping beams add up); objects block or filter the light |
+| 01 | Moths & Lamps | Beam | Agents gather where the light is strongest (overlapping beams add up); objects block, filter or reflect the light |
 | 02 | School of Fish | Flow | A group you steer grows in green zones, shrinks in red zones, and is pushed by flows |
 | 03 | Ants & Sugar | Trail | Each agent walks to the closest attractor it can see, then returns to its base |
 
@@ -47,7 +47,8 @@ The address is case-sensitive: `DigitalStory` needs its capitals.
 Up to five lamps hang on the frame, in six colors: red, orange, yellow, green, blue and purple. Moths fly to the
 brightest light. Every beam adds up, so where two beams overlap the light is stronger than one beam alone (and three
 beat two). The swarm gathers in the brightest area and keeps roaming around inside it. Stones block light, colored
-glass lets only its own color through, and beams mix their colors where they overlap.
+glass lets only its own color through, mirrors bounce beams (up to 3 times, a little weaker each bounce), and beams
+mix their colors where they overlap.
 
 | Input | Action |
 |---|---|
@@ -61,13 +62,16 @@ glass lets only its own color through, and beams mix their colors where they ove
 | Tab / Esc | Select the next lamp / deselect |
 | 7 8 9 0 | Add a block, wedge, stone or plank |
 | G | Add glass in the current color |
+| − | Add a mirror (Shift + wheel or Shift + Q E turns it 1° at a time) |
 | Q E, arrows | Turn or nudge the selected object |
 | Right-click, or Delete | Remove a lamp or object |
 
 **One-minute demo:** the red and blue beams already cross; watch the moth fly into the overlap and roam there.
 Raise *How many* in Tweaks to 30 for a swarm. Aim a third lamp into the same spot and the swarm packs into the
 three-beam patch; move one lamp away and they stream to the next brightest place. Drag a stone into the overlap to
-break it up. The *Brightest* counter shows how many beams the swarm is sitting in.
+break it up. Then add a mirror (−) and turn it so the reflection crosses the direct beam: the reflection adds up like
+a second lamp and the swarm moves to the new hot spot. The *Brightest* counter shows how many beams the swarm is
+sitting in.
 
 ## 02 School of Fish (Flow)
 
