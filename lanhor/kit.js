@@ -836,7 +836,12 @@
       Kit.keys.delete(e.code);
       if (cfg.keyup) cfg.keyup(e);
     });
-    window.addEventListener('blur', () => { Kit.keys.clear(); Kit.mouse.down = false; });
+    window.addEventListener('blur', () => {
+      Kit.keys.clear();
+      // a release that happens outside the window never reaches us: end any drag here
+      if (Kit.mouse.down && cfg.pointerUp) cfg.pointerUp({ x: Kit.mouse.x, y: Kit.mouse.y, button: 0, buttons: 0, shift: false, alt: false, ctrl: false, type: 'mouse' }, null);
+      Kit.mouse.down = false;
+    });
     window.addEventListener('resize', resize);
   }
   /** True if any of the given KeyboardEvent.code values is held. */

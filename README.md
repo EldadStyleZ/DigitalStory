@@ -22,6 +22,14 @@ Every toy has a **Sprites / Shapes** switch in the top bar (key **V**). Shapes r
 base colors and plain geometry and renames everything neutrally ("agents", "light", "zone", "attractor"), so the
 class can play first and guess the reference after. The choice is remembered across the launcher and all three toys.
 
+For the guessing round, open a toy straight into Shapes with `?view=shapes`, for example
+`lanhor/flow.html?view=shapes`. Use `?view=sprites` for the reveal, or just press V.
+
+## Share a link
+
+Turn on GitHub Pages for this repository (Settings → Pages → Deploy from a branch → `main`, folder `/`). The
+toys are then online at `https://eldadstylez.github.io/digitalstory/lanhor/`.
+
 ## Keys that work everywhere
 
 | Key | Action |
