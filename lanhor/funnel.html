@@ -1446,39 +1446,70 @@ function blitResting(ctx, f, sp, x, y) {
   }
   ctx.drawImage(c.cv, (ix - c.half) / d, (iy - c.half) / d, (2 * c.half) / d, (2 * c.half) / d);
 }
-/** Show fields: each resting funnel's pull and push bubbles are painted (rotated, cut to the board) into two small
- *  canvases of its own and blitted without a transform. They are repainted only when the funnel, its power or the
- *  layout changes: a room-sized gradient costs a software canvas several ms per funnel per frame. */
-const FIELD_LEVELS = 24;
-function drawFields(ctx, R) {
-  const d = Kit.dpr, sc = S.sc, reach = tw('reach') * F_LEN, bx0 = S.ox * d, by0 = S.oy * d, bx1 = (S.ox + WORLD_W * sc) * d, by1 = (S.oy + WORLD_H * sc) * d;
-  const board = (g) => { U.roundRect(g, S.ox, S.oy, WORLD_W * sc, WORLD_H * sc, BOARD_R * sc); g.clip(); };
+/** Show fields. Each resting funnel's pull and push bubbles are painted (rotated, cut to the board) into two small
+ *  canvases of its own, repainted only when the funnel, its power or the layout changes (a room-sized gradient costs a
+ *  software canvas several ms per funnel per frame). With the particle frame buffer, bubbles that have not changed for
+ *  a moment are baked into a copy of its background and cost nothing per frame; only changing ones are blitted. */
+const FIELD_LEVELS = 24, FIELD_SETTLE = 0.25;
+const fieldsLayer = document.createElement('canvas');
+const fieldShown = (f) => !f.lifted && f.power > 0;
+const boardClip = (g) => { U.roundRect(g, S.ox, S.oy, WORLD_W * S.sc, WORLD_H * S.sc, BOARD_R * S.sc); g.clip(); };
+const fieldLevel = (f) => Math.max(1, Math.round(f.glow * FIELD_LEVELS)) / FIELD_LEVELS;
+const fieldRadius = (which) => (which ? tw('reach') * F_LEN * PUSH_REACH : tw('reach') * F_LEN) / 2;
+/** Bring a funnel's bubble canvases up to date; null while it pops in or lands (then it is painted directly). */
+function fieldCache(f, R) {
+  if (f.pop < 1 || f.lift > 0.01) return null;
+  const d = Kit.dpr, sc = S.sc, P = fieldLevel(f);
+  const key = `${Kit.view}:${sc}:${S.ox}:${S.oy}:${d}:${tw('reach')}:${f.x}:${f.y}:${f.angle}:${P}`;
+  const c = f.fields || (f.fields = { key: '', since: 0, baked: false, parts: [0, 1].map(() => ({ cv: document.createElement('canvas'), x: 0, y: 0, on: false })) });
+  if (c.key === key) return c;
+  c.key = key; c.since = Kit.realTime;
+  const bx0 = S.ox * d, by0 = S.oy * d, bx1 = (S.ox + WORLD_W * sc) * d, by1 = (S.oy + WORLD_H * sc) * d;
+  for (let which = 0; which < 2; which++) {
+    const part = c.parts[which], r = fieldRadius(which), off = which ? F_HALF + r : -F_HALF - r;
+    const cx = (S.ox + (f.x + f.c * off) * sc) * d, cy = (S.oy + (f.y + f.s * off) * sc) * d, rp = r * sc * d + 2;
+    const x0 = Math.floor(Math.max(cx - rp, bx0)), y0 = Math.floor(Math.max(cy - rp, by0)), x1 = Math.ceil(Math.min(cx + rp, bx1)), y1 = Math.ceil(Math.min(cy + rp, by1));
+    part.on = x1 > x0 && y1 > y0;
+    if (!part.on) continue;
+    part.x = x0; part.y = y0; part.cv.width = x1 - x0; part.cv.height = y1 - y0;
+    const g = part.cv.getContext('2d');
+    g.setTransform(d, 0, 0, d, -x0, -y0);
+    boardClip(g);
+    R.fields(g, f, P, which, r);
+  }
+  return c;
+}
+/** The frame buffer's background with every settled bubble baked in; rebuilt only when that set changes. */
+function fieldsBackground(R) {
+  let key = S.layerAt + '|';
   for (const f of S.funnels) {
-    if (f.lifted || f.power <= 0) continue;
-    const P = Math.max(1, Math.round(f.glow * FIELD_LEVELS)) / FIELD_LEVELS;
-    if (f.pop < 1 || f.lift > 0.01) {   // landing or popping in: a few frames, painted directly
-      ctx.save(); board(ctx);
-      for (let which = 0; which < 2; which++) R.fields(ctx, f, P, which, (which ? reach * PUSH_REACH : reach) / 2);
+    const c = fieldShown(f) ? fieldCache(f, R) : null;
+    if (f.fields) f.fields.baked = !!c && Kit.realTime - c.since >= FIELD_SETTLE;
+    if (c && c.baked) key += f.id + '@' + c.key + '|';
+  }
+  if (key !== PB.fkey) {
+    PB.fkey = key;
+    if (fieldsLayer.width !== layer.width || fieldsLayer.height !== layer.height) { fieldsLayer.width = layer.width; fieldsLayer.height = layer.height; }
+    const g = fieldsLayer.getContext('2d', { willReadFrequently: true });
+    g.drawImage(layer, 0, 0);
+    for (const f of S.funnels) if (f.fields && f.fields.baked) for (const p of f.fields.parts) if (p.on) g.drawImage(p.cv, p.x, p.y);
+    PB.bgF = new Uint32Array(g.getImageData(0, 0, layer.width, layer.height).data.buffer);
+  }
+  return PB.bgF;
+}
+/** Bubbles drawn on top of the frame: all of them on the vector path, only the changing ones over a baked background. */
+function drawFields(ctx, R, bakedIn) {
+  const d = Kit.dpr;
+  for (const f of S.funnels) {
+    if (!fieldShown(f)) continue;
+    const c = fieldCache(f, R);
+    if (!c) {   // popping in or landing: a few frames, painted directly
+      ctx.save(); boardClip(ctx);
+      for (let which = 0; which < 2; which++) R.fields(ctx, f, fieldLevel(f), which, fieldRadius(which));
       ctx.restore();
       continue;
     }
-    const key = `${Kit.view}:${sc}:${S.ox}:${S.oy}:${d}:${reach}:${f.x}:${f.y}:${f.angle}:${P}`;
-    const c = f.fields || (f.fields = { key: '', parts: [0, 1].map(() => ({ cv: document.createElement('canvas'), x: 0, y: 0, on: false })) });
-    if (c.key !== key) {
-      c.key = key;
-      for (let which = 0; which < 2; which++) {
-        const part = c.parts[which], r = (which ? reach * PUSH_REACH : reach) / 2, off = which ? F_HALF + r : -F_HALF - r;
-        const cx = (S.ox + (f.x + f.c * off) * sc) * d, cy = (S.oy + (f.y + f.s * off) * sc) * d, rp = r * sc * d + 2;
-        const x0 = Math.floor(Math.max(cx - rp, bx0)), y0 = Math.floor(Math.max(cy - rp, by0)), x1 = Math.ceil(Math.min(cx + rp, bx1)), y1 = Math.ceil(Math.min(cy + rp, by1));
-        part.on = x1 > x0 && y1 > y0;
-        if (!part.on) continue;
-        part.x = x0; part.y = y0; part.cv.width = x1 - x0; part.cv.height = y1 - y0;
-        const g = part.cv.getContext('2d');
-        g.setTransform(d, 0, 0, d, -x0, -y0);
-        board(g);
-        R.fields(g, f, P, which, r);
-      }
-    }
+    if (bakedIn && c.baked) continue;
     for (const part of c.parts) if (part.on) ctx.drawImage(part.cv, part.x / d, part.y / d, part.cv.width / d, part.cv.height / d);
   }
 }
@@ -1676,7 +1707,7 @@ const SHAPE_GROUPS = [[0, 1, 4], [2, 3], [5, 6]];
 // At 1× pixel density the maze layer is copied into a frame buffer, every particle is stamped in as an
 // anti-aliased, sub-pixel positioned dot (plus a trailing dot when fast), and one putImageData shows it.
 // On a software canvas this is several times cheaper than rastering 2000 vector shapes.
-const PB = { w: 0, h: 0, img: null, d32: null, bg: null, key: '', kers: null };
+const PB = { w: 0, h: 0, img: null, d32: null, bg: null, bgF: null, fkey: '', key: '', kers: null };   // bgF: bg with settled field bubbles
 const SUB = 4;                                   // sub-pixel phases per axis
 const RGB = new Uint8Array(BK * 3), RGB_SH = new Uint8Array(BK * 3);
 for (let b = 0; b < BK; b++) {
@@ -1804,10 +1835,10 @@ function render(ctx, rdt) {
   updateFx(rdt);
   if (Kit.mouse.inside && !S.drag) updateHover(Kit.mouse);
   if (S.layerDirty && performance.now() - S.layerAt > 140) { buildLayer(); captureLayer(); }
-  const stamped = useStamp() && PB.bg;
-  if (stamped) { PB.d32.set(PB.bg); stampParticles(); ctx.putImageData(PB.img, 0, 0); }
+  const stamped = useStamp() && PB.bg, fields = tw('fields');
+  if (stamped) { PB.d32.set(fields ? fieldsBackground(R) : PB.bg); stampParticles(); ctx.putImageData(PB.img, 0, 0); }
   else ctx.drawImage(layer, 0, 0, Kit.W, Kit.H);
-  if (tw('fields')) drawFields(ctx, R);
+  if (fields) drawFields(ctx, R, stamped);
   // lifted funnels float above everything; with vector particles, resting ones lie under them
   for (const f of S.funnels) if (!f.lifted) drawFunnel(ctx, f, rt, R, 1, 1);
   if (!stamped) R.particles(ctx);
