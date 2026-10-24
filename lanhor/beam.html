@@ -1047,7 +1047,7 @@ function setDest(m, x, y, region, bandL) {
  *  ones right next to it, so it keeps travelling all over the band (nearFirst: nearer ones first, for a
  *  moth whose spot just went dark). Cells that other moths head for or
  *  sit in count less, so a swarm spreads out; the cells a band grew by count less the further out they
- *  are, so the swarm stays densest round its brightest spot. */
+ *  are and its own cells count more, so the swarm stays densest on and round its brightest spot. */
 function pickDest(m, inRegion, nearFirst) {
   const M = MAP, n = M.n, s = S.scale;
   if (!(M.max > 0) || (inRegion && !(m.region >= 0 && m.region < M.peak.length))) return false;
@@ -1067,6 +1067,7 @@ function pickDest(m, inRegion, nearFirst) {
       const near = inRegion && !nearFirst ? (d < 70 * s || c === cur ? 0.08 : 1) : 1 / (1 + d / (220 * s));
       w = near / (1 + 1.5 * M.crowd[c]);
       if (grown) w *= Math.pow(0.6, M.ring[c]);
+      else if (r >= 0 && M.floor[r] < BAND * M.peak[r]) w *= 3;   // the brightest spot of a grown band: a few moths always on it
     }
     M.w[c] = w; total += w;
   }
