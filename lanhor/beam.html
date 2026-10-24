@@ -73,6 +73,7 @@ const DEFAULT_OBJECTS = [
   ['triangle', 0.3, 0.635, 0.07, -24, 'red'],  // in the red beam: red shines through
   ['circle', 0.12, 0.17, 0.045, 0, null],
 ];
+const OBJECT_KEYS = { 7: 'square', 8: 'triangle', 9: 'circle', 0: 'bar', G: 'glass' };   // keys 1–6 pick colors
 const NEW_OBJECT = {
   square: { kind: 'square', size: 0.06 },
   triangle: { kind: 'triangle', size: 0.068 },
@@ -107,7 +108,7 @@ const S = {
   nextId: 1,
   lampPlacedAt: -9,
   litToastShown: false, overlapToastShown: false,
-  litCount: 0, level: -1,
+  litCount: 0, level: -1, levelNext: -1, levelT: 0,   // level: beams making the light the swarm roams in
   cursor: '',
   ui: {},
 };
@@ -1173,8 +1174,10 @@ function updateMoths(dt, t) {
     }
   }
   if (lit !== S.litCount) { S.litCount = lit; updateCounts(); }
+  // the "Brightest" stat follows a level once it has held for a moment, so it does not flicker at band edges
   const lv = roamLevel || level;
-  if (lv !== S.level) { S.level = lv; showLevel(); }
+  if (lv !== S.levelNext) { S.levelNext = lv; S.levelT = 0; } else S.levelT += dt;
+  if (lv !== S.level && (S.levelT > 0.4 || S.level < 0)) { S.level = lv; showLevel(); }
 }
 
 // ================================================================== particles + dust
@@ -1213,7 +1216,7 @@ function updateParticles(dt) {
 function makeMotes(n) {
   S.motes = Array.from({ length: n }, () => ({
     u: Math.random(), v: Math.random(), du: rand(-1, 1) * 0.006, dv: rand(-1, 1) * 0.006,
-    ph: rand(0, TAU), f: rand(1.5, 4.5), sz: rand(0.6, 1.4), lr: 0, lg: 0, lb: 0,
+    ph: rand(0, TAU), f: rand(1.5, 4.5), sz: rand(0.6, 1.4), mask: 0, lit: 0,
   }));
 }
 function updateMotes(dt, t) {
@@ -1397,12 +1400,13 @@ function nudge(code, f) {
 
 function keydown(e) {
   const c = e.code;
-  const digit = /^(Digit|Numpad)([1-8])$/.exec(c);
-  if (digit) {
+  const digit = /^(?:Digit|Numpad)([0-9])$/.exec(c);
+  const key = digit ? digit[1] : c === 'KeyG' ? 'G' : null;
+  if (key) {
     if (e.repeat) return true;
-    const n = +digit[2];
-    if (n <= 3) setColor(COLORS[n - 1], true);
-    else addObject(['square', 'triangle', 'circle', 'bar', 'glass'][n - 4]);
+    const n = +key;
+    if (n >= 1 && n <= NC) setColor(COLORS[n - 1], true);
+    else addObject(OBJECT_KEYS[key]);
     return true;
   }
   if (STEP_KEYS.has(c)) {
@@ -1433,13 +1437,15 @@ const floorLayer = document.createElement('canvas');
 const baseLayer = document.createElement('canvas');   // background + the beams that hold still (sprites)
 const FLAP_FRAMES = 8;
 const RIM_BUCKETS = 3;
-// additive mix of the sprite light colors, indexed by bitmask red=1 green=2 blue=4
-const MIX = Array.from({ length: 8 }, (_, mask) => {
+// additive mix of the sprite light colors for every set of colors (bit i = COLORS[i]): at most 63 glows
+const MIX = Array.from({ length: 1 << NC }, (_, mask) => {
   const sum = [0, 0, 0];
   COLORS.forEach((c, i) => { if (mask & (1 << i)) { const v = U.hexToRgb(LIGHT[c]); sum[0] += v.r; sum[1] += v.g; sum[2] += v.b; } });
   return '#' + sum.map((v) => Math.min(255, v).toString(16).padStart(2, '0')).join('');
 });
-const GLOW = 64, GLOW_COLS = 8, GLOW_ROWS = 4;
+const maskSeen = new Uint8Array(1 << NC), maskList = [];   // scratch: the light mixes on screen this frame
+const bitCount = (v) => { let k = 0; for (; v; v &= v - 1) k++; return k; };
+const GLOW = 64, GLOW_COLS = 16, GLOW_ROWS = 6;   // room for every mix plus the swatch and particle colors
 const glowAtlas = document.createElement('canvas');
 glowAtlas.width = GLOW * GLOW_COLS; glowAtlas.height = GLOW * GLOW_ROWS;
 const glowSlots = new Map();
@@ -1460,7 +1466,7 @@ function drawGlowSized(ctx, hex, x, y, size) {
   if (!c) {
     const i = glowSlot(hex);
     if (i < 0) return;
-    if (glowSized.size >= 400) glowSized.clear();
+    if (glowSized.size >= 600) glowSized.clear();   // bounded: sizes × the mixes on screen
     c = document.createElement('canvas');
     c.width = c.height = px;
     c.getContext('2d').drawImage(glowAtlas, (i % GLOW_COLS) * GLOW, Math.floor(i / GLOW_COLS) * GLOW, GLOW, GLOW, 0, 0, px, px);
@@ -2053,14 +2059,14 @@ function drawLitRims(ctx) {
   ctx.globalCompositeOperation = 'lighter';
   ctx.lineCap = 'round';
   ctx.lineWidth = 2.6 * S.scale;
-  for (let c = 0; c < 3; c++) {
+  for (let c = 0; c < NC; c++) {
     for (let b = 0; b < RIM_BUCKETS; b++) {
       ctx.beginPath();
       let any = false;
       for (const o of S.obstacles) {
         const el = o.fx.edgeLit, pts = o.points, n = pts.length, rr = cornerRadius(o);
         for (let i = 0, j = n - 1; i < n; j = i++) {
-          const I = el[j * 3 + c];
+          const I = el[j * NC + c];
           if (I <= 0 || Math.min(RIM_BUCKETS - 1, Math.floor(I * 1.5 * RIM_BUCKETS)) !== b) continue;
           const ax = pts[j].x, ay = pts[j].y, bx = pts[i].x, by = pts[i].y, len = Math.hypot(bx - ax, by - ay) || 1;
           const k = n > 8 ? 0 : Math.min(0.45, rr / len);
@@ -2087,29 +2093,27 @@ function drawMotes(ctx, t) {
     const d = motes[k], x = R.x + d.u * R.w, y = R.y + d.v * R.h;
     // the light test is spread over three frames; a mote drifts far less than a pixel meanwhile
     if (k % 3 === motePhase) {
-      d.lr = d.lg = d.lb = 0;
+      d.mask = 0; d.lit = 0;
       for (const l of lamps) {
         const vis = lampVis(l);
         if (vis <= 0.01) continue;
-        const I = litAmount(x, y, l) * vis;
+        const I = beamGlow(x, y, l) * vis;
         if (I <= 0) continue;
-        if (l.color === 'red') d.lr += I; else if (l.color === 'green') d.lg += I; else d.lb += I;
+        d.lit += I; d.mask |= 1 << CI[l.color];
       }
     }
-    if (d.lr + d.lg + d.lb <= 0) ctx.rect(x, y, 1.6 * d.sz, 1.6 * d.sz);
+    if (!d.mask) ctx.rect(x, y, 1.6 * d.sz, 1.6 * d.sz);
   }
   ctx.fill();
-  // lit motes sparkle in the additive mix of the beams they float in
+  // lit motes sparkle in the additive mix of the beams they float in, brighter where beams overlap
   ctx.globalCompositeOperation = 'lighter';
   for (const d of S.motes) {
-    const top = Math.max(d.lr, d.lg, d.lb);
-    if (top <= 0) continue;
-    const mask = (d.lr > 0 ? 1 : 0) | (d.lg > 0 ? 2 : 0) | (d.lb > 0 ? 4 : 0);
+    if (!d.mask) continue;
     const x = R.x + d.u * R.w, y = R.y + d.v * R.h;
     const tw2 = 0.45 + 0.55 * Math.pow(0.5 + 0.5 * Math.sin(t * d.f + d.ph), 2);
-    const size = (8 + 8 * Math.min(1, top)) * s * d.sz;
-    ctx.globalAlpha = Math.min(1, top * 1.8) * tw2;
-    drawGlowSized(ctx, MIX[mask], x, y, size);
+    const size = (8 + 8 * Math.min(1, d.lit)) * s * d.sz;
+    ctx.globalAlpha = Math.min(1, d.lit * 1.8) * tw2;
+    drawGlowSized(ctx, MIX[d.mask], x, y, size);
   }
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
@@ -2133,35 +2137,40 @@ function drawMothsSprite(ctx) {
     ctx.fillStyle = 'rgba(0,0,8,0.2)';
     ctx.fill();
   }
-  // glowing trails (a faint long tail plus a brighter recent part), batched per light color
+  // glowing trails (a faint long tail plus a brighter recent part), batched per mix of light colors
   ctx.globalCompositeOperation = 'lighter';
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  for (const c of COLORS) {
+  maskList.length = 0;
+  for (const m of moths) if (m.glow >= 0.3 && m.glowMask && !maskSeen[m.glowMask]) { maskSeen[m.glowMask] = 1; maskList.push(m.glowMask); }
+  for (const mk of maskList) {
+    maskSeen[mk] = 0;
     for (let part = 0; part < 2; part++) {
       ctx.beginPath();
-      let any = false;
       for (const m of moths) {
-        if (m.glow < 0.3 || m.glowColor !== c) continue;
+        if (m.glow < 0.3 || m.glowMask !== mk) continue;
         const fx = m.fx, n = fx.tn, i0 = part ? Math.floor(n / 2) : 0;
         for (let i = i0; i < n; i++) {
           const a = (fx.th - n + i + TRAIL * 2) % TRAIL;
           if (i === i0) ctx.moveTo(fx.trail[a * 2], fx.trail[a * 2 + 1]); else ctx.lineTo(fx.trail[a * 2], fx.trail[a * 2 + 1]);
         }
-        any = true;
       }
-      if (!any) continue;
-      ctx.strokeStyle = LIGHT[c];
+      ctx.strokeStyle = MIX[mk];
       ctx.globalAlpha = part ? 0.4 : 0.18;
       ctx.lineWidth = (part ? 3.2 : 1.6) * s;
       ctx.stroke();
     }
   }
-  // halo: full size out in the beam, small while circling inside the lamp's own glow
+  // halo in the mix of the lamps lighting it; in an overlap a wider bloom joins it
   for (const m of moths) {
-    if (m.glow < 0.03) continue;
+    if (m.glow < 0.03 || !m.glowMask) continue;
+    const col = MIX[m.glowMask];
     ctx.globalAlpha = 0.55 * m.glow;
-    drawGlowSized(ctx, LIGHT[m.glowColor], m.x, m.y, MOTH_WS * s * (m.state === 'orbit' ? 1 : 1.7));
+    drawGlowSized(ctx, col, m.x, m.y, MOTH_WS * s * 1.7);
+    if (m.boost > 0.02) {
+      ctx.globalAlpha = Math.min(1, 0.32 * m.boost) * m.glow;
+      drawGlowSized(ctx, col, m.x, m.y, MOTH_WS * s * 2.7);
+    }
   }
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
@@ -2235,7 +2244,7 @@ function buildLampSprites() {
   const res = S.scale * 1.3 * 1.35 * Kit.dpr;
   if (Math.abs(res - lampAtlas.res) < 0.01) return;
   const cw = Math.ceil(LAMP_CELL.w * res), ch = Math.ceil(LAMP_CELL.h * res);
-  lampAtlas.width = cw * 2; lampAtlas.height = ch * 3;
+  lampAtlas.width = cw * 2; lampAtlas.height = ch * NC;   // a row per color: off, on
   lampAtlas.res = res; lampAtlas.cw = cw; lampAtlas.ch = ch;
   const g = lampAtlas.getContext('2d');
   COLORS.forEach((c, row) => [false, true].forEach((on, col) => {
@@ -2332,14 +2341,18 @@ function drawAgentsShapes(ctx) {
     }
   }
   ctx.stroke();
-  for (const c of COLORS) {
-    ctx.strokeStyle = BASE[c];
-    ctx.lineWidth = 2.5 * s;
+  // one ring per color lighting it (up to three), so an agent in an overlap wears more rings
+  ctx.lineWidth = 2.5 * s;
+  for (let c = 0; c < NC; c++) {
+    ctx.strokeStyle = BASE[COLORS[c]];
     ctx.beginPath();
     for (const m of S.moths) {
-      if (m.glow < 0.3 || m.glowColor !== c) continue;
-      ctx.moveTo(m.x + r + 4.5 * s, m.y);
-      ctx.arc(m.x, m.y, r + 4.5 * s, 0, TAU);
+      if (m.glow < 0.3 || !(m.glowMask & (1 << c))) continue;
+      const k = bitCount(m.glowMask & ((1 << c) - 1));
+      if (k > 2) continue;
+      const rr = r + (4.5 + 4.5 * k) * s;
+      ctx.moveTo(m.x + rr, m.y);
+      ctx.arc(m.x, m.y, rr, 0, TAU);
     }
     ctx.stroke();
   }
@@ -2571,6 +2584,7 @@ function render(ctx, rdt) {
 function update(dt, t) {
   if (!S.ready) return;
   if (S.dirty) recomputeBeams();
+  if (S.mapDirty && Kit.realTime - MAP.builtAt >= 0.1) buildMap();   // at most ~10 rebuilds a second while dragging
   updateMoths(dt, t);
   updateMotes(dt, t);
 }
@@ -2581,50 +2595,61 @@ function updateCounts() {
   if (S.ui.readout) S.ui.readout.textContent = `${Kit.pick('Lamps', 'Lights')} ${n}/${MAX_LAMPS}`;
   if (S.ui.addLampBtn) S.ui.addLampBtn.disabled = n >= MAX_LAMPS;
   if (S.ui.clearBtn) S.ui.clearBtn.disabled = n === 0;
-  S.litCount = S.moths.filter((m) => m.target).length;
+  S.litCount = S.moths.filter((m) => m.n > 0).length;
   Kit.setStat('lit', `${S.litCount}/${S.moths.length}`, { neutral: true });
+  showLevel();
+}
+
+/** "Brightest": how many beams make the light the swarm roams in. */
+function showLevel() {
+  const k = S.level;
+  Kit.setStat('level', k > 0 ? `${k} ${Kit.pick(k === 1 ? 'beam' : 'beams', k === 1 ? 'light' : 'lights')}` : '—', { neutral: true });
 }
 
 function refreshHint() {
-  if (S.selLamp) Kit.setHint('Drag the knob or press ← → to aim. ↑ ↓ width, O on or off.');
+  if (S.selLamp) Kit.setHint('Drag the knob or press ← → to aim. ↑ ↓ width, 1–6 color, O on or off.');
   else if (S.selObj) Kit.setHint('Drag to move it. Wheel or Q E rotates. Delete removes it.');
   else Kit.setHint(null);
 }
 
-/** Default scene: a red lamp on the left, a blue one top-right, one moth drifting in the dark middle. */
+/** Default scene: a red lamp on the left and a blue one on top cross their beams in the open middle;
+ *  one moth, already in the red beam, is on its way to the brighter overlap. */
 function buildDefaultScene() {
-  const R = S.room;
+  const R = S.room, s = S.scale;
   S.lamps = []; S.obstacles = []; S.moths = [];
   S.selLamp = null; S.selObj = null; S.drag = null;
   S.hover.lamp = null; S.hover.obj = null; S.hover.handle = false;
+  S.level = -1;
   partN = 0;
   for (const [kind, cx, cy, size, rot, glass] of DEFAULT_OBJECTS) {
     const o = makeObstacle(kind, cx, cy, size, rot * DEG, glass);
     clampObstacle(o);
     S.obstacles.push(o);
   }
-  addLampAt(R.x, R.y + R.h * 0.52, 'red', { silent: true });
-  addLampAt(R.x + R.w * 0.8, R.y, 'blue', { silent: true, aimAt: { x: R.x + R.w * 0.42, y: R.y + R.h * 0.64 } });
+  const at = (u, v) => ({ x: R.x + R.w * u, y: R.y + R.h * v });
+  const red = addLampAt(R.x, R.y + R.h * 0.5, 'red', { silent: true, aimAt: at(0.55, 0.6) });
+  addLampAt(R.x + R.w * 0.56, R.y, 'blue', { silent: true, aimAt: at(0.44, 0.62) });
   recomputeBeams();
-  // the hero moth starts in a dark patch near the middle, heading for the nearest beam
-  const cx = R.x + R.w * 0.5, cy = R.y + R.h * 0.5, s = S.scale;
-  let start = { x: cx, y: cy, a: rand(0, TAU) }, found = false;
-  for (let rr = 0; rr <= 200 * s && !found; rr += 25 * s) {
-    for (let i = 0; i < 16 && !found; i++) {
-      const a = (i / 16) * TAU, x = cx + Math.cos(a) * rr, y = cy + Math.sin(a) * rr;
-      if (isLitPoint(x, y) || S.obstacles.some((o) => U.dist(x, y, o.bx, o.by) < o.br + 20 * s)) continue;
-      for (let j = 0; j < 24; j++) {
-        const b = (j / 24) * TAU, d = 110 * s;
-        if (isLitPoint(x + Math.cos(b) * d, y + Math.sin(b) * d)) { start = { x, y, a: b }; found = true; break; }
-      }
-    }
+  buildMap();
+  // the hero moth starts lit, partway along the red beam
+  let start = null;
+  for (let d = 150 * s; d < 420 * s && !start; d += 10 * s) {
+    const x = red.ox + Math.cos(red.angle - 0.05) * d, y = red.oy + Math.sin(red.angle - 0.05) * d;
+    if (sampleLight(x, y).n === 1 && openSpot(x, y, 26 * s)) start = { x, y };
   }
+  start = start || randomFreePoint(30 * s);
   const hero = makeMoth(start.x, start.y, 1);
   hero.size = 1.08;
-  hero.h = hero.wh = start.a;
-  hero.p1 = -Kit.time * 0.53; hero.p2 = -Kit.time * 1.37;
-  hero.vx = Math.cos(start.a) * 40 * s; hero.vy = Math.sin(start.a) * 40 * s;
   S.moths.push(hero);
+  const pr = sampleLight(hero.x, hero.y);
+  if (pr.n) {
+    feelLight(hero, pr);
+    hero.state = 'seek'; hero.glow = 1; hero.lastLit = Kit.time;
+    if (plan(hero, false)) {
+      hero.h = hero.wh = Math.atan2(hero.dest.y - hero.y, hero.dest.x - hero.x);
+      hero.vx = Math.cos(hero.h) * 60 * s; hero.vy = Math.sin(hero.h) * 60 * s;
+    }
+  }
   S.ready = true;
   setCreatureCount(tw('count'));
   updateCounts();
