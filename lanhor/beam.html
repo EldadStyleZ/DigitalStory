@@ -709,13 +709,14 @@ function recomputeBeams() {
 
 // ================================================================== light map (moths plan from it)
 /* A coarse grid of L over the room, rebuilt (at most ~10 times a second) whenever the beams change.
- * Each cell keeps one open sample point (clear of objects and lamp heads) and its exact L. Cells in
- * the brightest band are grouped into regions, grown from the brightest cell down: a region holds the
- * connected cells within BAND of its own peak. A moth commits to one region and roams inside it. */
+ * Each cell keeps one open sample point (clear of objects and lamp heads) and its exact L. Bright cells
+ * are grouped into regions, grown from the brightest cell down: a region holds the connected cells
+ * within BAND of its own peak. A region whose peak sits next to a brighter region is only that
+ * region's slope; the others are bands. A moth commits to one band and roams inside it. */
 const MAP = {
   cols: 0, rows: 0, n: 0, cw: 1, ch: 1, max: 0, builtAt: -9,
   L: new Float32Array(0), sx: new Float32Array(0), sy: new Float32Array(0), ok: new Uint8Array(0),
-  reg: new Int16Array(0), crowd: new Float32Array(0), w: new Float32Array(0), peak: [],
+  reg: new Int16Array(0), crowd: new Float32Array(0), w: new Float32Array(0), peak: [], isBand: [],
 };
 const mapOrder = [], mapStack = [];
 const byMapL = (a, b) => MAP.L[b] - MAP.L[a];
@@ -787,14 +788,22 @@ function buildMap() {
   M.max = max;
   // regions of the bright bands, grown from the brightest cell down
   M.reg.fill(-1);
-  M.peak.length = 0;
+  M.peak.length = 0; M.isBand.length = 0;
   mapOrder.length = 0;
   if (max > 0) for (let c = 0; c < n; c++) if (M.ok[c] && M.L[c] >= 0.5 * max) mapOrder.push(c);
   mapOrder.sort(byMapL);
+  const touchesRegion = (c) => {
+    const ci = c % cols, cj = (c - ci) / cols;
+    for (let j = Math.max(0, cj - 1); j <= Math.min(rows - 1, cj + 1); j++) {
+      for (let i = Math.max(0, ci - 1); i <= Math.min(cols - 1, ci + 1); i++) if (M.reg[j * cols + i] >= 0) return true;
+    }
+    return false;
+  };
   for (const c0 of mapOrder) {
     if (M.reg[c0] >= 0) continue;
     const r = M.peak.length, thr = BAND * M.L[c0];
     M.peak.push(M.L[c0]);
+    M.isBand.push(!touchesRegion(c0));
     M.reg[c0] = r;
     mapStack.push(c0);
     while (mapStack.length) {
@@ -967,18 +976,19 @@ function plan(m, inRegion) {
   return ok;
 }
 
-/** Light-map region at (x, y), or the brightest one next to it (the spot itself may have just been covered). */
+/** The band at (x, y), or the brightest one next to it (the spot itself may have just been covered);
+ *  -1 on a slope or in the dark. */
 function regionNear(x, y) {
   const M = MAP;
   if (!M.n) return -1;
-  const c = cellIndex(x, y);
-  if (M.reg[c] >= 0) return M.reg[c];
+  const c = cellIndex(x, y), own = M.reg[c];
+  if (own >= 0) return M.isBand[own] ? own : -1;
   const ci = c % M.cols, cj = (c - ci) / M.cols;
   let best = -1;
   for (let j = Math.max(0, cj - 1); j <= Math.min(M.rows - 1, cj + 1); j++) {
     for (let i = Math.max(0, ci - 1); i <= Math.min(M.cols - 1, ci + 1); i++) {
       const r = M.reg[j * M.cols + i];
-      if (r >= 0 && (best < 0 || M.peak[r] > M.peak[best])) best = r;
+      if (r >= 0 && M.isBand[r] && (best < 0 || M.peak[r] > M.peak[best])) best = r;
     }
   }
   return best;
@@ -2350,6 +2360,27 @@ function drawObstaclesShapes(ctx) {
   }
 }
 
+/** Agent ring k (0 innermost) in color index ci, with a dark outline that keeps it readable on a light
+ *  of its own color. Painted once per size at device resolution (stroking arcs every frame is slow). */
+const ringSprites = new Map();
+function ringSprite(ci, k) {
+  const s = S.scale, d = Kit.dpr, rr = (9 + 4.5 + 4.5 * k) * s, key = `${ci}|${k}|${(rr * d).toFixed(1)}`;
+  let c = ringSprites.get(key);
+  if (!c) {
+    if (ringSprites.size >= 64) ringSprites.clear();
+    c = document.createElement('canvas');
+    c.half = Math.ceil((rr + 2.5 * s) * d) + 1;
+    c.width = c.height = c.half * 2;
+    const g = c.getContext('2d');
+    g.setTransform(d, 0, 0, d, c.half, c.half);
+    g.beginPath(); g.arc(0, 0, rr, 0, TAU);
+    g.strokeStyle = SH.bg; g.lineWidth = 4.5 * s; g.stroke();
+    g.strokeStyle = BASE[COLORS[ci]]; g.lineWidth = 2.5 * s; g.stroke();
+    ringSprites.set(key, c);
+  }
+  return c;
+}
+
 function drawAgentsShapes(ctx) {
   const s = S.scale, r = 9 * s;
   ctx.strokeStyle = 'rgba(255,255,255,0.28)';
@@ -2365,31 +2396,19 @@ function drawAgentsShapes(ctx) {
     }
   }
   ctx.stroke();
-  // a ring in the color of each lamp lighting it (up to three), so an agent in an overlap wears more
-  // rings; a dark outline keeps a ring readable on a light of its own color
-  const ringPath = (c) => {
-    ctx.beginPath();
-    for (const m of S.moths) {
-      if (m.glow < 0.3) continue;
-      const rings = m.fx.rings;
-      for (let k = 0; k < 3; k++) {
-        if (rings[k] < 0 || (c >= 0 && rings[k] !== c)) continue;
-        const rr = r + (4.5 + 4.5 * k) * s;
-        ctx.moveTo(m.x + rr, m.y);
-        ctx.arc(m.x, m.y, rr, 0, TAU);
-      }
+  // a ring in the color of each lamp lighting it (up to three), so an agent in an overlap wears more rings
+  const d = Kit.dpr;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  for (const m of S.moths) {
+    if (m.glow < 0.3) continue;
+    const rings = m.fx.rings;
+    for (let k = 0; k < 3; k++) {
+      if (rings[k] < 0) continue;
+      const c = ringSprite(rings[k], k);
+      ctx.drawImage(c, Math.round(m.x * d) - c.half, Math.round(m.y * d) - c.half);
     }
-  };
-  ringPath(-1);
-  ctx.strokeStyle = SH.bg;
-  ctx.lineWidth = 4.5 * s;
-  ctx.stroke();
-  ctx.lineWidth = 2.5 * s;
-  for (let c = 0; c < NC; c++) {
-    ringPath(c);
-    ctx.strokeStyle = BASE[COLORS[c]];
-    ctx.stroke();
   }
+  ctx.setTransform(d, 0, 0, d, 0, 0);
   // direction ticks, then bodies; a dark outline keeps them readable on white overlaps
   ctx.beginPath();
   for (const m of S.moths) {
@@ -2849,10 +2868,10 @@ window.__toy = {
   removeObstacle,
   beamPolygon: (l) => l.fx.poly.slice(),
   refresh: () => { for (const l of S.lamps) placeLamp(l); for (const o of S.obstacles) updateObstacle(o); recomputeBeams(); buildMap(); },
-  /** The light map's band regions: [{peak, cells}] brightest first, plus the band threshold. */
+  /** The light map's regions: [{peak, band (false: a slope of a brighter one), cells}] brightest first, plus the band threshold. */
   bands: () => {
     syncMap();
-    const out = MAP.peak.map((peak) => ({ peak, cells: 0 }));
+    const out = MAP.peak.map((peak, i) => ({ peak, band: MAP.isBand[i], cells: 0 }));
     for (let c = 0; c < MAP.n; c++) if (MAP.reg[c] >= 0) out[MAP.reg[c]].cells++;
     return { max: MAP.max, threshold: BAND * MAP.max, beat: BEAT, regions: out };
   },
