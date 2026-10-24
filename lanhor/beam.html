@@ -78,8 +78,9 @@ const DEFAULT_OBJECTS = [
   ['circle', 0.42, 0.13, 0.06, 0, null],
   ['rect', 0.555, 0.25, 0.058, 20, 'blue'],    // in the blue beam: blue shines through
   ['triangle', 0.75, 0.3, 0.078, 12, null],
-  // in the red beam past the overlap: bounces part of it up into the dark top right (clear of the overlap)
-  ['mirror', 0.86, 0.8, 0.07, 134, null],
+  // in the red beam past the overlap: bounces part of it up into the dark top right (clear of the
+  // overlap); its top end tucks into the green pane's shadow, so no hairline of light slips past it
+  ['mirror', 0.86, 0.8, 0.075, 134, null],
   ['square', 0.67, 0.6, 0.058, -14, 'green'],  // in the red beam past the overlap: casts a red shadow
   ['square', 0.42, 0.87, 0.064, 16, null],
   ['triangle', 0.21, 0.67, 0.07, -24, 'red'],  // in the red beam: red shines through
@@ -120,7 +121,7 @@ const S = {
   mapDirty: true,     // the light map is behind the beams
   floorDirty: true,
   obsRev: 0,          // bumped whenever object geometry or the room changes
-  basePieces: new Set(), baseValid: false,
+  basePieces: new Set(), baseValid: false, baseAt: -9,
   floorWasDirty: false, floorStale: false,
   nextId: 1,
   lampPlacedAt: -9,
@@ -128,11 +129,12 @@ const S = {
   litCount: 0, level: -1, levelNext: -1, levelT: 0,   // level: beams making the light the swarm roams in
   cursor: '',
   ui: {},
+  counts: { beams: 0, maps: 0 },   // how often the beams and the light map were rebuilt (test API)
 };
 const hash = new Kit.SpatialHash(48);
 const railOut = { x: 0, y: 0, nx: 0, ny: 1 };
 const keyHold = new Map();
-const angBuf = [], tBuf = [], hoBuf = [], hfBuf = [], tsBuf = [];
+const angBuf = [], tBuf = [], hoBuf = [], hfBuf = [], tsBuf = [], eBuf = [];
 let polyBuf = [];
 const copyInto = (dst, src) => { dst.length = src.length; for (let i = 0; i < src.length; i++) dst[i] = src[i]; };
 const byNumber = (a, b) => a - b;
@@ -459,9 +461,9 @@ function makePiece(lamp, depth, key) {
   return {
     lamp, depth, key, color: lamp.color, k: 1,   // k: strength factor (Mirror strength per bounce)
     sx: 0, sy: 0, c: 0, hw: 0,                   // source, and the window of its rays (center, half width)
-    mirror: null, face: -1, ax: 0, ay: 0, nx: 0, ny: 0,   // reflections: the face it leaves, outward normal
-    ang: [], t: [], ho: [], hf: [], ts: [],      // rays: relative angle, end and start distance, mirror face hit
-    poly: [], path: null, pathColor: '', far: 40, grad: null, gradKey: '',
+    mirror: null, ax: 0, ay: 0, nx: 0, ny: 0,    // reflections: the mirror it leaves, a point on that face, its outward normal
+    ang: [], t: [], ho: [], hf: [],              // rays: relative angle, length, the mirror and face each one ends on
+    poly: [], path: null, pathColor: '', pathAt: Kit.realTime, far: 40, grad: null, gradKey: '',   // pathAt: when its polygon last changed
     x0: 0, y0: 0, x1: 0, y1: 0,                  // bounding box of the polygon
     painted: { path: null, vis: -1, key: '' },   // what the sprite floor currently shows for this piece
   };
@@ -575,13 +577,14 @@ function setColor(c, fromUser) {
 
 // ================================================================== beams (visibility polygons)
 /** Distance along (dx, dy) to the first wall or object that blocks `color` (skip: the mirror a
- *  reflected ray leaves). Also leaves in rayHit / rayFace the mirror and face it ended on (else null / -1). */
-let rayHit = null, rayFace = -1;
+ *  reflected ray leaves). Also leaves in rayHit / rayFace the mirror and face it ended on (else null / -1),
+ *  and in rayEdge which edge stopped it (a wall: -1 … -4; an object edge: id·64 + edge). */
+let rayHit = null, rayFace = -1, rayEdge = 0;
 function castRay(ox, oy, dx, dy, color, skip) {
   const R = S.room;
-  let t = Infinity, hit = null, edge = -1;
-  if (dx > 1e-9) t = (R.x + R.w - ox) / dx; else if (dx < -1e-9) t = (R.x - ox) / dx;
-  if (dy > 1e-9) t = Math.min(t, (R.y + R.h - oy) / dy); else if (dy < -1e-9) t = Math.min(t, (R.y - oy) / dy);
+  let t = Infinity, hit = null, edge = -1, wall = 0;
+  if (dx > 1e-9) { t = (R.x + R.w - ox) / dx; wall = -1; } else if (dx < -1e-9) { t = (R.x - ox) / dx; wall = -2; }
+  if (dy > 1e-9) { const ty = (R.y + R.h - oy) / dy; if (ty < t) { t = ty; wall = -3; } } else if (dy < -1e-9) { const ty = (R.y - oy) / dy; if (ty < t) { t = ty; wall = -4; } }
   const obs = S.obstacles;
   for (let k = 0; k < obs.length; k++) {
     const o = obs[k];
@@ -604,15 +607,28 @@ function castRay(ox, oy, dx, dy, color, skip) {
   }
   const face = hit && isMirror(hit) && (edge === MIRROR_FACES[0] || edge === MIRROR_FACES[1]);
   rayHit = face ? hit : null; rayFace = face ? edge : -1;
+  rayEdge = hit ? hit.id * 64 + edge : wall;
   return t;
+}
+
+/** Far ends of a fan of rays as polygon points, leaving out every end whose neighbours stop on the same
+ *  edge (it lies on the straight line between them). Exact, and it keeps a beam's polygon the same when
+ *  only an object it cannot see moves (whose corners still add rays), so that beam stays baked. */
+function pushFarEnds(poly, ox, oy, c, ang, t, eid) {
+  const n = ang.length;
+  for (let i = 0; i < n; i++) {
+    if (i > 0 && i < n - 1 && eid[i] === eid[i - 1] && eid[i] === eid[i + 1]) continue;
+    const a = c + ang[i];
+    poly.push(ox + Math.cos(a) * t[i], oy + Math.sin(a) * t[i]);
+  }
 }
 
 /** Where two shadow edges almost line up (or a ray grazes the vertex between two edges), a run of
  *  rays slips through a gap thinner than a couple of pixels even at its far end, which draws a stray
  *  hairline across the room. Such a gap is closed: each of its rays stops where its nearer flanking
- *  neighbour does (and so ends on what that neighbour hit: ho / hf, the mirror and face). Wider gaps
- *  stay open as real thin rays of light. */
-function closeNeedles(ang, t, ho, hf) {
+ *  neighbour does (and so ends on what that neighbour hit: ho / hf the mirror and face, eid the edge).
+ *  Wider gaps stay open as real thin rays of light. */
+function closeNeedles(ang, t, ho, hf, eid) {
   const n = t.length, M = 8;   // a gap counts once its rays reach M px past both flanking hits
   for (let i = 1; i < n - 1; i++) {
     const left = t[i - 1];
@@ -624,7 +640,7 @@ function closeNeedles(ang, t, ho, hf) {
         if ((ang[j + 1] - ang[i - 1]) * high < NEEDLE_PX) {
           for (let k = i; k <= j; k++) {
             const from = k - i < j - k ? i - 1 : j + 1;
-            t[k] = t[from]; ho[k] = ho[from]; hf[k] = hf[from];
+            t[k] = t[from]; ho[k] = ho[from]; hf[k] = hf[from]; eid[k] = eid[from];
           }
           i = j;
         }
@@ -657,25 +673,22 @@ function computeBeam(l) {
   const c = S.roomCorners;
   for (let i = 0; i < 8; i += 2) addVert(c[i], c[i + 1]);
   angBuf.sort(byNumber);
-  tBuf.length = 0; hoBuf.length = 0; hfBuf.length = 0;
+  tBuf.length = 0; hoBuf.length = 0; hfBuf.length = 0; eBuf.length = 0;
   for (let i = 0; i < angBuf.length; i++) {
     const a = a0 + angBuf[i];
     tBuf.push(castRay(ox, oy, Math.cos(a), Math.sin(a), l.color));
-    hoBuf.push(rayHit); hfBuf.push(rayFace);
+    hoBuf.push(rayHit); hfBuf.push(rayFace); eBuf.push(rayEdge);
   }
-  closeNeedles(angBuf, tBuf, hoBuf, hfBuf);
+  closeNeedles(angBuf, tBuf, hoBuf, hfBuf, eBuf);
   // the rays themselves (relative angle, length, mirror face hit): reflections start where they meet a mirror
   const P = fx.piece;
   copyInto(P.ang, angBuf); copyInto(P.t, tBuf); copyInto(P.ho, hoBuf); copyInto(P.hf, hfBuf);
   P.c = a0; P.hw = hw;
   poly.length = 0;
   poly.push(ox, oy);
+  pushFarEnds(poly, ox, oy, a0, angBuf, tBuf, eBuf);
   let far = 0;
-  for (let i = 0; i < angBuf.length; i++) {
-    const a = a0 + angBuf[i], t = tBuf[i];
-    poly.push(ox + Math.cos(a) * t, oy + Math.sin(a) * t);
-    if (t > far) far = t;
-  }
+  for (let i = 0; i < tBuf.length; i++) if (tBuf[i] > far) far = tBuf[i];
   // an unchanged beam keeps its path, so the sprite floor can leave it baked
   if (fx.path && fx.polyColor === l.color && samePoly(poly, fx.poly)) return;
   polyBuf = fx.poly; fx.poly = poly; fx.polyColor = l.color;
@@ -709,6 +722,7 @@ function buildPieces() {
     for (const l of S.lamps) {
       if (l.on !== on || !l.fx.path) continue;
       const P = l.fx.piece, fx = l.fx;
+      if (P.path !== fx.path) P.pathAt = Kit.realTime;
       P.color = l.color; P.sx = l.ox; P.sy = l.oy; P.poly = fx.poly; P.path = fx.path; P.far = fx.far;
       polyBounds(P);
       out.push(P);
@@ -754,7 +768,7 @@ function reflectPiece(C, P, o, face, x1, y1, x2, y2) {
   const hw = Math.abs(span) / 2, c = t1 + span / 2;
   if (hw < 2e-5) return false;
   C.color = P.color; C.sx = sx; C.sy = sy; C.c = c; C.hw = hw;
-  C.mirror = o; C.face = face; C.ax = F.ax; C.ay = F.ay; C.nx = nx; C.ny = ny;
+  C.mirror = o; C.ax = F.ax; C.ay = F.ay; C.nx = nx; C.ny = ny;
   const color = P.color, ang = angBuf;
   ang.length = 0;
   const m = Math.max(1, Math.ceil((2 * hw) / RAY_STEP));
@@ -767,32 +781,29 @@ function reflectPiece(C, P, o, face, x1, y1, x2, y2) {
   const rc = S.roomCorners;
   for (let i = 0; i < 8; i += 2) addVert(rc[i], rc[i + 1]);
   ang.sort(byNumber);
-  tBuf.length = 0; hoBuf.length = 0; hfBuf.length = 0; tsBuf.length = 0;
+  tBuf.length = 0; hoBuf.length = 0; hfBuf.length = 0; tsBuf.length = 0; eBuf.length = 0;
   const base = (F.ax - sx) * nx + (F.ay - sy) * ny;   // how far the image sits behind the face line
   for (let i = 0; i < ang.length; i++) {
     const a = c + ang[i], dx = Math.cos(a), dy = Math.sin(a), dn = dx * nx + dy * ny;
     const ts = dn > 1e-9 ? base / dn : 0;   // where the ray crosses the face: the light starts there
     tsBuf.push(ts);
     tBuf.push(ts + castRay(sx + dx * ts, sy + dy * ts, dx, dy, color, o));
-    hoBuf.push(rayHit); hfBuf.push(rayFace);
+    hoBuf.push(rayHit); hfBuf.push(rayFace); eBuf.push(rayEdge);
   }
-  closeNeedles(ang, tBuf, hoBuf, hfBuf);
-  copyInto(C.ang, ang); copyInto(C.t, tBuf); copyInto(C.ho, hoBuf); copyInto(C.hf, hfBuf); copyInto(C.ts, tsBuf);
+  closeNeedles(ang, tBuf, hoBuf, hfBuf, eBuf);
+  copyInto(C.ang, ang); copyInto(C.t, tBuf); copyInto(C.ho, hoBuf); copyInto(C.hf, hfBuf);
   // polygon: the lit stretch of the face, then the far ends of the rays
   const poly = polyBuf, last = ang.length - 1;
   poly.length = 0;
   poly.push(sx + Math.cos(c + ang[0]) * tsBuf[0], sy + Math.sin(c + ang[0]) * tsBuf[0]);
+  pushFarEnds(poly, sx, sy, c, ang, tBuf, eBuf);
   let far = 0;
-  for (let i = 0; i <= last; i++) {
-    const a = c + ang[i];
-    poly.push(sx + Math.cos(a) * tBuf[i], sy + Math.sin(a) * tBuf[i]);
-    far = Math.max(far, tBuf[i]);
-  }
+  for (let i = 0; i <= last; i++) if (tBuf[i] > far) far = tBuf[i];
   poly.push(sx + Math.cos(c + ang[last]) * tsBuf[last], sy + Math.sin(c + ang[last]) * tsBuf[last]);
   C.far = Math.max(far, 40);
   if (!(C.path && C.pathColor === color && samePoly(poly, C.poly))) {   // an unchanged piece keeps its path, so it stays baked in the floor
     polyBuf = C.poly; C.poly = poly;
-    C.path = polyPath2D(poly); C.pathColor = color;
+    C.path = polyPath2D(poly); C.pathColor = color; C.pathAt = Kit.realTime;
     C.grad = null;
   }
   polyBounds(C);
@@ -880,6 +891,7 @@ function recomputeBeams() {
   S.dirty = false;
   S.floorDirty = true;
   S.mapDirty = true;
+  S.counts.beams++;
   for (const l of S.lamps) computeBeam(l);
   buildPieces();
   for (const o of S.obstacles) {
@@ -956,6 +968,7 @@ function openSpot(x, y, clear) {
 
 function buildMap() {
   S.mapDirty = false;
+  S.counts.maps++;
   const M = MAP, R = S.room, s = S.scale, clear = spotClear();
   const size = clamp(44 * s, 36, 60);
   const cols = Math.max(1, Math.round(R.w / size)), rows = Math.max(1, Math.round(R.h / size)), n = cols * rows;
@@ -977,10 +990,10 @@ function buildMap() {
       }
     }
   }
-  // a narrow beam can slip between the sample points: sample along every beam's axis too
-  // (a reflection's axis starts on its mirror)
+  // a narrow beam can slip between the sample points: sample along every beam's axis too (a
+  // reflection's axis starts on its mirror; one wider than a cell at its far end is caught anyway)
   for (const p of S.pieces) {
-    if (!p.lamp.on) continue;
+    if (!p.lamp.on || (p.depth && 2 * p.hw * p.far > size)) continue;
     const ca = Math.cos(p.c), sa = Math.sin(p.c);
     let x0 = p.sx, y0 = p.sy, d0 = 52 * s;
     if (p.depth) {
@@ -2297,37 +2310,42 @@ function pieceGradient(p, g) {
 
 /** Visible brightness of a piece: its lamp's, times the strength left after its bounces. */
 const pieceVis = (p) => lampVis(p.lamp) * p.k;
+/** How strongly a piece shows in the floor: Sprites as above; Shapes draw a reflection exactly like a direct beam. */
+const floorVis = (p) => (Kit.isAbstract ? p.lamp.fx.power : pieceVis(p));
 
-/** Additive gradient fill of one beam piece. Beam polygons stop at the room's bounding rectangle, so
- *  they are drawn unclipped and restoreRoomCorners() fixes the rounded corners afterwards
- *  (far cheaper than clipping every full-room gradient fill). */
+/** Additive fill of one beam piece: a soft gradient (Sprites) or flat translucent color (Shapes). Beam
+ *  polygons stop at the room's bounding rectangle, so they are drawn unclipped and
+ *  restoreRoomCorners() fixes the rounded corners afterwards (far cheaper than clipping every fill). */
 function fillPiece(g, p) {
-  const vis = pieceVis(p);
+  const vis = floorVis(p);
   if (!p.path || vis <= 0.01) return;
-  g.globalAlpha = clamp(vis, 0, 1);
-  g.fillStyle = pieceGradient(p, g);
+  if (Kit.isAbstract) { g.globalAlpha = 0.5 * vis; g.fillStyle = BASE[p.color]; } else { g.globalAlpha = clamp(vis, 0, 1); g.fillStyle = pieceGradient(p, g); }
   g.fill(p.path);
 }
 
 function pieceChanged(p, key) {
   const q = p.painted;
-  return q.path !== p.path || q.vis !== pieceVis(p) || q.key !== key;
+  return q.path !== p.path || q.vis !== floorVis(p) || q.key !== key;
 }
 
-/** Sprites: the night floor with every beam piece, object and lamp mount, painted into f. Pieces that
- *  hold still stay baked in baseLayer (background + those pieces), so aiming, sliding or switching
- *  one lamp or turning one mirror re-rasters only the pieces that changed; `moving` (the lighting
- *  changed last frame too) is when re-baking the base pays off. */
+const SETTLE = 0.4;   // s a piece must hold still, while the light keeps changing, before it is baked
+/** The floor with every beam piece (and in Sprites every object, lamp mount and mirror hit), painted
+ *  into f. Pieces that hold still stay baked in baseLayer (background + those pieces), so aiming,
+ *  sliding or switching one lamp or turning one mirror re-rasters only the pieces that change; while
+ *  the light keeps changing (`moving`) only pieces that have settled for a moment are baked, so a piece
+ *  that changes now and then (a far bounce of a turning mirror) never forces a re-bake every frame. */
 function paintLitFloor(f, moving) {
   S.floorDirty = false;
-  const dpr = Kit.dpr, W = bgLayer.width, H = bgLayer.height;
+  const dpr = Kit.dpr, W = bgLayer.width, H = bgLayer.height, now = Kit.realTime;
   if (!W || !H) return;
   for (const c of [floorLayer, baseLayer]) if (c.width !== W || c.height !== H) { c.width = W; c.height = H; S.baseValid = false; }
   const key = reachPx() + '';
+  const bakeable = (p) => !pieceChanged(p, key) && (!moving || now - p.pathAt >= SETTLE);
   let rebuild = !S.baseValid;
-  for (const p of S.basePieces) if (!S.pieces.includes(p) || pieceChanged(p, key)) rebuild = true;
-  if (moving) for (const p of S.pieces) if (!S.basePieces.has(p) && !pieceChanged(p, key)) rebuild = true;
+  for (const p of S.basePieces) if (!S.pieces.includes(p) || pieceChanged(p, key)) rebuild = true;   // a baked piece moved or went
+  if (moving && !rebuild && now - S.baseAt > 0.3) rebuild = S.pieces.some((p) => !S.basePieces.has(p) && bakeable(p));
   if (rebuild) {
+    S.baseAt = now;
     const b = baseLayer.getContext('2d');
     b.setTransform(1, 0, 0, 1, 0, 0);
     b.globalCompositeOperation = 'source-over';
@@ -2336,7 +2354,7 @@ function paintLitFloor(f, moving) {
     b.setTransform(dpr, 0, 0, dpr, 0, 0);
     b.globalCompositeOperation = 'lighter';
     S.basePieces.clear();
-    for (const p of S.pieces) if (!pieceChanged(p, key)) { fillPiece(b, p); S.basePieces.add(p); }
+    for (const p of S.pieces) if (bakeable(p)) { fillPiece(b, p); S.basePieces.add(p); }
     S.baseValid = true;
   }
   f.setTransform(1, 0, 0, 1, 0, 0);
@@ -2348,14 +2366,26 @@ function paintLitFloor(f, moving) {
   for (const p of S.pieces) {
     if (!S.basePieces.has(p)) fillPiece(f, p);
     const q = p.painted;
-    q.path = p.path; q.vis = pieceVis(p); q.key = key;
+    q.path = p.path; q.vis = floorVis(p); q.key = key;
   }
   f.globalCompositeOperation = 'source-over';
   f.globalAlpha = 1;
   restoreRoomCorners(f);
-  // objects and lamp mounts only change when the lighting does, so they live in this layer too
+  if (Kit.isAbstract) return;
+  // objects, lamp mounts and the light on mirrors only change when the lighting does, so they live in this layer too
   paintObstacles(f);
+  paintMirrorHits(f);
   for (const l of S.lamps) paintLampMount(f, l, 1);
+}
+
+/** Floor of either view: one blit of floorLayer while the light holds still; while it changes every
+ *  frame (drags, aiming, turning) it is composed straight onto the screen and baked again once it settles. */
+function drawFloor(ctx) {
+  const dirty = S.floorDirty, moving = dirty && S.floorWasDirty;
+  S.floorWasDirty = dirty;
+  if (moving) { paintLitFloor(ctx, true); S.floorStale = true; return; }
+  if (dirty || S.floorStale) { paintLitFloor(floorLayer.getContext('2d'), false); S.floorStale = false; }
+  ctx.drawImage(floorLayer, 0, 0, Kit.W, Kit.H);
 }
 
 /** Copy the background back into the four slivers between the room's rounded corners and its bounding rectangle. */
@@ -2524,8 +2554,30 @@ function paintMirror(g, o) {
 }
 
 const LIGHT_HOT = Object.fromEntries(COLORS.map((c) => [c, U.mixHex(LIGHT[c], '#ffffff', 0.5)]));
-/** Live mirror effects (Sprites): a soft sheen sliding along each mirror, and where a beam meets one a
- *  bright stripe on the lit stretch, a glint and a faint flare in the beam's color. */
+/** Where a beam meets a mirror (Sprites, baked in the floor): a bright stripe on the lit stretch and,
+ *  for light that arrives directly or after one bounce, a faint flare in the beam's color. */
+const FLARE_K = 0.7;
+function paintMirrorHits(f) {
+  const s = S.scale;
+  f.save();
+  f.globalCompositeOperation = 'lighter';
+  f.lineCap = 'round';
+  f.lineWidth = 2.2 * s;
+  for (const h of S.mirrorHits) {
+    const vis = lampVis(h.lamp) * h.k;
+    if (vis < 0.02) continue;
+    f.globalAlpha = 0.8 * vis;
+    f.strokeStyle = LIGHT_HOT[h.color];
+    f.beginPath(); f.moveTo(h.x1, h.y1); f.lineTo(h.x2, h.y2); f.stroke();
+    if (h.k < FLARE_K) continue;
+    const len = Math.hypot(h.x2 - h.x1, h.y2 - h.y1);
+    f.globalAlpha = 0.4 * vis;
+    drawGlowSized(f, LIGHT[h.color], (h.x1 + h.x2) / 2, (h.y1 + h.y2) / 2, Math.round(clamp(len * 0.8, 40 * s, 100 * s) / 8) * 8);
+  }
+  f.restore();
+}
+
+/** Live mirror effects (Sprites): a soft sheen sliding along each mirror and a twinkling glint where a beam meets it. */
 function drawMirrorFx(ctx, t) {
   const s = S.scale;
   ctx.save();
@@ -2544,17 +2596,12 @@ function drawMirrorFx(ctx, t) {
     ctx.beginPath(); ctx.moveTo(o.bx + ux * a2, o.by + uy * a2); ctx.lineTo(o.bx + ux * b2, o.by + uy * b2);
     ctx.strokeStyle = `rgba(255,255,255,${0.5 * fade})`; ctx.lineWidth = hy * 0.9; ctx.stroke();
   }
+  const g = Math.round((28 * s) / 4) * 4;
   for (const h of S.mirrorHits) {
     const vis = lampVis(h.lamp) * h.k;
-    if (vis < 0.02) continue;
-    const mx = (h.x1 + h.x2) / 2, my = (h.y1 + h.y2) / 2, len = Math.hypot(h.x2 - h.x1, h.y2 - h.y1);
-    ctx.globalAlpha = 0.8 * vis;
-    ctx.strokeStyle = LIGHT_HOT[h.color]; ctx.lineWidth = 2.2 * s;
-    ctx.beginPath(); ctx.moveTo(h.x1, h.y1); ctx.lineTo(h.x2, h.y2); ctx.stroke();
-    ctx.globalAlpha = 0.38 * vis;
-    drawGlowSized(ctx, LIGHT[h.color], mx, my, Math.round(clamp(len * 1.1, 50 * s, 170 * s) / 8) * 8);
+    if (vis < 0.02 || h.k < FLARE_K) continue;
     ctx.globalAlpha = vis * (0.7 + 0.3 * Math.sin(t * 6.5 + h.o.id * 1.7));
-    drawGlowSized(ctx, '#ffffff', mx, my, Math.round(28 * s / 4) * 4);
+    drawGlowSized(ctx, '#ffffff', (h.x1 + h.x2) / 2, (h.y1 + h.y2) / 2, g);
   }
   ctx.restore();
 }
@@ -2611,13 +2658,14 @@ function drawLitRims(ctx) {
 let motePhase = 0;
 function drawMotes(ctx, t) {
   const R = S.room, s = S.scale, pieces = S.pieces, motes = S.motes;
-  motePhase = (motePhase + 1) % 3;
+  // the light test is spread over three frames (six with many reflections); a mote drifts about a pixel meanwhile
+  const spread = pieces.length > 12 ? 6 : 3;
+  motePhase = (motePhase + 1) % spread;
   ctx.fillStyle = 'rgba(190,205,255,0.09)';
   ctx.beginPath();
   for (let k = 0; k < motes.length; k++) {
     const d = motes[k], x = R.x + d.u * R.w, y = R.y + d.v * R.h;
-    // the light test is spread over three frames; a mote drifts far less than a pixel meanwhile
-    if (k % 3 === motePhase) {
+    if (k % spread === motePhase) {
       d.mask = 0; d.lit = 0;
       for (const p of pieces) {
         const vis = lampVis(p.lamp);
@@ -2819,21 +2867,6 @@ function drawParticlesSprite(ctx) {
 }
 
 // ================================================================== rendering: shapes
-/** Flat translucent fill per beam piece; a reflection looks exactly like a direct beam. */
-function drawBeamsShapes(ctx) {
-  ctx.save();
-  ctx.clip(S.roomPath);
-  ctx.globalCompositeOperation = 'lighter';
-  for (const p of S.pieces) {
-    const pw = p.lamp.fx.power;
-    if (!p.path || pw <= 0.01) continue;
-    ctx.globalAlpha = 0.5 * pw;
-    ctx.fillStyle = BASE[p.color];
-    ctx.fill(p.path);
-  }
-  ctx.restore();
-}
-
 function drawObstaclesShapes(ctx) {
   for (const o of S.obstacles) {
     polyPath(ctx, o.points, 0);
@@ -3103,23 +3136,14 @@ function render(ctx, rdt) {
   updateParticles(rdt);
   if (S.dirty) recomputeBeams();
 
+  drawFloor(ctx);
   if (abs) {
-    ctx.drawImage(bgLayer, 0, 0, Kit.W, Kit.H);
-    drawBeamsShapes(ctx);
     drawObstaclesShapes(ctx);
     drawObjectFlashes(ctx);
     drawAgentsShapes(ctx);
     drawParticlesShapes(ctx);
     for (const l of S.lamps) drawLampShapes(ctx, l, 1, l.color, l.on);
   } else {
-    // a still floor is one blit of floorLayer; while the lighting changes every frame (drags, aiming)
-    // the floor is composed straight onto the screen and baked again once it holds still
-    const dirty = S.floorDirty, moving = dirty && S.floorWasDirty;
-    S.floorWasDirty = dirty;
-    if (moving) { paintLitFloor(ctx, true); S.floorStale = true; } else {
-      if (dirty || S.floorStale) { paintLitFloor(floorLayer.getContext('2d'), false); S.floorStale = false; }
-      ctx.drawImage(floorLayer, 0, 0, Kit.W, Kit.H);
-    }
     drawObjectFlashes(ctx);
     drawMirrorFx(ctx, rt);
     if (tw('dust')) drawMotes(ctx, rt);
@@ -3215,8 +3239,8 @@ const GLASS_ICON = {
   sprite: svgIcon('<rect x="5" y="4" width="14" height="16" rx="1.5" fill="currentColor" fill-opacity="0.3"/><path d="M9 8.5l-1.6 2.8M13 8.5l-4.2 7.2"/>'),
   abstract: svgIcon('<rect x="5" y="5" width="14" height="14" fill="currentColor" fill-opacity="0.35"/>'),
 };
-// a slanted mirror with a ray bouncing off it (a mechanic, so the same in both views)
-const MIRROR_ICON = svgIcon('<path d="M6 20.5L20.5 6" stroke-width="3.2"/><path d="M2.5 13.2h10.6V2.8" stroke-width="1.6"/><path d="M10.6 5.3l2.5-2.5 2.5 2.5" stroke-width="1.6"/>');
+// a ray bouncing off a mirror pane (a mechanic, so the same in both views)
+const MIRROR_ICON = svgIcon('<rect x="16.6" y="3" width="3.4" height="18" rx="1" fill="currentColor" fill-opacity="0.35"/><path d="M3 5.5l13 6.5L3 18.5M7 18.7L3 18.5l2.15-3.37" stroke-width="1.7"/>');
 
 // Toy-local styles (kit.css stays shared), more specific than the kit's own rules: the color bar (six
 // round swatches in one pill), a slightly tighter toolbar, and a help card whose "How to play" column
@@ -3399,6 +3423,8 @@ window.__toy = {
     return S.pieces.map((p) => ({ lamp: p.lamp, depth: p.depth, poly: p.poly.slice(), color: p.color, strength: p.k, source: { x: p.sx, y: p.sy }, mirror: S.obstacles.indexOf(p.mirror) }));
   },
   reflectRay,
+  /** How many times the beams (with their reflections) and the light map have been rebuilt. */
+  get counters() { return Object.assign({}, S.counts); },
   /** Where light meets a mirror face: [{mirror (obstacle index), x1, y1, x2, y2 (the lit stretch), color, strength}]. */
   mirrorHits: () => {
     if (S.dirty) recomputeBeams();
