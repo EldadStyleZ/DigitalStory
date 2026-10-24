@@ -429,6 +429,7 @@
     // drop anything still showing the old view's words
     Kit.dom.toasts.replaceChildren();
     Kit.dom.tip.classList.remove('is-on');
+    Kit.dom.tip.textContent = '';
     applyViewText();
     if (Kit.cfg.viewChanged) Kit.cfg.viewChanged(v);
     if (!opts.silent) {
