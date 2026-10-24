@@ -1,6 +1,6 @@
 # Digital Story: לנהור toys
 
-Three playable prototypes for the verb **לנהור**: to stream, flock or throng toward something.
+Four playable prototypes for the verb **לנהור**: to stream, flock or throng toward something.
 Each toy tests a different pull. Built for the Digital Story course at Bezalel Academy.
 
 | # | Sprites name | Shapes name | The pull |
@@ -8,6 +8,7 @@ Each toy tests a different pull. Built for the Digital Story course at Bezalel A
 | 01 | Moths & Lamps | Beam | Agents gather where the light is strongest (overlapping beams add up); objects block, filter or reflect the light |
 | 02 | School of Fish | Flow | A group you steer grows in green zones, shrinks in red zones, and is pushed by flows |
 | 03 | Ants & Sugar | Trail | Each agent walks to the closest attractor it can see, then returns to its base |
+| 04 | Funnel | Funnel | Funnels you steer pull particles in at a red mouth and push them out at a blue spout, with equal power |
 
 ## Run it
 
@@ -116,14 +117,40 @@ through a corridor to a far corner and plant a flag at the end (key 2). Stop add
 walk back to its own nest. Turn on sight lines (L) to explain "the closest one it can see". The opening trail is
 eaten in a few seconds; raise *Bites per cube* in Tweaks if you want trails to last longer while you talk.
 
+## 04 Funnel
+
+Up to 2000 particles race through a maze of rounded walls, big chambers and narrow tunnels, bouncing off every
+surface. Each funnel pulls particles into its red mouth and shoots them out of its blue spout, with equal power on
+both sides, set by the slider on the funnel. Everything that goes in comes out. The Particles and Speed sliders in the
+bottom bar set how many particles there are and how fast they move.
+
+| Input | Action |
+|---|---|
+| Right-click empty space | Add a funnel (up to 12) |
+| Drag a funnel | Move it anywhere; it settles in free space when you let go |
+| Click a funnel | Remove it (Z brings it back) |
+| A / D (hold) | Turn the funnel under the mouse, or the selected one |
+| Slider on the funnel, or W / S | Power: pull and push are always equal |
+| Wheel | Turn a funnel; over its slider, set the power |
+| Arrows | Move the selected funnel |
+| Tab / Esc | Select the next funnel / deselect |
+| Delete or X | Remove the selected funnel |
+| N | New map (R keeps the current one) |
+
+**One-minute demo:** the opening funnel already pumps particles through a tunnel. Right-click in another chamber to
+add a second funnel and hold A or D to aim its spout into a tunnel mouth, so the two pump in a chain. Drag a slider to
+0 % and the stream stops; push it to 100 % and the chamber behind the spout empties. Raise Particles to 2000 and Speed
+to 3× for chaos. Turn on *Show fields* in Tweaks (T) to show the equal pull and push zones.
+
 ## Files
 
 ```
 lanhor/
-  index.html   launcher (press 1, 2 or 3 to open a toy)
+  index.html   launcher (press 1, 2, 3 or 4 to open a toy)
   beam.html    toy 01
   flow.html    toy 02
   trail.html   toy 03
+  funnel.html  toy 04
   kit.js       shared shell: canvas loop, Sprites/Shapes switch, help, tweaks, toolbar, sound, input
   kit.css      shared look
 ```

@@ -24,12 +24,13 @@
   --beam: #ffd166;
   --flow: #4cc9f0;
   --trail: #ff9f6e;
+  --funnel: #b48cff;
   --accent: #ffd166;
   --font-display: 'Fredoka', 'Rubik', system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
   --font-ui: 'Rubik', system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
   --font-mono: 'DM Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
-body.view-abstract { --beam: #ffd60a; --flow: #0a84ff; --trail: #ff3b30; }
+body.view-abstract { --beam: #ffd60a; --flow: #0a84ff; --trail: #ff3b30; --funnel: #af52de; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -61,6 +62,7 @@ body {
 .mark-dots i { width: 8px; height: 8px; border-radius: 50%; background: var(--beam); }
 .mark-dots i:nth-child(2) { background: var(--flow); }
 .mark-dots i:nth-child(3) { background: var(--trail); }
+.mark-dots i:nth-child(4) { background: var(--funnel); }
 body.view-abstract .mark-dots i { border-radius: 1px; }
 .controls { display: flex; align-items: center; gap: 6px; padding: 5px; border-radius: 16px; background: var(--ink-1); border: 1px solid var(--line); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
 .seg { position: relative; display: flex; padding: 3px; border-radius: 12px; background: rgba(0,0,0,0.28); border: 1px solid var(--line); }
@@ -92,7 +94,8 @@ body.view-abstract .mark-dots i { border-radius: 1px; }
 .gloss { position: absolute; right: 4%; bottom: 2%; font: 500 14px/1.2 var(--font-ui); color: var(--fg-faint); }
 
 /* toy doors */
-.doors { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.doors { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 1500px) { .doors { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .door {
   --c: var(--beam);
   position: relative;
@@ -114,6 +117,7 @@ body.view-abstract .mark-dots i { border-radius: 1px; }
 }
 .door[data-toy="flow"] { --c: var(--flow); }
 .door[data-toy="trail"] { --c: var(--trail); }
+.door[data-toy="funnel"] { --c: var(--funnel); }
 .door:hover, .door:focus-visible {
   transform: translateY(-4px);
   border-color: color-mix(in srgb, var(--c) 70%, transparent);
@@ -127,7 +131,7 @@ body.view-abstract .mark-dots i { border-radius: 1px; }
 body.view-abstract .glyph .g-sprite { display: none; }
 body.view-abstract .glyph .g-abstract { display: block; }
 body.view-abstract .glyph { border-radius: 6px; }
-.door h2 { margin: 2px 0 0; font: 600 23px/1.15 var(--font-display); display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.door h2 { margin: 0; font: 600 23px/1.15 var(--font-display); display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
 .num { font: 600 15px/1 var(--font-display); color: var(--c); }
 .door p { margin: 0; font-size: 14.5px; line-height: 1.5; color: var(--fg-dim); min-width: 0; }
 .door-foot { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 13.5px; color: var(--fg-faint); }
@@ -161,7 +165,7 @@ kbd { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: v
 <canvas id="field" aria-hidden="true"></canvas>
 <div class="page">
   <header class="top">
-    <div class="mark"><span class="mark-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>Digital Story, Bezalel Academy</span></div>
+    <div class="mark"><span class="mark-dots" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>Digital Story, Bezalel Academy</span></div>
     <div class="controls">
       <div class="seg" role="group" aria-label="Look">
         <div class="seg-thumb"></div>
@@ -174,8 +178,8 @@ kbd { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: v
 
   <section class="hero">
     <div class="copy">
-      <h1>Three toys about moving together toward something.</h1>
-      <p data-sprite="Each toy tests a different pull: <b>light</b>, <b>water</b> and <b>food</b>. Play them live, then switch to Shapes and let the class guess what they were."
+      <h1>Four toys about moving together toward something.</h1>
+      <p data-sprite="Each toy tests a different pull: <b>light</b>, <b>water</b>, <b>food</b> and a <b>funnel</b> you steer. Play them live, then switch to Shapes and let the class guess what they were."
          data-abstract="Each toy tests a different pull. Play them live. Everything you see is plain shapes and base colors, so the reference is yours to guess."></p>
     </div>
     <div class="word-slot" id="word-slot">
@@ -215,10 +219,20 @@ kbd { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: v
          data-abstract="Place attractors to lead agents from three bases through a maze. Each agent goes to the closest attractor it can see, then back to its base."></p>
       <div class="door-foot"><span>Mostly mouse</span><span class="play"><kbd>3</kbd> Play</span></div>
     </a>
+    <a class="door" data-toy="funnel" href="funnel.html">
+      <span class="glyph" aria-hidden="true">
+        <svg class="g-sprite" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12l22 9v6L8 36" opacity=".9"/><path d="M30 21h6M30 27h6" opacity=".9"/><circle cx="4.5" cy="18" r="1.6" fill="currentColor"/><circle cx="5" cy="30" r="1.6" fill="currentColor"/><circle cx="41" cy="22" r="1.6" fill="currentColor"/><circle cx="44" cy="27" r="1.6" fill="currentColor"/></svg>
+        <svg class="g-abstract" viewBox="0 0 48 48" fill="currentColor"><path d="M7 11l24 10v6L7 37z" opacity=".55"/><rect x="31" y="21" width="6" height="6"/><rect x="3" y="20" width="3" height="3"/><rect x="40" y="23" width="3" height="3"/></svg>
+      </span>
+      <h2><span class="num">04</span><span data-sprite="Funnel" data-abstract="Funnel"></span></h2>
+      <p data-sprite="Drag funnels around a rounded maze full of fast particles. The red mouth pulls them in, the blue spout pushes them out, and one slider on each funnel sets the power."
+         data-abstract="Drag funnels around a rounded maze full of fast particles. The red side pulls them in, the blue side pushes them out, and one slider on each funnel sets the power."></p>
+      <div class="door-foot"><span>Mouse and keyboard</span><span class="play"><kbd>4</kbd> Play</span></div>
+    </a>
   </nav>
 
   <footer class="foot">
-    <span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> open a toy</span>
+    <span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd> open a toy</span>
     <span><kbd>V</kbd> switch between Sprites and Shapes, here and inside every toy</span>
     <span><kbd>F</kbd> fullscreen</span>
   </footer>
@@ -278,7 +292,7 @@ kbd { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: v
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (e.code === 'KeyV') setView(view === 'abstract' ? 'sprite' : 'abstract');
     else if (e.code === 'KeyF') toggleFullscreen();
-    else if (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3') {
+    else if (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3' || e.code === 'Digit4') {
       const d = doors[+e.code.slice(-1) - 1];
       store.set('lanhor-view', view);
       location.href = d.href;
