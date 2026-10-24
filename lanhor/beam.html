@@ -964,7 +964,7 @@ function makeMoth(x, y, look) {
     size: rand(0.9, 1.1), look: look != null ? look : U.randi(0, MOTH_LOOKS.length - 1),
     p1: rand(0, TAU), p2: rand(0, TAU), p3: rand(0, TAU), flap: rand(0, TAU),
     darkT: 0, outT: 0, lostT: 0, dazeT: 0, spin: 1,
-    nextT: 0, holdT: 0, stuckT: 0, bestD: Infinity, loopT: 0, loopA: 0,
+    nextT: 0, holdT: 0, stuckT: 0, bestD: Infinity, loopT: 0, loopA: 0, arrive: 35,   // arrive: px (at scale 1) that count as there
     glow: 0, glowMask: 0, boost: 0, crowd: 0, squash: 0, lastLit: -9, cueAt: -9,
   };
   Object.defineProperty(m, 'fx', { value: { trail: new Float32Array(TRAIL * 2), tn: 0, th: 0, rings: new Int8Array([-1, -1, -1]) }, enumerable: false });
@@ -1035,8 +1035,9 @@ function loseLight(m) {
   m.lostT = rand(0.6, 1); m.dazeT = 0.35; m.spin = Math.random() < 0.5 ? -1 : 1;
 }
 
-function setDest(m, x, y, region, bandL) {
+function setDest(m, x, y, region, bandL, tight) {
   if (m.dest) { m.dest.x = x; m.dest.y = y; } else m.dest = { x, y };
+  m.arrive = tight ? 14 : 35;   // the bright spot of a grown band is small: fly right into it
   m.region = region; m.bandL = bandL; m.floorL = region >= 0 ? floorOf(region) : BAND * bandL;
   m.nextT = rand(2, 4) / tw('roam');
   m.stuckT = 0; m.bestD = Infinity; m.holdT = 0.4;   // in a tiny band every spot is "arrived": hold each a moment
@@ -1095,7 +1096,7 @@ function pickDest(m, inRegion, nearFirst) {
     const px = M.sx[pick] + rand(-8, 8) * s, py = M.sy[pick] + rand(-8, 8) * s;
     if (cellIndex(px, py) === pick && openSpot(px, py, clear) && lightAt(px, py) >= need) { x = px; y = py; found = true; }
   }
-  setDest(m, x, y, reg, bandL);
+  setDest(m, x, y, reg, bandL, reg >= 0 && !M.ring[pick] && M.floor[reg] < BAND * M.peak[reg]);
   return true;
 }
 
@@ -1198,7 +1199,7 @@ function think(m, pr, dt) {
   if (d < m.bestD - 6 * S.scale) { m.bestD = d; m.stuckT = 0; } else m.stuckT += dt;
   m.nextT -= dt; m.holdT -= dt;
   // never hover: a new spot in the band on arrival, every few seconds while roaming, or when blocked
-  if ((d < 35 * S.scale && m.holdT <= 0) || m.stuckT > 1.6 || (m.state === 'roam' && m.nextT <= 0)) plan(m, m.region >= 0);
+  if ((d < m.arrive * S.scale && m.holdT <= 0) || m.stuckT > 1.6 || (m.state === 'roam' && m.nextT <= 0)) plan(m, m.region >= 0);
 }
 
 // neighbour separation (module-level scratch keeps the hot loop allocation-free)
