@@ -61,19 +61,21 @@ const KINDS = {
   circle: { verts: ngon(16, 0.95, 0), mat: 'stone' },
 };
 for (const k of Object.values(KINDS)) k.rmax = Math.max(...k.verts.map((v) => Math.hypot(v.x, v.y)));
-// kind, cx, cy (room fractions), size (fraction of the room's short side), rotation (deg), glass color
+// kind, cx, cy (room fractions), size (fraction of the room's short side), rotation (deg), glass color.
+// A loose ring around the open middle, where the red and the blue beam cross.
 const DEFAULT_OBJECTS = [
-  ['hex', 0.25, 0.37, 0.075, 8, null],
-  ['circle', 0.41, 0.2, 0.065, 0, null],
-  ['rect', 0.6, 0.22, 0.058, 24, 'blue'],      // in the blue beam: blue shines through
-  ['triangle', 0.73, 0.33, 0.078, 12, null],
-  ['bar', 0.76, 0.62, 0.075, 78, null],        // its shadow overlaps the green pane's: no hairline gap
-  ['square', 0.6, 0.74, 0.058, -14, 'green'],  // in the red beam: casts a red shadow
-  ['square', 0.43, 0.8, 0.064, 16, null],
-  ['triangle', 0.3, 0.635, 0.07, -24, 'red'],  // in the red beam: red shines through
+  ['hex', 0.27, 0.26, 0.075, 8, null],
+  ['circle', 0.42, 0.13, 0.06, 0, null],
+  ['rect', 0.555, 0.25, 0.058, 20, 'blue'],    // in the blue beam: blue shines through
+  ['triangle', 0.75, 0.3, 0.078, 12, null],
+  ['bar', 0.82, 0.66, 0.075, 78, null],
+  ['square', 0.67, 0.6, 0.058, -14, 'green'],  // in the red beam past the overlap: casts a red shadow
+  ['square', 0.42, 0.87, 0.064, 16, null],
+  ['triangle', 0.21, 0.67, 0.07, -24, 'red'],  // in the red beam: red shines through
   ['circle', 0.12, 0.17, 0.045, 0, null],
 ];
-const OBJECT_KEYS = { 7: 'square', 8: 'triangle', 9: 'circle', 0: 'bar', G: 'glass' };   // keys 1–6 pick colors
+const OBJECT_KEYS = [['7', 'square'], ['8', 'triangle'], ['9', 'circle'], ['0', 'bar'], ['G', 'glass']];   // keys 1–6 pick colors
+const OBJECT_OF_KEY = Object.fromEntries(OBJECT_KEYS);
 const NEW_OBJECT = {
   square: { kind: 'square', size: 0.06 },
   triangle: { kind: 'triangle', size: 0.068 },
@@ -806,6 +808,11 @@ function buildMap() {
   M.builtAt = Kit.realTime;
   replanAll();
 }
+/** Bring the beams and the map up to date now (test API; the loop throttles its own rebuilds). */
+function syncMap() {
+  if (S.dirty) recomputeBeams();
+  if (S.mapDirty) buildMap();
+}
 
 // ================================================================== creatures (moths)
 function makeMoth(x, y, look) {
@@ -818,7 +825,7 @@ function makeMoth(x, y, look) {
     p1: rand(0, TAU), p2: rand(0, TAU), p3: rand(0, TAU), flap: rand(0, TAU),
     darkT: 0, outT: 0, lostT: 0, dazeT: 0, spin: 1,
     nextT: 0, stuckT: 0, bestD: Infinity, loopT: 0, loopA: 0,
-    glow: 0, glowMask: 0, boost: 0, squash: 0, lastLit: -9, cueAt: -9,
+    glow: 0, glowMask: 0, boost: 0, crowd: 0, squash: 0, lastLit: -9, cueAt: -9,
   };
   Object.defineProperty(m, 'fx', { value: { trail: new Float32Array(TRAIL * 2), tn: 0, th: 0 }, enumerable: false });
   return m;
@@ -1026,10 +1033,11 @@ function think(m, pr, dt) {
 }
 
 // neighbour separation (module-level scratch keeps the hot loop allocation-free)
-let sepM = null, sepAx = 0, sepAy = 0, sepR = 0;
+let sepM = null, sepAx = 0, sepAy = 0, sepR = 0, sepN = 0;
 function sepVisit(o) {
   if (o === sepM) return;
   const dx = sepM.x - o.x, dy = sepM.y - o.y, d2 = dx * dx + dy * dy;
+  if (d2 < 4 * sepR * sepR) sepN++;   // close enough for their halos to pile up
   if (d2 >= sepR * sepR || d2 < 1e-6) return;
   const d = Math.sqrt(d2), f = (1 - d / sepR) / d;
   sepAx += dx * f; sepAy += dy * f;
@@ -1146,8 +1154,9 @@ function updateMoths(dt, t) {
       avoidObstacles(m, 50 * s, 220 * s, steer);
     }
     // separation spreads a swarm over its band instead of collapsing it into one dot
-    sepM = m; sepAx = 0; sepAy = 0;
-    hash.query(m.x, m.y, sepR, sepVisit);
+    sepM = m; sepAx = 0; sepAy = 0; sepN = 0;
+    hash.query(m.x, m.y, 2 * sepR, sepVisit);
+    m.crowd += (sepN - m.crowd) * (1 - Math.exp(-dt * 3));
     const sepK = (roaming ? 1300 : 900) * s;
     steer.ax += sepAx * sepK; steer.ay += sepAy * sepK;
 
@@ -1406,7 +1415,7 @@ function keydown(e) {
     if (e.repeat) return true;
     const n = +key;
     if (n >= 1 && n <= NC) setColor(COLORS[n - 1], true);
-    else addObject(OBJECT_KEYS[key]);
+    else addObject(OBJECT_OF_KEY[key]);
     return true;
   }
   if (STEP_KEYS.has(c)) {
@@ -2161,14 +2170,15 @@ function drawMothsSprite(ctx) {
       ctx.stroke();
     }
   }
-  // halo in the mix of the lamps lighting it; in an overlap a wider bloom joins it
+  // halo in the mix of the lamps lighting it; in an overlap a wider bloom joins it. Halos of a
+  // dense swarm are dimmed so they add up to a glow, not a white blot that hides the moths.
   for (const m of moths) {
     if (m.glow < 0.03 || !m.glowMask) continue;
-    const col = MIX[m.glowMask];
-    ctx.globalAlpha = 0.55 * m.glow;
+    const col = MIX[m.glowMask], k = m.glow / (1 + 0.3 * m.crowd);
+    ctx.globalAlpha = 0.55 * k;
     drawGlowSized(ctx, col, m.x, m.y, MOTH_WS * s * 1.7);
     if (m.boost > 0.02) {
-      ctx.globalAlpha = Math.min(1, 0.32 * m.boost) * m.glow;
+      ctx.globalAlpha = Math.min(1, 0.32 * m.boost) * k;
       drawGlowSized(ctx, col, m.x, m.y, MOTH_WS * s * 2.7);
     }
   }
@@ -2665,15 +2675,38 @@ const GLASS_ICON = {
   abstract: svgIcon('<rect x="5" y="5" width="14" height="14" fill="currentColor" fill-opacity="0.35"/>'),
 };
 
+// The color bar: six round swatches in one pill. Toy-local styles (kit.css stays shared), more
+// specific than the kit's own tool-button rules.
+const COLOR_BAR_CSS = `
+.bm-swatches { display: flex; align-items: center; gap: 3px; padding: 2px; border-radius: 999px;
+  background: rgba(0, 0, 0, 0.3); box-shadow: inset 0 0 0 1px var(--line); }
+.bm-swatches .kit-tool.is-swatch { width: 40px; height: 40px; padding: 0; justify-content: center;
+  border-radius: 50%; background: transparent; }
+.bm-swatches .kit-tool.is-swatch:hover { background: rgba(255, 255, 255, 0.1); }
+.bm-swatches .kit-swatch { width: 30px; height: 30px; display: grid; place-items: center;
+  font: 600 13px/1 var(--font-mono); color: rgba(0, 0, 0, 0.62);
+  box-shadow: inset 0 -2px 0 rgba(0, 0, 0, 0.2), 0 0 0 1.5px rgba(0, 0, 0, 0.4); transition: transform .15s, box-shadow .15s; }
+.bm-swatches .kit-tool.is-swatch.is-active { border-color: transparent; background: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 0 0 2px var(--sw), 0 0 20px color-mix(in srgb, var(--sw) 60%, transparent); }
+.bm-swatches .kit-tool.is-active .kit-swatch { transform: scale(1.12); color: rgba(0, 0, 0, 0.88);
+  box-shadow: inset 0 -2px 0 rgba(0, 0, 0, 0.2), 0 0 0 2px rgba(255, 255, 255, 0.92); }
+`;
+
 function setup() {
+  document.head.append(Object.assign(document.createElement('style'), { textContent: COLOR_BAR_CSS }));
   S.ui.swatch = {};
   const gColor = Kit.ui.group({ sprite: 'Lamp color', abstract: 'Light color' });
+  const bar = document.createElement('div');
+  bar.className = 'bm-swatches';
+  gColor.append(bar);
   COLORS.forEach((c, i) => {
-    S.ui.swatch[c] = Kit.ui.button({
-      parent: gColor, label: NAME[c], swatch: BASE[c], key: String(i + 1),
+    const b = Kit.ui.button({
+      parent: bar, swatch: BASE[c], iconOnly: true, key: String(i + 1),
       tip: { sprite: `${NAME[c]} light for new lamps and the selected one`, abstract: `${NAME[c]} for new lights and the selected one` },
       onClick: () => setColor(c, true),
     });
+    b.querySelector('.kit-swatch').textContent = String(i + 1);
+    S.ui.swatch[c] = b;
   });
   const gLamps = Kit.ui.group(null);
   S.ui.readout = Kit.ui.readout(gLamps);
@@ -2686,11 +2719,11 @@ function setup() {
     circle: { sprite: 'Add a round stone', abstract: 'Add a circle' },
     bar: { sprite: 'Add a plank', abstract: 'Add a bar' },
   };
-  ['square', 'triangle', 'circle', 'bar'].forEach((k, i) => {
-    Kit.ui.button({ parent: gObj, icon: k, iconOnly: true, key: String(4 + i), tip: objTips[k], onClick: () => addObject(k) });
-  });
+  for (const [key, k] of OBJECT_KEYS) {
+    if (k !== 'glass') Kit.ui.button({ parent: gObj, icon: k, iconOnly: true, key, tip: objTips[k], onClick: () => addObject(k) });
+  }
   S.ui.glassBtn = Kit.ui.button({
-    parent: gObj, icon: Kit.t(GLASS_ICON), iconOnly: true, key: '8',
+    parent: gObj, icon: Kit.t(GLASS_ICON), iconOnly: true, key: 'G',
     tip: { sprite: 'Add colored glass: only its own color shines through', abstract: 'Add a colored object: only its own color passes' },
     onClick: () => addObject('glass'),
   });
@@ -2711,36 +2744,38 @@ Kit.init({
   accentInk: '#2a1d00',
   title: { sprite: 'Moths & Lamps', abstract: 'Beam' },
   hint: {
-    sprite: 'Click the frame to hang a lamp. Drag stones to cast shadows.',
-    abstract: 'Click the frame to add a light. Drag objects to cast shadows.',
+    sprite: 'Click the frame to hang a lamp. Moths gather where beams overlap.',
+    abstract: 'Click the frame to add a light. Agents gather where lights overlap.',
   },
   about: {
-    sprite: 'On a summer night every moth flies to the lamp whose light reaches it. Hang colored lamps on the frame, then move stones and glass to steer the swarm.',
-    abstract: 'Agents move toward any light that reaches them. Add colored lights on the frame, then move objects to steer the agents; colored ones pass only their own color.',
+    sprite: 'Moths fly to the brightest light. Where beams overlap the light is stronger, and the swarm roams inside it. Move stones and glass to shape the light.',
+    abstract: 'Agents move to the brightest light. Where lights overlap the light is stronger, and the agents roam inside it. Move objects to shape the light.',
   },
   // one line per row (key chips fit the help card's key column), so the card fits a 640 px tall screen
   controls: [
     { keys: ['Click frame', 'L'], label: { sprite: 'Hang a lamp (up to five)', abstract: 'Add a light (up to five)' } },
-    { keys: ['1', '2', '3'], label: { sprite: 'Lamp color: red, green, blue', abstract: 'Light color: red, green, blue' } },
+    { keys: ['1–6'], label: { sprite: 'Lamp color, from red to purple', abstract: 'Light color, from red to purple' } },
     { keys: ['Drag'], label: { sprite: 'Slide a lamp or move an object', abstract: 'Slide a light or move an object' } },
     { keys: ['Knob', '← →'], label: { sprite: 'Aim the selected lamp', abstract: 'Aim the selected light' } },
     { keys: ['Wheel'], label: { sprite: 'Aim a lamp or turn an object', abstract: 'Aim a light or turn an object' } },
     { keys: ['Shift+wheel'], label: 'Make a beam wider or narrower (or ↑ ↓)' },
     { keys: ['Double-click'], label: { sprite: 'Switch a lamp on or off (or press O)', abstract: 'Switch a light on or off (or press O)' } },
     { keys: ['Tab', 'Esc'], label: { sprite: 'Select the next lamp, or deselect', abstract: 'Select the next light, or deselect' } },
-    { keys: ['4–8'], label: { sprite: 'Add a block, wedge, stone, plank or glass', abstract: 'Add an object; 8 adds a colored one' } },
+    { keys: ['7 8 9 0', 'G'], label: { sprite: 'Add a block, wedge, stone, plank or glass', abstract: 'Add an object; G adds a colored one' } },
     { keys: ['Q E', 'Arrows'], label: 'Turn or nudge the selected object' },
     { keys: ['Right-click'], label: { sprite: 'Remove a lamp or object (or press Delete)', abstract: 'Remove a light or object (or press Delete)' } },
   ],
   stats: [
     { id: 'lamps', label: { sprite: 'Lamps', abstract: 'Lights' }, value: '0/5' },
     { id: 'lit', label: { sprite: 'Moths lit', abstract: 'Agents in light' }, value: '0/1' },
+    { id: 'level', label: 'Brightest', value: '—' },
   ],
   tweaks: [
     { type: 'section', label: { sprite: 'Moths', abstract: 'Agents' } },
     { type: 'range', id: 'count', label: 'How many', min: 1, max: MAX_MOTHS, step: 1, value: DEFAULTS.count, onInput: (v) => setCreatureCount(v) },
     { type: 'range', id: 'speed', label: { sprite: 'Flying speed', abstract: 'Agent speed' }, min: 0.4, max: 2, step: 0.1, value: DEFAULTS.speed, format: (v) => v.toFixed(1) + '×' },
-    { type: 'range', id: 'pull', label: 'Attraction', min: 0.3, max: 2.5, step: 0.1, value: DEFAULTS.pull, format: (v) => v.toFixed(1) + '×', note: { sprite: 'How hard moths rush toward a lamp.', abstract: 'How hard agents rush toward a light.' } },
+    { type: 'range', id: 'pull', label: 'Attraction', min: 0.3, max: 2.5, step: 0.1, value: DEFAULTS.pull, format: (v) => v.toFixed(1) + '×', note: { sprite: 'How fast moths rush to the brightest light.', abstract: 'How fast agents rush to the brightest light.' } },
+    { type: 'range', id: 'roam', label: 'Roaming', min: 0.3, max: 2, step: 0.1, value: DEFAULTS.roam, format: (v) => v.toFixed(1) + '×', note: { sprite: 'How restless moths are inside the bright area.', abstract: 'How restless agents are inside the bright area.' } },
     { type: 'button', label: { sprite: 'Scatter moths', abstract: 'Scatter agents' }, onClick: scatter },
     { type: 'section', label: { sprite: 'Lamps', abstract: 'Lights' } },
     { type: 'range', id: 'reach', label: 'Beam reach', min: 200, max: 1200, step: 50, value: DEFAULTS.reach, format: (v) => v + ' px', onInput: () => { S.dirty = true; }, note: 'How far the light stays strong.' },
@@ -2772,10 +2807,13 @@ window.__toy = {
   get obstacles() { return S.obstacles; },
   get room() { return Object.assign({}, S.room); },
   get frameBand() { return S.band; },
+  COLORS,
   addLamp: (x, y, color) => addLampAt(x, y, color || S.color),
   removeLamp,
-  litBy: (c) => (c && c.target) || null,
+  litBy: (c) => (c ? sampleLight(c.x, c.y).lamp : null),   // the lamp lighting it most
   isLitPoint,
+  lightAt: (x, y) => lightAt(x, y),
+  lightMax: () => { syncMap(); return MAP.max; },
   setCreatureCount: (n) => Kit.setTweak('count', clamp(Math.round(n), 1, MAX_MOTHS)),
   // extras for tests and debugging
   get selectedLamp() { return S.selLamp; },
@@ -2786,7 +2824,14 @@ window.__toy = {
   addObject: (type, x, y) => addObject(type, x != null ? { x, y } : null),
   removeObstacle,
   beamPolygon: (l) => l.fx.poly.slice(),
-  refresh: () => { for (const l of S.lamps) placeLamp(l); for (const o of S.obstacles) updateObstacle(o); recomputeBeams(); },
+  refresh: () => { for (const l of S.lamps) placeLamp(l); for (const o of S.obstacles) updateObstacle(o); recomputeBeams(); buildMap(); },
+  /** The light map's band regions: [{peak, cells}] brightest first, plus the band threshold. */
+  bands: () => {
+    syncMap();
+    const out = MAP.peak.map((peak) => ({ peak, cells: 0 }));
+    for (let c = 0; c < MAP.n; c++) if (MAP.reg[c] >= 0) out[MAP.reg[c]].cells++;
+    return { max: MAP.max, threshold: BAND * MAP.max, beat: BEAT, regions: out };
+  },
   railPoint: (s) => Object.assign({}, railAt(s)),
   get railLength() { return S.railLen; },
 };
