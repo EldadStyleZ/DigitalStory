@@ -638,10 +638,12 @@ function bestAngle(x, y) {
   }
   return fitA !== null ? fitA : best;
 }
-/** Right-click: a new funnel at the cursor, refused on walls and on other funnels. */
+/** Right-click: a new funnel at the cursor, refused (shaking red ghost + buzz) on walls and on other funnels. */
 function createAtCursor(wx, wy) {
-  if (sdfAt(wx, wy) < 3 || funnelAt(wx, wy, 4)) {
-    S.ghost = { x: wx, y: wy, angle: S.sel ? S.sel.angle : 0, t: Kit.realTime };
+  const on = funnelAt(wx, wy);
+  if (sdfAt(wx, wy) < 3 || on) {
+    S.ghost = { x: wx, y: wy, angle: on ? on.angle : S.sel ? S.sel.angle : 0, t: Kit.realTime };
+    if (on) on.flash = 0.8;
     Kit.sfx('buzz');
     return null;
   }
@@ -756,8 +758,11 @@ function setParticleCount(n, quiet) {
   S.count = n;
   syncCountUI();
 }
+/** Live speed change: every particle's velocity scales with it at once (relaxing would take seconds when slowing). */
 function setSpeed(x) {
-  S.speed = clamp(Math.round(x * 10) / 10, 0.2, 3);
+  const v = clamp(Math.round(x * 10) / 10, 0.2, 3), k = v / S.speed;
+  if (k !== 1) for (let i = 0; i < N; i++) { VX[i] *= k; VY[i] *= k; }
+  S.speed = v;
   syncSpeedUI();
 }
 
@@ -799,11 +804,16 @@ function funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, wasIn) {
   }
   let code = 0;
   if (lx >= -F_HALF && lx <= F_HALF && ay < hwAt(lx)) {
-    // inside the cone: carried toward the spout, gently centered; a stuck particle gets nudged out
+    // inside the cone: carried toward the spout, gently centered; a stuck particle gets nudged out (out of the
+    // spout while the funnel works; at power 0 out of the nearer end, so an idle funnel pumps nothing)
     code = 1;
     const P = f.power, acc = S.speed * S.speed;
     let push = CARRY_ACC * acc * P;
-    if (tIn > STUCK_T) { push += 520 * (tIn - STUCK_T + 0.3); if (lvx < 0) lvx *= 0.8; }
+    if (tIn > STUCK_T) {
+      const dir = P > 0 || lx > 0 ? 1 : -1;
+      push += dir * 520 * (tIn - STUCK_T + 0.3);
+      if (lvx * dir < 0) lvx *= 0.8;
+    }
     lvx += push * h;
     avy -= ay * 26 * acc * P * h;
     avy *= 1 - Math.min(0.5, 3.5 * P * h);
@@ -1086,11 +1096,7 @@ function pointerDown(p) {
   if (!S.ready) return;
   updateHover(p);
   const wx = toWorldX(p.x), wy = toWorldY(p.y);
-  if (p.button === 2) {
-    if (S.hover) { S.hover.flash = 0.8; Kit.sfx('buzz', { vol: 0.5 }); }
-    else createAtCursor(wx, wy);
-    return;
-  }
+  if (p.button === 2) { createAtCursor(wx, wy); return; }
   if (p.button !== 0 || !S.hover) return;
   const f = S.hover;
   select(f);
@@ -1929,6 +1935,7 @@ window.__toy = {
   // extras for tests
   get seed() { return S.seed; },
   get selected() { return S.sel; },
+  get ghost() { return S.ghost; },                        // the red ghost of a refused placement, while it shows
   select: (f) => select(f),
   get scale() { return S.sc; },
   world: { w: WORLD_W, h: WORLD_H, funnelLength: F_LEN },
