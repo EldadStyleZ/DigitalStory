@@ -48,7 +48,8 @@ const BEAT = 1.25;            // a band this much stronger pulls committed moths
 // brightest light around it, down to GROW_FLOOR of its peak, so a swarm never jams into a frozen ball
 const BAND_MIN_CELLS = 6;
 const CELLS_PER_MOTH = 0.9;
-const GROW_FLOOR = 0.6;
+const GROW_FLOOR = 0.55;      // two-beam light (≥ 1.3) still counts round a triple overlap
+const GROW_RINGS = 4;         // and it stays within this many cells of the band, never snaking along a beam
 const DARK_GRACE = 1.5;       // s a moth keeps flying through shadow before it is lost
 const TRAIL = 14;
 const MOTH_WS = 62;           // moth wingspan (px at scale 1)
@@ -823,14 +824,35 @@ function buildMap() {
       }
     }
   }
+  mergeTouchingBands();
   growBands();
   M.builtAt = Kit.realTime;
   replanAll();
 }
 
+/** Two bands whose cells touch and whose peaks are within BAND of each other are one bright patch with
+ *  two crests (e.g. a triple overlap split by a beam edge): the dimmer one joins the brighter, so neither
+ *  is left too small to roam in. Bands apart from each other stay apart (no flip-flop between them). */
+function mergeTouchingBands() {
+  const M = MAP, cols = M.cols, rows = M.rows;
+  for (let c = 0; c < M.n; c++) {
+    const a = M.reg[c];
+    if (a < 0 || !M.isBand[a]) continue;
+    const ci = c % cols, cj = (c - ci) / cols;
+    for (let j = Math.max(0, cj - 1); j <= Math.min(rows - 1, cj + 1); j++) {
+      for (let i = Math.max(0, ci - 1); i <= Math.min(cols - 1, ci + 1); i++) {
+        const b = M.reg[j * cols + i];
+        if (b <= a || !M.isBand[b] || M.peak[b] < BAND * M.peak[a]) continue;
+        for (let q = 0; q < M.n; q++) if (M.reg[q] === b) M.reg[q] = a;
+        M.isBand[b] = false;
+      }
+    }
+  }
+}
+
 /** A band smaller than the moths that will roam in it need (CELLS_PER_MOTH each, BAND_MIN_CELLS at
  *  least) takes in the cells around it ring by ring (brightest first within a ring), down to GROW_FLOOR
- *  of its peak, so it stays centred on its brightest spot. It may take slopes, unclaimed cells, bands
+ *  of its peak and at most GROW_RINGS out, so it stays centred on its brightest spot. It may take slopes, unclaimed cells, bands
  *  the brightest one beats (their moths leave them) and bands no moth is in, never a band that still
  *  holds moths, so no moth changes band. A tiny triple overlap thus becomes the triple spot plus the two-beam light right around
  *  it: the swarm crowds round the spot and keeps moving. */
@@ -838,9 +860,15 @@ const mapRing = [];
 function growBands() {
   const M = MAP, nr = M.peak.length, cols = M.cols, rows = M.rows;
   M.floor.length = nr; M.cells.length = nr; mapLoad.length = nr;
-  M.ring.fill(0);   // for a grown cell: how many rings out from its band it was taken
+  M.ring.fill(0);   // for a grown cell: how many rings out from its band it was taken (merged crests: 1)
   for (let r = 0; r < nr; r++) { M.floor[r] = BAND * M.peak[r]; M.cells[r] = 0; mapLoad[r] = 0; }
-  for (let c = 0; c < M.n; c++) if (M.reg[c] >= 0) M.cells[M.reg[c]]++;
+  for (let c = 0; c < M.n; c++) {
+    const r = M.reg[c];
+    if (r < 0) continue;
+    M.cells[r]++;
+    if (M.L[c] < BAND * M.peak[r]) M.ring[c] = 1;
+    if (M.L[c] < M.floor[r]) M.floor[r] = M.L[c];
+  }
   if (!nr) { M.active = 0; return; }
   // the moths each band will hold: its committed ones; the rest (new, or leaving a beaten band) go to the brightest
   const beaten = (r) => BEAT * M.peak[r] <= M.max;
@@ -848,7 +876,9 @@ function growBands() {
   for (const m of S.moths) {
     if (m.state !== 'seek' && m.state !== 'roam') continue;
     active++;
+    // a moth in light its band grew over at the last rebuild still belongs to that band
     let r = m.dest ? regionNear(m.dest.x, m.dest.y) : -1;
+    if (r < 0 || M.peak[r] < 0.98 * m.bandL) { const o = ownBand(m); if (o >= 0) r = o; }
     if (r < 0 || beaten(r)) r = 0;
     mapLoad[r]++;
   }
@@ -872,8 +902,9 @@ function growBands() {
       }
     };
     front.length = 0;
+    M.mark.fill(0);
     for (let c = 0; c < M.n; c++) if (M.reg[c] === r) pushAround(c);
-    for (let ring = 1; M.cells[r] < need && front.length; ring++) {
+    for (let ring = 1; ring <= GROW_RINGS && M.cells[r] < need && front.length; ring++) {
       mapRing.length = 0;
       for (const q of front) mapRing.push(q);
       front.length = 0;
@@ -882,14 +913,29 @@ function growBands() {
         if (M.cells[r] >= need) break;
         if (!open(q, r)) continue;
         if (M.reg[q] >= 0) M.cells[M.reg[q]]--;
-        M.reg[q] = r; M.cells[r]++; M.ring[q] = Math.min(255, ring);
+        M.reg[q] = r; M.cells[r]++; M.ring[q] = ring;
         if (M.L[q] < M.floor[r]) M.floor[r] = M.L[q];
         pushAround(q);   // the next ring
       }
     }
     front.length = 0;
-    M.mark.fill(0);
   }
+  M.mark.fill(0);
+}
+
+/** The band a moth is committed to, found again after a rebuild: a band with (about) the peak it
+ *  committed to, the one nearest its destination, so two equal bands stay apart; -1 once it is gone. */
+function ownBand(m) {
+  const M = MAP, x = m.dest ? m.dest.x : m.x, y = m.dest ? m.dest.y : m.y;
+  let best = -1, bd = Infinity;
+  if (!(m.bandL > 0)) return -1;
+  for (let c = 0; c < M.n; c++) {
+    const r = M.reg[c];
+    if (r < 0 || !M.isBand[r] || Math.abs(M.peak[r] - m.bandL) > 0.02 * m.bandL) continue;
+    const d = (M.sx[c] - x) * (M.sx[c] - x) + (M.sy[c] - y) * (M.sy[c] - y);
+    if (d < bd) { bd = d; best = r; }
+  }
+  return best;
 }
 
 /** The lowest light that still counts as inside band r (a grown band reaches below BAND of its peak). */
@@ -1032,10 +1078,12 @@ function pickDest(m, inRegion) {
   const R = S.room, ci = pick % M.cols, cj = (pick - ci) / M.cols, clear = spotClear(), e = 14 * s;
   const core = BAND * bandL, need = Math.min(M.L[pick], (M.L[pick] >= core || reg < 0 ? core : floorOf(reg)) * 1.03);
   let x = M.sx[pick], y = M.sy[pick];
-  for (let k = 0; k < 6; k++) {
+  // in a sliver of light thinner than the margin, any bright enough spot will do: moths sharing one
+  // fallback point would pile up on it
+  for (let k = 0; k < 12; k++) {
     const px = R.x + (ci + Math.random()) * M.cw, py = R.y + (cj + Math.random()) * M.ch;
-    if (openSpot(px, py, clear) && lightAt(px, py) >= need &&
-      lightAt(px - e, py) >= need && lightAt(px + e, py) >= need && lightAt(px, py - e) >= need && lightAt(px, py + e) >= need) { x = px; y = py; break; }
+    if (openSpot(px, py, clear) && lightAt(px, py) >= need && (k >= 6 ||
+      (lightAt(px - e, py) >= need && lightAt(px + e, py) >= need && lightAt(px, py - e) >= need && lightAt(px, py + e) >= need))) { x = px; y = py; break; }
   }
   setDest(m, x, y, reg, bandL);
   return true;
@@ -1079,18 +1127,24 @@ function regionNear(x, y) {
 }
 
 /** After the map changes: follow a band that moved, leave one that went dark, and stream to a band
- *  that clearly beats the committed one (BEAT). An equal band elsewhere never steals a moth. A moth
- *  left in the dark with its destination re-plans too: the shadow grace in think() decides whether it
- *  reaches the light in time (a swung beam keeps its swarm); with no light anywhere it is lost at once. */
+ *  that clearly beats the committed one (BEAT). An equal band elsewhere never steals a moth: a moth
+ *  whose spot went dark or fell out of its band picks a new one inside its own band first. One left in
+ *  the dark re-plans too: the shadow grace in think() decides whether it reaches the light in time (a
+ *  swung beam keeps its swarm); with no light anywhere it is lost at once. */
 function replanAll() {
   const M = MAP;
   for (const m of S.moths) {
     if (!m.dest) continue;
-    const r = regionNear(m.dest.x, m.dest.y), destL = lightAt(m.dest.x, m.dest.y);
+    let r = regionNear(m.dest.x, m.dest.y);
+    const destL = lightAt(m.dest.x, m.dest.y);
+    // its spot is no longer in its band (a grown band shrank back): it stays with its band
+    if (r < 0 || M.peak[r] < 0.98 * m.bandL) { const o = ownBand(m); if (o >= 0) r = o; }
     if (r >= 0) { m.region = r; m.bandL = M.peak[r]; m.floorL = floorOf(r); } else m.region = -1;
-    if (destL <= 0 && lightAt(m.x, m.y) <= 0) { if (!plan(m, false)) loseLight(m); }
-    else if (destL <= 0 || r < 0 || M.max >= BEAT * m.bandL) plan(m, false);
-    else if (destL < m.floorL || !openSpot(m.dest.x, m.dest.y, spotClear())) plan(m, true);
+    const dark = destL <= 0 && lightAt(m.x, m.y) <= 0;
+    let ok = true;
+    if (r < 0 || M.max >= BEAT * m.bandL) ok = plan(m, false);   // its band is gone or clearly beaten
+    else if (destL < m.floorL || !openSpot(m.dest.x, m.dest.y, spotClear())) ok = plan(m, true);
+    if (!ok && dark) loseLight(m);   // no light anywhere
   }
 }
 
