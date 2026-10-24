@@ -758,9 +758,10 @@ function orbitFocus(l, r) {
   return focus;
 }
 
-/** A moth circling the lamp is lit while the lamp is on, it stays in the swarm around the focus
- *  (same reach as the orbit → seek switch) and nothing blocks the lens. The cone is only a few px
- *  wide there, so the plain lit test would flicker. */
+/** A moth at its lamp (circling it, or still arriving at the swarm) is lit while the lamp is on,
+ *  it stays in the swarm around the focus (same reach as the orbit → seek switch) and nothing
+ *  blocks the lens. The cone is only a few px wide there, so the plain lit test would flicker and
+ *  send swarm moths off to another lamp's beam and back. */
 function orbitLit(m, l, r) {
   if (!l.on) return false;
   const F = orbitFocus(l, r);
@@ -776,7 +777,7 @@ function senseLight(m, dt) {
   for (const l of S.lamps) {
     let I;
     if (l === m.target) {
-      I = m.state === 'orbit' && orbitLit(m, l, orbitR) ? 1 : litAmount(m.x, m.y, l, 10 * DEG);
+      I = orbitLit(m, l, orbitR) ? 1 : litAmount(m.x, m.y, l, 10 * DEG);
       curI = I;
     } else I = litAmount(m.x, m.y, l);
     if (I > bestI) { bestI = I; best = l; }
