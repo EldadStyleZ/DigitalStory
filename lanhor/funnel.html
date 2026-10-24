@@ -19,7 +19,6 @@
 // ================================================================== config
 const U = Kit.util;
 const { TAU, clamp, lerp } = U;
-const DEG = Math.PI / 180;
 
 const WORLD_W = 1600, WORLD_H = 880;
 const GRID = 4;                                      // SDF sample spacing (world units)
@@ -40,7 +39,7 @@ const PILL_AT = -14;                                 // the slider sits on the w
 // forces in world units / s² at 1× speed and 100 % power (pull and push share one power)
 const PULL_ACC = 2300, CARRY_ACC = 1700, PUSH_ACC = 1700, KICK = 300;
 const PUSH_REACH = 0.6;                              // push zone radius as a fraction of the pull reach
-const RELAX = 1.15;                                  // return to cruising speed (1/s)
+const RELAX_UP = 4, RELAX_DOWN = 1.15;               // back to cruising speed (1/s): quick after bounces, slow after a kick
 const WANDER = 1.5;                                  // random-walk heading noise (rad / √s)
 const VMAX = 1500;
 const STUCK_T = 1.3;                                 // after this long inside, a nudge guarantees the exit
@@ -50,11 +49,17 @@ const GLIDE_K = 13;
 const CLICK_PX = 5, CLICK_MS = 350;
 
 const COL = { red: '#ff4d6d', blue: '#4aa3ff', violet: '#b48cff', part: '#ece8ff' };
-const SH = { bg: '#0d0d10', dark: '#1c1c22', band: '#2c2c34', mid: '#5a5a66', light: '#9a9aa6', white: '#ffffff', red: '#ff3b30', blue: '#0a84ff' };
+const SH = { bg: '#0d0d10', band: '#2c2c34', mid: '#5a5a66', light: '#9a9aa6', white: '#ffffff', red: '#ff3b30', blue: '#0a84ff' };   // Shapes palette
 const DEFAULTS = { size: 3.5, bounce: 0.9, reach: 2.5, fields: false };
 const tw = (id) => (Kit.tweaks[id] !== undefined ? Kit.tweaks[id] : DEFAULTS[id]);
 
 const CSS = `
+/* kit-glass blurs what lies behind it; over a canvas that changes every frame a software compositor redoes
+   that blur every frame (about 10 ms at 1920 × 1080). The panels sit over the plain backdrop here, so a
+   denser fill looks the same and keeps the frame rate up. */
+.kit-glass { backdrop-filter: none; -webkit-backdrop-filter: none; background: rgba(24, 20, 48, 0.96); }
+/* kit.css gives the Sprites / Shapes buttons z-index 1, which paints them through the help overlay */
+.kit-help { z-index: 20; }
 .fn-layer { position: fixed; inset: 0; pointer-events: none; z-index: 5; overflow: hidden; }
 .fn-pos { position: absolute; left: 0; top: 0; width: 0; height: 0; }
 .fn-pill {
@@ -86,17 +91,12 @@ body.view-abstract .fn-pill.is-sel { border-color: #ffffff; }
 }
 .fn-mk:hover { background: rgba(255, 255, 255, 0.1); }
 .fn-track { position: relative; width: 70px; height: 20px; flex: none; cursor: ew-resize; }
-.fn-ramp {
-  position: absolute; left: 1px; right: 1px; top: 50%; height: 12px; margin-top: -6px;
-  clip-path: polygon(0 40%, 100% 0, 100% 100%, 0 60%);
-  background: rgba(255, 255, 255, 0.16);
-}
-.fn-fill {
-  position: absolute; inset: 0;
-  background: linear-gradient(90deg, #ff4d6d, #b48cff 55%, #4aa3ff);
-  clip-path: inset(0 calc((1 - var(--p)) * 100%) 0 0);
-}
-body.view-abstract .fn-fill { background: linear-gradient(90deg, #ff3b30 0 50%, #0a84ff 50% 100%); }
+.fn-ramp { position: absolute; left: 1px; top: 50%; width: 68px; height: 13px; margin-top: -6.5px; }
+.fn-ramp svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.fn-ramp-base { fill: rgba(236, 230, 255, 0.24); }
+.fn-ramp-fill { fill: url(#fn-grad); clip-path: inset(0 calc((1 - var(--p)) * 100%) 0 0); }
+body.view-abstract .fn-ramp-base { fill: #5a5a66; }
+body.view-abstract .fn-ramp-fill { fill: url(#fn-grad-sh); }
 .fn-thumb {
   position: absolute; top: 50%; left: calc(var(--p) * (100% - 32px)); width: 32px; height: 17px; margin-top: -8.5px;
   border-radius: 9px; background: #f6f3ff; color: #1a0f2e;
@@ -124,7 +124,7 @@ const S = {
   through: 0, exits: 0, statT: 0,
   nextId: 1,
   cursor: '',
-  layerDirty: true, layerAt: -1e9, layerTimer: 0,
+  layerDirty: true, layerAt: -1e9,
   ui: {},
 };
 
@@ -328,6 +328,8 @@ function generate(seed) {
   const used = [], spare = [];
   for (const e of edges) { const a = find(e[0]), b = find(e[1]); if (a !== b) { root[a] = b; used.push(e); } else spare.push(e); }
   used.push(...spare.slice(0, rnd() < 0.5 ? 1 : 2));
+  // one long, curved tunnel between diagonal neighbours, through the solid rock in between
+  const diag = [[0, 4], [1, 3], [1, 5], [2, 4]][Math.floor(rnd() * 4)];
   // at least three narrow tunnels and two wide gaps
   const kinds = used.map((_, i) => (i < 3 ? 'narrow' : i < 5 ? 'wide' : rnd() < 0.5 ? 'narrow' : 'wide'));
   for (let i = kinds.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [kinds[i], kinds[j]] = [kinds[j], kinds[i]]; }
@@ -344,6 +346,13 @@ function generate(seed) {
     }
     addTunnel(e[0], e[1], pts, narrow ? R(22, 30) : R(66, 96), narrow);
   });
+  {
+    const A = MAP.chambers[diag[0]], B = MAP.chambers[diag[1]], dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy);
+    const bend = R(0.12, 0.22) * (rnd() < 0.5 ? -1 : 1) * len, qx = (A.x + B.x) / 2 - (dy / len) * bend, qy = (A.y + B.y) / 2 + (dx / len) * bend;
+    const pts = [];
+    for (let k = 0; k <= 14; k++) { const t = k / 14, u = 1 - t; pts.push([u * u * A.x + 2 * u * t * qx + t * t * B.x, u * u * A.y + 2 * u * t * qy + t * t * B.y]); }
+    addTunnel(diag[0], diag[1], pts, R(22, 27), true);
+  }
   // where each connection leaves each chamber: obstacles keep clear of these mouths
   const mouths = [];
   for (const t of MAP.tunnels) for (const end of [0, 1]) {
@@ -584,6 +593,7 @@ function destroyFunnel(f, opts = {}) {
   if (S.sel === f) S.sel = null;
   if (S.hover === f) S.hover = null;
   if (S.pillHover === f) S.pillHover = null;
+  if (S.pillDrag === f) S.pillDrag = null;
   if (S.press && S.press.f === f) S.press = null;
   if (S.drag && S.drag.f === f) S.drag = null;
   if (!opts.silent) {
@@ -641,12 +651,16 @@ function createAtCursor(wx, wy) {
 function addFunnelFree() {
   if (S.funnels.length >= MAX_FUNNELS) return addFunnel(0, 0, 0);
   let best = null, bs = -1;
-  for (let tries = 0, found = 0; tries < 400 && found < 14; tries++) {
-    const s = MAP.free[(Math.random() * MAP.freeN) | 0], x = (s % GW) * GRID, y = Math.floor(s / GW) * GRID, a = Math.random() * TAU;
-    if (!fits(null, x, y, a)) continue;
-    found++;
-    const sc = openness(x, y, a);
-    if (sc > bs) { bs = sc; best = { x, y, a }; }
+  for (let tries = 0, found = 0; tries < 500 && found < 14; tries++) {
+    const s = MAP.free[(Math.random() * MAP.freeN) | 0], x = (s % GW) * GRID, y = Math.floor(s / GW) * GRID, a0 = Math.random() * TAU;
+    for (let k = 0; k < 8; k++) {
+      const a = a0 + (k * TAU) / 8;
+      if (!fits(null, x, y, a)) continue;
+      found++;
+      const sc = openness(x, y, a);
+      if (sc > bs) { bs = sc; best = { x, y, a }; }
+      break;
+    }
   }
   if (!best) { Kit.toast('No free spot for a funnel', { tone: 'bad' }); Kit.sfx('buzz'); return null; }
   return addFunnel(best.x, best.y, best.a, 0.6);
@@ -660,7 +674,7 @@ function updateFunnels(rdt) {
   const mx = (Kit.held('ArrowRight') ? 1 : 0) - (Kit.held('ArrowLeft') ? 1 : 0);
   const my = (Kit.held('ArrowDown') ? 1 : 0) - (Kit.held('ArrowUp') ? 1 : 0);
   const ml = Math.hypot(mx, my) || 1;
-  const fade = (v, target, rate) => v + (target - v) * (1 - Math.exp(-rate * rdt));
+  const fade = (v, target, rate) => (Math.abs(target - v) < 1e-3 ? target : v + (target - v) * (1 - Math.exp(-rate * rdt)));
   for (let fi = S.funnels.length - 1; fi >= 0; fi--) {
     const f = S.funnels[fi];
     f.pop = Math.min(1, f.pop + rdt / 0.42);
@@ -806,7 +820,7 @@ function simulate(dt) {
   if (dt <= 0) return;
   const sp = S.speed, cruise = BASE_SPEED * sp, acc = sp * sp, r = tw('size'), bounce = tw('bounce');
   const reach = tw('reach') * F_LEN, reach2 = reach * reach, pushR = reach * PUSH_REACH, pushR2 = pushR * pushR;
-  const relax = 1 - Math.exp(-RELAX * dt), wander = WANDER * Math.sqrt(dt) * 2.449, vmax = VMAX * sp, maxStep = r + 2.5;
+  const relaxUp = 1 - Math.exp(-RELAX_UP * dt), relaxDown = 1 - Math.exp(-RELAX_DOWN * dt), wander = WANDER * Math.sqrt(dt) * 2.449, vmax = VMAX * sp, maxStep = r + 2.5;
   const carryV = CARRY_ACC * acc * dt, B2 = F_BOUND * F_BOUND;
   let nf = 0;
   for (const f of S.funnels) { f.inside = 0; if (!f.lifted) FA[nf++] = f; }
@@ -823,7 +837,7 @@ function simulate(dt) {
       const turn = (Math.random() + Math.random() - 1) * wander * Math.min(1, cruise / v);
       const ct = Math.cos(turn), st = Math.sin(turn), rx = vx * ct - vy * st;
       vy = vx * st + vy * ct; vx = rx;
-      const k = (v + (cruise - v) * relax) / v;
+      const k = (v + (cruise - v) * (v < cruise ? relaxUp : relaxDown)) / v;
       vx *= k; vy *= k;
     }
     for (let q = 0; q < nf; q++) {
@@ -945,12 +959,19 @@ function updateFx(rdt) {
 let pillLayer = null;
 const PILL_W = 110, PILL_H = 24, THUMB_W = 32;
 const pillScale = () => clamp(S.sc * 1.15, 0.84, 1.15);
+// the power ramp: thin at the weak end, thick and rounded at the strong end
+const RAMP = '<path d="M1 5.3 L61.5 0 A6.5 6.5 0 0 1 61.5 13 L1 7.7 A1.2 1.2 0 0 1 1 5.3 Z"/>';
+const RAMP_DEFS = '<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>'
+  + '<linearGradient id="fn-grad"><stop offset="0" stop-color="#ff4d6d"/><stop offset="0.55" stop-color="#b48cff"/><stop offset="1" stop-color="#4aa3ff"/></linearGradient>'
+  + '<linearGradient id="fn-grad-sh"><stop offset="0" stop-color="#ff3b30"/><stop offset="0.5" stop-color="#ff3b30"/><stop offset="0.5" stop-color="#0a84ff"/><stop offset="1" stop-color="#0a84ff"/></linearGradient>'
+  + '</defs></svg>';
 function makePill(f) {
   const pos = document.createElement('div');
   pos.className = 'fn-pos';
   const pill = document.createElement('div');
   pill.className = 'fn-pill';
-  pill.innerHTML = '<span class="fn-mk" data-step="-1">−</span><div class="fn-track"><div class="fn-ramp"><div class="fn-fill"></div></div>'
+  pill.innerHTML = '<span class="fn-mk" data-step="-1">−</span><div class="fn-track"><div class="fn-ramp">'
+    + `<svg class="fn-ramp-base" viewBox="0 0 68 13">${RAMP}</svg><svg class="fn-ramp-fill" viewBox="0 0 68 13">${RAMP}</svg></div>`
     + '<div class="fn-thumb"><span></span></div></div><span class="fn-mk" data-step="1">+</span>';
   pos.append(pill);
   pillLayer.append(pos);
@@ -1170,16 +1191,18 @@ function placeDefaultFunnels() {
     }
   }
   const f1 = a1 && addFunnel(a1.x, a1.y, a1.a, 0.6, { quiet: true, keepSel: true });
-  // one elsewhere, aimed across another chamber
+  // one elsewhere, aimed across another chamber: the longest open run ahead of the spout wins
   let a2 = null;
   MAP.chambers.forEach((ch, ci) => {
     if (a1 && ci === a1.ci) return;
-    for (let k = 0; k < 24; k++) {
-      const a = (k / 24) * TAU, c = Math.cos(a), s = Math.sin(a);
-      for (const back of [50, 80, 110]) {
-        const x = ch.x - c * back, y = ch.y - s * back;
+    for (let gy = -0.6; gy <= 0.61; gy += 0.3) for (let gx = -0.6; gx <= 0.61; gx += 0.3) {
+      const x = ch.x + gx * ch.hx, y = ch.y + gy * ch.hy;
+      for (let k = 0; k < 16; k++) {
+        const a = (k / 16) * TAU, c = Math.cos(a), s = Math.sin(a);
+        const ahead = rayFree(x + c * F_HALF, y + s * F_HALF, c, s, 640, 10);
+        if (ahead < 240 || (a2 && ahead + 300 < a2.score)) continue;
         if (!fits(null, x, y, a)) continue;
-        const score = rayFree(x + c * F_HALF, y + s * F_HALF, c, s, 600, 10) + 0.5 * rayFree(x - c * F_HALF, y - s * F_HALF, -c, -s, 300, 10);
+        const score = ahead + 0.5 * rayFree(x - c * F_HALF, y - s * F_HALF, -c, -s, 300, 10);
         if (!a2 || score > a2.score) a2 = { x, y, a, score };
       }
     }
@@ -1199,13 +1222,13 @@ function buildDefaultScene() {
   const f1 = placeDefaultFunnels();
   for (const f of S.funnels) { f.pop = 1; f.lift = 0; f.glow = f.power; }
   select(f1 || S.funnels[0] || null);
+  Kit.setHint(null);   // keep the opening hint until someone touches a funnel
   for (let k = 0; k < 100; k++) simulate(1 / 60);
   S.exits = 0;
   S.through = S.funnels.reduce((n, f) => n + f.through, 0) / (100 / 60);
   for (const f of S.funnels) f.through = 0;
   S.ready = true;
   updateCounts();
-  refreshHint();
 }
 /** A new maze (random seed unless given). Particles in new walls jump to free spots; funnels glide clear. */
 function newMap(seed) {
@@ -1264,6 +1287,7 @@ function buildLayer() {
   const upp = 1 / (sc * dpr);                      // world units per device pixel
   const bhx = WORLD_W / 2 - BOARD_R, bhy = WORLD_H / 2 - BOARD_R;
   const LX = -0.55, LY = -0.83;                    // light from the top left
+  const F0 = U.hexToRgb(SH.bg), F1 = U.hexToRgb(SH.band), F2 = U.hexToRgb(SH.mid);   // Shapes: floor, rock, outline
   for (let py = 0; py < ph; py++) {
     const wy = ((y0 + py + 0.5) / dpr - S.oy) / sc;
     for (let px = 0; px < pw; px++) {
@@ -1278,8 +1302,7 @@ function buildLayer() {
       if (abs) {
         // flat floor, flat walls, one plain outline
         const line = clamp(1.25 - Math.abs(dp + 0.4), 0, 1);
-        r = lerp(13, 44, wall); gg = lerp(13, 44, wall); b = lerp(16, 52, wall);
-        r = lerp(r, 90, line); gg = lerp(gg, 90, line); b = lerp(b, 102, line);
+        r = lerp(lerp(F0.r, F1.r, wall), F2.r, line); gg = lerp(lerp(F0.g, F1.g, wall), F2.g, line); b = lerp(lerp(F0.b, F1.b, wall), F2.b, line);
       } else {
         let nx = 0, ny = 0;
         if (d < 14 && d > -14) {
@@ -1296,6 +1319,10 @@ function buildLayer() {
         // walls: lit bevel along the edge, darker deep inside
         const depth = -d, deep = U.smoothstep(0, 28, depth), bevel = 1 - U.smoothstep(0, 9, depth);
         let wr = lerp(56, 30, deep), wg = lerp(46, 25, deep), wb = lerp(104, 62, deep);
+        if (depth > 14) {   // faint engraved contour lines follow the rock's shape
+          const q = ((depth - 14) % 18) - 9, iso = Math.exp(-(q * q) / (upp * upp * 0.9)) * 0.55 * U.smoothstep(14, 30, depth);
+          wr += iso * 14; wg += iso * 12; wb += iso * 30;
+        }
         if (lit > 0) { wr += bevel * lit * 74; wg += bevel * lit * 64; wb += bevel * lit * 130; }
         else { const k = 1 + bevel * lit * 0.4; wr *= k; wg *= k; wb *= k; }
         r = lerp(fr, wr, wall); gg = lerp(fg, wg, wall); b = lerp(fb, wb, wall);
@@ -1313,6 +1340,7 @@ function buildLayer() {
   S.layerAt = performance.now();
 }
 
+
 // ================================================================== rendering: shared helpers
 /** Wall center line, smoothed through the profile points (deviates < 1 unit from the collision polyline). */
 function wallPath(ctx, side) {
@@ -1328,6 +1356,7 @@ function bodyPath(ctx) {
   ctx.quadraticCurveTo(PROF_X[1], -PROF_H[1], PROF_X[0], -PROF_H[0]);
   ctx.closePath();
 }
+function bothWalls(ctx) { ctx.beginPath(); wallPath(ctx, 1); wallPath(ctx, -1); }
 /** Enter a funnel's local frame (world units); returns the scale used. */
 function enterFunnel(ctx, f, extra) {
   const pop = f.pop < 1 ? Math.max(0.05, U.easeOutBack(f.pop)) : 1, k = S.sc * pop * (1 + f.lift * 0.05) * (extra || 1);
@@ -1351,119 +1380,173 @@ function bucketize() {
     BIDX[b][BN[b]++] = i;
   }
 }
-const DASH = [6, 7], NO_DASH = [];
+const DASH = [6, 7], GHOST_DASH = [10, 8], NO_DASH = [];
 
-// ================================================================== rendering: sprites (glowing particles, glassy funnels)
-let GR = null;
-function spriteGrads(ctx) {
-  if (GR) return GR;
-  const wall = ctx.createLinearGradient(-F_HALF, 0, F_HALF, 0);
-  wall.addColorStop(0, COL.red); wall.addColorStop(0.5, COL.violet); wall.addColorStop(1, COL.blue);
-  const body = ctx.createLinearGradient(-F_HALF, 0, F_HALF, 0);
-  body.addColorStop(0, 'rgba(255, 77, 109, 0.24)'); body.addColorStop(0.5, 'rgba(180, 140, 255, 0.10)'); body.addColorStop(1, 'rgba(74, 163, 255, 0.26)');
-  const mouth = ctx.createRadialGradient(-F_HALF, 0, 0, -F_HALF, 0, 84);
-  mouth.addColorStop(0, 'rgba(255, 77, 109, 0.5)'); mouth.addColorStop(1, 'rgba(255, 77, 109, 0)');
-  const spout = ctx.createRadialGradient(F_HALF, 0, 0, F_HALF, 0, 50);
-  spout.addColorStop(0, 'rgba(74, 163, 255, 0.75)'); spout.addColorStop(1, 'rgba(74, 163, 255, 0)');
-  GR = { wall, body, mouth, spout };
-  return GR;
+// ---- funnel sprites: painted once per scale and view, then blitted rotated every frame (much cheaper to raster)
+const SP_BX = F_HALF + 14, SP_BY = PROF_H[0] + 14;            // body sprite half extents (world units)
+const GLOW_M = 62, GLOW_S = 38;                                 // glow radii at the mouth and the spout
+const GLOW_LEVELS = 16;                                        // glow brightness steps (drawn at alpha 1: far cheaper)
+const FSP = { key: '', body: null, hot: null, shadow: null, glowM: null, glowS: null };
+function paintSprite(w0, h0, x0, y0, k, paint) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.ceil(w0 * k)); c.height = Math.max(1, Math.ceil(h0 * k));
+  const g = c.getContext('2d');
+  g.setTransform(k, 0, 0, k, -x0 * k, -y0 * k);
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  paint(g);
+  return c;
 }
+/** Glow discs at GLOW_LEVELS brightness steps, painted on first use. */
+function glowDiscs(r, k, col, a0, a1) {
+  const levels = [];
+  return (level) => levels[level] || (levels[level] = paintSprite(2 * r, 2 * r, -r, -r, k, (g) => {
+    const m = (level + 1) / GLOW_LEVELS, gr = g.createRadialGradient(0, 0, 0, 0, 0, r);
+    gr.addColorStop(0, U.rgba(col, a0 * m)); gr.addColorStop(0.42, U.rgba(col, a1 * m)); gr.addColorStop(1, U.rgba(col, 0));
+    g.fillStyle = gr; g.fillRect(-r, -r, 2 * r, 2 * r);
+  }));
+}
+function funnelSprites() {
+  const k = S.sc * Kit.dpr, key = Kit.view + ':' + k.toFixed(4);
+  if (FSP.key === key) return FSP;
+  FSP.key = key;
+  const abs = Kit.isAbstract, R = abs ? SHAPES : SPRITES, px = 1 / S.sc;   // px: one CSS pixel in world units
+  const body = (paint) => paintSprite(2 * SP_BX, 2 * SP_BY, -SP_BX, -SP_BY, k, paint);
+  FSP.body = body((g) => R.paintBody(g, px));
+  FSP.hot = body((g) => { g.strokeStyle = SH.white; g.lineWidth = F_WALL * 2 + 7; bothWalls(g); g.stroke(); });
+  FSP.shadow = abs ? null : body((g) => SPRITES.paintShadow(g));
+  FSP.glowM = abs ? null : glowDiscs(GLOW_M, k, COL.red, 0.5, 0.16);
+  FSP.glowS = abs ? null : glowDiscs(GLOW_S, k, COL.blue, 0.75, 0.22);
+  return FSP;
+}
+/** Blit an unrotated, centered sprite at a whole device pixel (the cheap path for the round glows). */
+function blitCentered(ctx, img, cx, cy) {
+  const d = Kit.dpr;
+  ctx.drawImage(img, Math.round(cx * d - img.width / 2) / d, Math.round(cy * d - img.height / 2) / d, img.width / d, img.height / d);
+}
+/** A resting funnel: its body pre-rotated once (exact angle and sub-pixel offset) into its own canvas, then
+ *  blitted without a transform each frame (a rotated blit costs ~15× more on a software canvas). */
+function blitResting(ctx, f, sp, x, y) {
+  const d = Kit.dpr, px = x * d, py = y * d, ix = Math.floor(px), iy = Math.floor(py), fx = px - ix, fy = py - iy;
+  let c = f.cache;
+  if (!c) c = f.cache = { cv: document.createElement('canvas'), body: null, angle: NaN, fx: -1, fy: -1, half: 0 };
+  if (c.body !== sp.body || c.angle !== f.angle || c.fx !== fx || c.fy !== fy) {
+    const half = Math.ceil(Math.hypot(SP_BX, SP_BY) * S.sc * d) + 2, k = S.sc * d;
+    c.body = sp.body; c.angle = f.angle; c.fx = fx; c.fy = fy; c.half = half;
+    c.cv.width = c.cv.height = 2 * half;
+    const g = c.cv.getContext('2d');
+    g.translate(half + fx, half + fy); g.rotate(f.angle); g.scale(k, k);
+    g.drawImage(sp.body, -SP_BX, -SP_BY, 2 * SP_BX, 2 * SP_BY);
+  }
+  ctx.drawImage(c.cv, (ix - c.half) / d, (iy - c.half) / d, (2 * c.half) / d, (2 * c.half) / d);
+}
+/** A funnel: glows, shadow while lifted, hover outline, body; chevrons on top while it works. */
+function drawFunnel(ctx, f, rt, R, alpha, extra) {
+  const sp = funnelSprites(), sc = S.sc, x = S.ox + f.x * sc, y = S.oy + f.y * sc - f.lift * 5;
+  const pop = f.pop < 1 ? Math.max(0.05, U.easeOutBack(f.pop)) : 1, m = sc * pop * (1 + f.lift * 0.05) * extra;
+  ctx.save();
+  if (sp.glowM && pop > 0.6) {
+    const level = Math.round(alpha * (0.15 + 0.85 * f.glow) * GLOW_LEVELS) - 1, h = F_HALF * m;
+    if (level >= 0) {
+      ctx.globalCompositeOperation = 'lighter';
+      blitCentered(ctx, sp.glowM(level), x - f.c * h, y - f.s * h);
+      blitCentered(ctx, sp.glowS(level), x + f.c * h, y + f.s * h);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+  ctx.globalAlpha = alpha;
+  if (sp.shadow && f.lift > 0.02) {
+    ctx.save();
+    ctx.globalAlpha = alpha * Math.min(1, f.lift * 1.5);
+    ctx.translate(x + (3 + f.lift * 9) * sc, y + (6 + f.lift * 13) * sc);
+    ctx.rotate(f.angle); ctx.scale(m, m);
+    ctx.drawImage(sp.shadow, -SP_BX, -SP_BY, 2 * SP_BX, 2 * SP_BY);
+    ctx.restore();
+  }
+  const hot = Math.max(f.hot * 0.45, f.flash * 0.8);
+  if (hot <= 0.01 && m === sc && alpha === 1 && !f.lifted && f.w === 0 && f.wd === 0) blitResting(ctx, f, sp, x, y);
+  else {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(f.angle); ctx.scale(m, m);
+    if (hot > 0.01) { ctx.globalAlpha = alpha * hot; ctx.drawImage(sp.hot, -SP_BX, -SP_BY, 2 * SP_BX, 2 * SP_BY); ctx.globalAlpha = alpha; }
+    ctx.drawImage(sp.body, -SP_BX, -SP_BY, 2 * SP_BX, 2 * SP_BY);
+    ctx.restore();
+  }
+  ctx.translate(x, y); ctx.rotate(f.angle); ctx.scale(m, m);
+  if (R.chevrons && !f.lifted && f.glow > 0.02) R.chevrons(ctx, f, rt, m);
+  ctx.restore();
+}
+
+// ================================================================== rendering: sprites (bright particles, glassy funnels)
+const CHEVRON = Array.from({ length: 16 }, (_, i) => U.mixHex('#2a2148', '#ffffff', 0.08 + (i / 15) * 0.32));
 const SPRITES = {
+  paintBody(g, px) {
+    const wall = g.createLinearGradient(-F_HALF, 0, F_HALF, 0);
+    wall.addColorStop(0, COL.red); wall.addColorStop(0.5, COL.violet); wall.addColorStop(1, COL.blue);
+    const fill = g.createLinearGradient(-F_HALF, 0, F_HALF, 0);
+    fill.addColorStop(0, 'rgba(255, 77, 109, 0.26)'); fill.addColorStop(0.5, 'rgba(180, 140, 255, 0.10)'); fill.addColorStop(1, 'rgba(74, 163, 255, 0.28)');
+    g.fillStyle = fill; bodyPath(g); g.fill();
+    g.strokeStyle = wall; g.lineWidth = F_WALL * 2; bothWalls(g); g.stroke();
+    g.strokeStyle = 'rgba(255, 255, 255, 0.6)'; g.lineWidth = 1.3 * px; bothWalls(g); g.stroke();
+    g.fillStyle = '#ffd0d9';
+    g.beginPath(); g.arc(PROF_X[0], PROF_H[0], F_WALL * 0.75, 0, TAU); g.arc(PROF_X[0], -PROF_H[0], F_WALL * 0.75, 0, TAU); g.fill();
+    g.fillStyle = '#d4ebff';
+    g.beginPath(); g.arc(PROF_X[5], PROF_H[5], F_WALL * 0.75, 0, TAU); g.arc(PROF_X[5], -PROF_H[5], F_WALL * 0.75, 0, TAU); g.fill();
+  },
+  paintShadow(g) {
+    g.strokeStyle = '#020108';
+    for (const [w, a] of [[F_WALL * 2 + 9, 0.12], [F_WALL * 2 + 5, 0.16], [F_WALL * 2 + 1.5, 0.22]]) { g.globalAlpha = a; g.lineWidth = w; bothWalls(g); g.stroke(); }
+  },
+  chevrons(ctx, f, t, m) {
+    // chevrons travel toward the spout, faster with more power; they swell in and out instead of fading
+    // (filled, opaque, pre-mixed with the cone's tint: translucent strokes are slow on a software canvas)
+    const P = f.glow, th = (2.6 / m) * S.sc;
+    ctx.fillStyle = CHEVRON[Math.min(15, Math.round(Math.min(1, P * 1.6) * 15))];
+    ctx.beginPath();
+    for (let c = 0; c < 3; c++) {
+      const ph = (t * (0.35 + 1.1 * P) + c / 3) % 1, lx = -F_HALF + 24 + ph * (F_LEN - 48), hw = (hwAt(lx) - F_WALL - 5) * Math.sin(ph * Math.PI);
+      ctx.moveTo(lx - hw * 0.4, -hw * 0.62); ctx.lineTo(lx, 0); ctx.lineTo(lx - hw * 0.4, hw * 0.62);
+      ctx.lineTo(lx - hw * 0.4 - th, hw * 0.62); ctx.lineTo(lx - th, 0); ctx.lineTo(lx - hw * 0.4 - th, -hw * 0.62);
+      ctx.closePath();
+    }
+    ctx.fill();
+  },
   particles(ctx) {
-    // one opaque fill per color bucket (in small chunks: far cheaper to raster than strokes or glows):
-    // each particle is a comet, a round head with a tapered tail that grows with speed
+    // vector fallback for HiDPI screens (GPU canvases): one opaque fill per color bucket, dots plus short trails
     bucketize();
-    const sc = S.sc, ox = S.ox, oy = S.oy, r = tw('size') * sc;
+    const sc = S.sc, ox = S.ox, oy = S.oy, r = tw('size') * sc, fast = BASE_SPEED * S.speed * 1.3;
     for (let b = 0; b < BK; b++) {
       const n = BN[b], idx = BIDX[b];
       if (!n) continue;
-      ctx.fillStyle = BCOL[b];
-      for (let s0 = 0; s0 < n; s0 += 40) {
-        ctx.beginPath();
-        for (let k = s0, e = Math.min(n, s0 + 40); k < e; k++) {
-          const i = idx[k], x = ox + PX[i] * sc, y = oy + PY[i] * sc, vx = VX[i], vy = VY[i], v = Math.hypot(vx, vy) || 1;
-          const ux = vx / v, uy = vy / v, tail = r * 1.6 + clamp(v * 0.034 - 3, 0, 26) * sc;
-          ctx.moveTo(x + r, y);
-          ctx.arc(x, y, r, 0, TAU);
-          ctx.moveTo(x - ux * tail, y - uy * tail);   // same winding as the arc, so the two shapes merge
-          ctx.lineTo(x + uy * r, y - ux * r);
-          ctx.lineTo(x - uy * r, y + ux * r);
-          ctx.closePath();
+      ctx.beginPath();
+      for (let k = 0; k < n; k++) {
+        const i = idx[k], x = ox + PX[i] * sc, y = oy + PY[i] * sc;
+        ctx.moveTo(x + r, y);
+        ctx.arc(x, y, r, 0, TAU);
+        const vx = VX[i], vy = VY[i], v = Math.hypot(vx, vy);
+        if (v > fast) {
+          // fast ones leave a short tapered trail of shrinking dots
+          const l = Math.min((v - fast) * 0.012, 9) * sc / v;
+          let tx = x - vx * l, ty = y - vy * l, tr = r * 0.78;
+          ctx.moveTo(tx + tr, ty); ctx.arc(tx, ty, tr, 0, TAU);
+          tx -= vx * l; ty -= vy * l; tr = r * 0.55;
+          ctx.moveTo(tx + tr, ty); ctx.arc(tx, ty, tr, 0, TAU);
         }
-        ctx.fill();
       }
+      ctx.fillStyle = BCOL[b];
+      ctx.fill();
     }
-  },
-  funnelBack(ctx, f, t) {
-    const G = spriteGrads(ctx);
-    // a soft shadow; while lifted the funnel floats higher above it
-    ctx.save();
-    ctx.translate(3 * S.sc + f.lift * 8 * S.sc, 6 * S.sc + f.lift * 12 * S.sc);
-    enterFunnel(ctx, f);
-    ctx.globalAlpha = 0.4;
-    ctx.strokeStyle = '#04030b';
-    ctx.lineWidth = F_WALL * 2 + 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    ctx.beginPath(); wallPath(ctx, 1); wallPath(ctx, -1); ctx.stroke();
-    ctx.restore();
-    ctx.save();
-    const k = enterFunnel(ctx, f), P = f.glow;
-    ctx.globalCompositeOperation = 'lighter';
-    ctx.globalAlpha = 0.18 + 0.82 * P;
-    ctx.fillStyle = G.mouth; ctx.beginPath(); ctx.arc(-F_HALF, 0, 84, 0, TAU); ctx.fill();
-    ctx.fillStyle = G.spout; ctx.beginPath(); ctx.arc(F_HALF, 0, 50, 0, TAU); ctx.fill();
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = G.body; bodyPath(ctx); ctx.fill();
-    // chevrons travel toward the spout, faster with more power
-    if (P > 0.02) {
-      ctx.lineWidth = 2.4 / k * S.sc; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-      ctx.strokeStyle = '#ffffff';
-      for (let c = 0; c < 4; c++) {
-        const ph = (t * (0.35 + 1.1 * P) + c / 4) % 1, lx = -F_HALF + 16 + ph * (F_LEN - 34), hw = hwAt(lx) - F_WALL - 5;
-        ctx.globalAlpha = Math.sin(ph * Math.PI) * 0.45 * Math.min(1, P * 1.6);
-        ctx.beginPath(); ctx.moveTo(lx - hw * 0.4, -hw * 0.62); ctx.lineTo(lx, 0); ctx.lineTo(lx - hw * 0.4, hw * 0.62); ctx.stroke();
-      }
-    }
-    ctx.restore();
-  },
-  funnelFront(ctx, f, t, alpha) {
-    const G = spriteGrads(ctx);
-    ctx.save();
-    const k = enterFunnel(ctx, f, alpha < 1 ? 1 + (1 - alpha) * 0.3 : 1);
-    ctx.globalAlpha = alpha;
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    if (f.hot > 0.01 || f.flash > 0) {
-      ctx.globalAlpha = alpha * Math.max(f.hot * 0.32, f.flash * 0.6);
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = F_WALL * 2 + 7;
-      ctx.beginPath(); wallPath(ctx, 1); wallPath(ctx, -1); ctx.stroke();
-      ctx.globalAlpha = alpha;
-    }
-    ctx.strokeStyle = G.wall;
-    ctx.lineWidth = F_WALL * 2;
-    ctx.beginPath(); wallPath(ctx, 1); wallPath(ctx, -1); ctx.stroke();
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
-    ctx.lineWidth = 1.3 / k * S.sc;
-    ctx.beginPath(); wallPath(ctx, 1); wallPath(ctx, -1); ctx.stroke();
-    // bright lips: red at the mouth, blue at the spout
-    ctx.fillStyle = '#ffd0d9';
-    ctx.beginPath(); ctx.arc(PROF_X[0], PROF_H[0], F_WALL * 0.75, 0, TAU); ctx.arc(PROF_X[0], -PROF_H[0], F_WALL * 0.75, 0, TAU); ctx.fill();
-    ctx.fillStyle = '#d4ebff';
-    ctx.beginPath(); ctx.arc(PROF_X[5], PROF_H[5], F_WALL * 0.75, 0, TAU); ctx.arc(PROF_X[5], -PROF_H[5], F_WALL * 0.75, 0, TAU); ctx.fill();
-    ctx.restore();
   },
   fields(ctx, f, reach, pushR) {
+    // soft bubbles in front of the mouth (pull) and behind the spout (push), strongest at the opening
     ctx.save();
     enterFunnel(ctx, f);
     const P = f.glow;
-    const gp = ctx.createRadialGradient(-F_HALF, 0, 0, -F_HALF, 0, reach);
-    gp.addColorStop(0, `rgba(255, 77, 109, ${0.2 * P})`); gp.addColorStop(1, 'rgba(255, 77, 109, 0)');
-    ctx.fillStyle = gp;
-    ctx.beginPath(); ctx.arc(-F_HALF, 0, reach, Math.PI / 2, Math.PI * 1.5); ctx.closePath(); ctx.fill();
-    const gq = ctx.createRadialGradient(F_HALF, 0, 0, F_HALF, 0, pushR);
-    gq.addColorStop(0, `rgba(74, 163, 255, ${0.22 * P})`); gq.addColorStop(1, 'rgba(74, 163, 255, 0)');
-    ctx.fillStyle = gq;
-    ctx.beginPath(); ctx.arc(F_HALF, 0, pushR, -Math.PI / 2, Math.PI / 2); ctx.closePath(); ctx.fill();
+    for (const [x0, dir, r, col, a] of [[-F_HALF, -1, reach / 2, '255, 77, 109', 0.26], [F_HALF, 1, pushR / 2, '74, 163, 255', 0.28]]) {
+      const g = ctx.createRadialGradient(x0, 0, 0, x0 + dir * r, 0, r);
+      g.addColorStop(0, `rgba(${col}, ${a * P})`); g.addColorStop(0.4, `rgba(${col}, ${a * 0.4 * P})`); g.addColorStop(1, `rgba(${col}, 0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(x0 + dir * r, 0, r, 0, TAU); ctx.fill();
+    }
     ctx.restore();
   },
   fx(ctx) {
@@ -1497,18 +1580,18 @@ function wallHalf(ctx, side, spoutHalf) {
     for (let k = 3; k <= 5; k++) ctx.lineTo(PROF_X[k], PROF_H[k] * side);
   }
 }
-function flatBody(ctx) {
-  ctx.beginPath();
-  ctx.moveTo(PROF_X[0], PROF_H[0]);
-  for (let k = 1; k <= 5; k++) ctx.lineTo(PROF_X[k], PROF_H[k]);
-  for (let k = 5; k >= 0; k--) ctx.lineTo(PROF_X[k], -PROF_H[k]);
-  ctx.closePath();
-}
 const SHAPES = {
+  paintBody(g) {
+    // walls only (particles inside stay visible): red mouth half, blue spout half
+    g.lineWidth = F_WALL * 2;
+    g.strokeStyle = SH.red; g.beginPath(); wallHalf(g, 1, false); wallHalf(g, -1, false); g.stroke();
+    g.strokeStyle = SH.blue; g.beginPath(); wallHalf(g, 1, true); wallHalf(g, -1, true); g.stroke();
+  },
+  chevrons: null,
   particles(ctx) {
     bucketize();
     const sc = S.sc, ox = S.ox, oy = S.oy, r = tw('size') * sc;
-    for (const group of [[0, 1, 4], [2, 3], [5, 6]]) {
+    for (const group of SHAPE_GROUPS) {
       ctx.beginPath();
       for (const b of group) {
         const idx = BIDX[b];
@@ -1521,38 +1604,14 @@ const SHAPES = {
       ctx.fill();
     }
   },
-  funnelBack(ctx, f) {
-    ctx.save();
-    enterFunnel(ctx, f);
-    ctx.fillStyle = SH.dark;
-    flatBody(ctx); ctx.fill();
-    ctx.restore();
-  },
-  funnelFront(ctx, f, t, alpha) {
-    ctx.save();
-    enterFunnel(ctx, f, alpha < 1 ? 1 + (1 - alpha) * 0.3 : 1);
-    ctx.globalAlpha = alpha;
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    if (f.hot > 0.3 || f.flash > 0.2 || f.lifted) {
-      ctx.strokeStyle = SH.white;
-      ctx.lineWidth = F_WALL * 2 + 5;
-      ctx.beginPath(); wallHalf(ctx, 1, false); wallHalf(ctx, 1, true); wallHalf(ctx, -1, false); wallHalf(ctx, -1, true); ctx.stroke();
-    }
-    ctx.lineWidth = F_WALL * 2;
-    ctx.strokeStyle = SH.red;
-    ctx.beginPath(); wallHalf(ctx, 1, false); wallHalf(ctx, -1, false); ctx.stroke();
-    ctx.strokeStyle = SH.blue;
-    ctx.beginPath(); wallHalf(ctx, 1, true); wallHalf(ctx, -1, true); ctx.stroke();
-    ctx.restore();
-  },
   fields(ctx, f, reach, pushR) {
     ctx.save();
     enterFunnel(ctx, f);
-    ctx.globalAlpha = 0.1 * Math.min(1, f.glow * 2);
+    ctx.globalAlpha = 0.12 * Math.min(1, f.glow * 2);
     ctx.fillStyle = SH.red;
-    ctx.beginPath(); ctx.arc(-F_HALF, 0, reach, Math.PI / 2, Math.PI * 1.5); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.arc(-F_HALF - reach / 2, 0, reach / 2, 0, TAU); ctx.fill();
     ctx.fillStyle = SH.blue;
-    ctx.beginPath(); ctx.arc(F_HALF, 0, pushR, -Math.PI / 2, Math.PI / 2); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.arc(F_HALF + pushR / 2, 0, pushR / 2, 0, TAU); ctx.fill();
     ctx.restore();
   },
   fx(ctx) {
@@ -1572,7 +1631,99 @@ const SHAPES = {
     ctx.restore();
   },
 };
+const SHAPE_GROUPS = [[0, 1, 4], [2, 3], [5, 6]];
 
+// ================================================================== rendering: particles stamped into a frame buffer
+// At 1× pixel density the maze layer is copied into a frame buffer, every particle is stamped in as an
+// anti-aliased, sub-pixel positioned dot (plus a trailing dot when fast), and one putImageData shows it.
+// On a software canvas this is several times cheaper than rastering 2000 vector shapes.
+const PB = { w: 0, h: 0, img: null, d32: null, bg: null, key: '', kers: null };
+const SUB = 4;                                   // sub-pixel phases per axis
+const RGB = new Uint8Array(BK * 3), RGB_SH = new Uint8Array(BK * 3);
+for (let b = 0; b < BK; b++) {
+  const c = U.hexToRgb(BCOL[b]), d = U.hexToRgb(BCOL_SH[b]);
+  RGB.set([c.r, c.g, c.b], b * 3); RGB_SH.set([d.r, d.g, d.b], b * 3);
+}
+const useStamp = () => Kit.dpr <= 1.25;
+/** Keep a copy of the finished maze layer as the frame buffer's background. */
+function captureLayer() {
+  if (!useStamp()) { PB.bg = null; return; }
+  const w = layer.width, h = layer.height;
+  PB.bg = new Uint32Array(layer.getContext('2d').getImageData(0, 0, w, h).data.buffer);
+  if (PB.w !== w || PB.h !== h || !PB.img) {
+    PB.w = w; PB.h = h;
+    PB.img = new ImageData(w, h);
+    PB.d32 = new Uint32Array(PB.img.data.buffer);
+  }
+}
+/** Dot kernels (head and trail), each in SUB × SUB sub-pixel phases, stored sparse: buffer offsets
+ *  relative to the dot's pixel; fully covered pixels first (plain stores), then the soft edge (weights 1–255). */
+function makeKernels(R, soft, W) {
+  const out = [];
+  for (const [rr, gain] of [[R, 1], [R * 0.72, 0.75], [0, 0]]) {
+    if (!gain) { out.push(haloKernel(R, W)); continue; }
+    const h = Math.ceil(rr + soft + 1), phases = [];
+    for (let sy = 0; sy < SUB; sy++) for (let sx = 0; sx < SUB; sx++) {
+      const fx = (sx + 0.5) / SUB, fy = (sy + 0.5) / SUB, full = [], off = [], wt = [];
+      for (let y = -h; y <= h; y++) for (let x = -h; x <= h; x++) {
+        const a = Math.round(clamp((rr + soft / 2 - Math.hypot(x + 0.5 - fx, y + 0.5 - fy)) / soft, 0, 1) * gain * 256);
+        if (a >= 256) full.push(y * W + x);
+        else if (a > 0) { off.push(y * W + x); wt.push(a); }
+      }
+      phases.push({ full: Int32Array.from(full), off: Int32Array.from(off), wt: Int32Array.from(wt) });
+    }
+    out.push({ h, phases });
+  }
+  return out;
+}
+/** A soft halo around tinted particles (the glow of a stream); weights only, no solid core. */
+function haloKernel(R, W) {
+  const reach = R + 3.5, h = Math.ceil(reach + 1), phases = [];
+  for (let sy = 0; sy < SUB; sy++) for (let sx = 0; sx < SUB; sx++) {
+    const fx = (sx + 0.5) / SUB, fy = (sy + 0.5) / SUB, off = [], wt = [];
+    for (let y = -h; y <= h; y++) for (let x = -h; x <= h; x++) {
+      const d = Math.hypot(x + 0.5 - fx, y + 0.5 - fy);
+      if (d < R - 1) continue;   // the head covers the middle
+      const t = 1 - clamp((d - R * 0.4) / (reach - R * 0.4), 0, 1), a = Math.round(t * t * 0.34 * 256);
+      if (a >= 3) { off.push(y * W + x); wt.push(a); }
+    }
+    phases.push({ full: new Int32Array(0), off: Int32Array.from(off), wt: Int32Array.from(wt) });
+  }
+  return { h, phases };
+}
+function stamp(k, x, y, cr, cg, cb) {
+  const ix = x | 0, iy = y | 0, h = k.h;
+  if (ix < h || iy < h || ix + h >= PB.w || iy + h >= PB.h) return;
+  const ph = k.phases[(((y - iy) * SUB) | 0) * SUB + (((x - ix) * SUB) | 0)], d = PB.d32, base = iy * PB.w + ix;
+  const full = ph.full, off = ph.off, wt = ph.wt, solid = 0xff000000 | (cb << 16) | (cg << 8) | cr;
+  for (let j = 0, n = full.length; j < n; j++) d[base + full[j]] = solid;
+  for (let j = 0, n = off.length; j < n; j++) {
+    const o = base + off[j], p = d[o], a = wt[j], na = 256 - a;
+    const r = ((p & 255) * na + cr * a) >> 8, g = (((p >> 8) & 255) * na + cg * a) >> 8, b = (((p >> 16) & 255) * na + cb * a) >> 8;
+    d[o] = 0xff000000 | (b << 16) | (g << 8) | r;
+  }
+}
+function stampParticles() {
+  const abs = Kit.isAbstract, dpr = Kit.dpr, sc = S.sc * dpr, ox = S.ox * dpr, oy = S.oy * dpr;
+  const R = tw('size') * sc, key = (abs ? 'a' : 's') + R.toFixed(2) + ':' + PB.w;
+  if (PB.key !== key) { PB.key = key; PB.kers = makeKernels(R, abs ? 1.1 : 1.4, PB.w); }
+  const k0 = PB.kers[0], k1 = PB.kers[1], k2 = PB.kers[2], cols = abs ? RGB_SH : RGB, fast = BASE_SPEED * S.speed * 1.3;
+  for (let i = 0; i < N; i++) {
+    const w = WARM[i], c = COOL[i];
+    let b = 0;
+    if (w > c) { if (w > 0.12) b = w > 0.72 ? 3 : w > 0.4 ? 2 : 1; } else if (c > 0.12) b = c > 0.72 ? 6 : c > 0.4 ? 5 : 4;
+    const cr = cols[b * 3], cg = cols[b * 3 + 1], cb = cols[b * 3 + 2], x = ox + PX[i] * sc, y = oy + PY[i] * sc;
+    if (!abs) {
+      if (b === 2 || b === 3 || b === 5 || b === 6) stamp(k2, x, y, cr, cg, cb);   // pulled and ejected ones glow
+      const vx = VX[i], vy = VY[i], v = Math.hypot(vx, vy);
+      if (v > fast) {   // fast ones leave a short trail
+        const l = (Math.min((v - fast) * 0.014, 7) * sc) / v;
+        stamp(k1, x - vx * l, y - vy * l, cr, cg, cb);
+      }
+    }
+    stamp(k0, x, y, cr, cg, cb);
+  }
+}
 // ================================================================== rendering: overlays + frame
 function drawOverlays(ctx, rt) {
   const abs = Kit.isAbstract, sc = S.sc;
@@ -1599,7 +1750,7 @@ function drawOverlays(ctx, rt) {
       ctx.globalAlpha = k;
       ctx.strokeStyle = abs ? SH.red : '#ff3b5c';
       ctx.lineWidth = F_WALL * 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-      ctx.setLineDash([10, 8]);
+      ctx.setLineDash(GHOST_DASH);
       ctx.beginPath(); wallPath(ctx, 1); wallPath(ctx, -1); ctx.stroke();
       ctx.restore();
     }
@@ -1613,16 +1764,23 @@ function render(ctx, rdt) {
   updateFunnels(rdt);
   updateFx(rdt);
   if (Kit.mouse.inside && !S.drag) updateHover(Kit.mouse);
-  if (S.layerDirty && performance.now() - S.layerAt > 140) buildLayer();
-  ctx.drawImage(layer, 0, 0, Kit.W, Kit.H);
+  if (S.layerDirty && performance.now() - S.layerAt > 140) { buildLayer(); captureLayer(); }
+  const stamped = useStamp() && PB.bg;
+  if (stamped) { PB.d32.set(PB.bg); stampParticles(); ctx.putImageData(PB.img, 0, 0); }
+  else ctx.drawImage(layer, 0, 0, Kit.W, Kit.H);
   if (tw('fields')) {
     const reach = tw('reach') * F_LEN, pushR = reach * PUSH_REACH;
+    ctx.save();
+    U.roundRect(ctx, S.ox, S.oy, WORLD_W * S.sc, WORLD_H * S.sc, BOARD_R * S.sc);
+    ctx.clip();
     for (const f of S.funnels) if (!f.lifted && f.power > 0) R.fields(ctx, f, reach, pushR);
+    ctx.restore();
   }
-  for (const f of S.funnels) R.funnelBack(ctx, f, rt);
-  R.particles(ctx);
-  for (const f of S.funnels) R.funnelFront(ctx, f, rt, 1);
-  for (const f of S.dead) R.funnelFront(ctx, f, rt, 1 - f.die);
+  // lifted funnels float above everything; with vector particles, resting ones lie under them
+  for (const f of S.funnels) if (!f.lifted) drawFunnel(ctx, f, rt, R, 1, 1);
+  if (!stamped) R.particles(ctx);
+  for (const f of S.funnels) if (f.lifted) drawFunnel(ctx, f, rt, R, 1, 1);
+  for (const f of S.dead) drawFunnel(ctx, f, rt, R, 1 - f.die, 1 + f.die * 0.3);
   R.fx(ctx);
   drawOverlays(ctx, rt);
   positionPills();
@@ -1673,6 +1831,7 @@ function setup() {
   document.head.append(style);
   pillLayer = document.createElement('div');
   pillLayer.className = 'fn-layer';
+  pillLayer.innerHTML = RAMP_DEFS;
   document.body.append(pillLayer);
   generate(DEFAULT_SEED);
   const gp = Kit.ui.group('Particles');
@@ -1697,14 +1856,14 @@ Kit.init({
   accentInk: '#1a0f2e',
   title: 'Funnel',
   hint: 'Drag a funnel to move it. Right-click empty space for a new one. Hold A or D to turn it.',
-  about: 'Particles race through a maze of rounded walls. Every funnel pulls them into its red mouth and shoots them out of its blue spout, with the same power on both sides. Everything that goes in comes out.',
+  about: 'Particles race through a maze of rounded walls. Each funnel pulls them into its red mouth and shoots them out of its blue spout, with equal power. Everything that goes in comes out.',
   controls: [
     { keys: ['Right-click'], label: 'Add a funnel on empty space (up to 12)' },
-    { keys: ['Drag'], label: 'Move a funnel anywhere; it settles in free space' },
+    { keys: ['Drag'], label: 'Move a funnel; it settles in free space' },
     { keys: ['Click'], label: 'Remove a funnel (Z brings it back)' },
-    { keys: ['A', 'D'], label: 'Turn the funnel under the mouse, or the selected one' },
+    { keys: ['A', 'D'], label: 'Turn the hovered or selected funnel' },
     { keys: ['Slider', 'W S'], label: 'Power: pull and push are always equal' },
-    { keys: ['Wheel'], label: 'Turn a funnel, or set power over its slider' },
+    { keys: ['Wheel'], label: 'Turn a funnel; over its slider, set power' },
     { keys: ['Arrows'], label: 'Move the selected funnel' },
     { keys: ['Tab', 'Esc'], label: 'Select the next funnel, or deselect' },
     { keys: ['Delete', 'X'], label: 'Remove the selected funnel' },
@@ -1750,6 +1909,7 @@ window.__toy = {
     get count() { return N; },
     x: (i) => PX[i], y: (i) => PY[i], vx: (i) => VX[i], vy: (i) => VY[i],
     insideOf: (i) => (INF[i] >= 0 ? S.slots[INF[i]] : null),
+    tint: (i) => ({ warm: WARM[i], cool: COOL[i] }),
     get radius() { return tw('size'); },
   },
   get funnels() { return S.funnels; },
