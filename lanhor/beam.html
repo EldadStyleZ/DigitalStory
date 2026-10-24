@@ -1504,12 +1504,13 @@ function moveMoth(m, dt, rad) {
   const px = m.x, py = m.y;
   const n = Math.min(8, Math.ceil((Math.hypot(m.vx, m.vy) * dt) / (rad * 0.6)) || 1);
   for (let k = 0; k < n; k++) {
+    const sx = m.x, sy = m.y;
     m.x += (m.vx * dt) / n; m.y += (m.vy * dt) / n;
-    pushOutOfObstacles(m, rad);
+    pushOutOfObstacles(m, rad, sx, sy);
     keepInRoom(m, rad);
   }
   // pushed out of one object into another, or against the wall: settle, else step back
-  for (let k = 0; k < 2 && insideObstacle(m.x, m.y); k++) { pushOutOfObstacles(m, rad); keepInRoom(m, rad); }
+  for (let k = 0; k < 2 && insideObstacle(m.x, m.y); k++) { pushOutOfObstacles(m, rad, px, py); keepInRoom(m, rad); }
   if (insideObstacle(m.x, m.y) && !insideObstacle(px, py)) { m.x = px; m.y = py; m.vx *= -0.4; m.vy *= -0.4; }
   if (insideObstacle(m.x, m.y)) escapeObjects(m, rad);
 }
@@ -1524,10 +1525,29 @@ function escapeObjects(m, rad) {
   }
 }
 
-function pushOutOfObstacles(m, rad) {
+/** A mirror is thinner than a moth: one pressed against it (wedged there by another object) could cross
+ *  its centre line in a single small move and be pushed out of the far face. When the move from (sx, sy)
+ *  crossed that line within the mirror's length, the moth goes back to the side it came from, a body's
+ *  radius off the face, and its speed into the mirror bounces as on any other object. */
+function keepMirrorSide(m, o, rad, sx, sy) {
+  const ux = Math.cos(o.rot), uy = Math.sin(o.rot);
+  const c0 = (sy - o.by) * ux - (sx - o.bx) * uy, c1 = (m.y - o.by) * ux - (m.x - o.bx) * uy;
+  if (c0 === 0 || c0 * c1 > 0) return false;
+  const a0 = (sx - o.bx) * ux + (sy - o.by) * uy, a1 = (m.x - o.bx) * ux + (m.y - o.by) * uy;
+  if (Math.abs(a0 + ((a1 - a0) * c0) / (c0 - c1)) >= 1.6 * o.r) return false;   // went round an end
+  const side = c0 > 0 ? 1 : -1, nx = -uy * side, ny = ux * side, c = (0.065 * o.r + rad) * side;
+  m.x = o.bx + ux * a1 - uy * c; m.y = o.by + uy * a1 + ux * c;
+  const vn = m.vx * nx + m.vy * ny;
+  if (vn < 0) { m.vx -= 1.5 * vn * nx; m.vy -= 1.5 * vn * ny; }
+  return true;
+}
+
+/** Push a moth out of every object it overlaps; (sx, sy): where its move started (a mirror keeps it on that side). */
+function pushOutOfObstacles(m, rad, sx, sy) {
   for (const o of S.obstacles) {
     const ddx = m.x - o.bx, ddy = m.y - o.by;
     if (ddx * ddx + ddy * ddy > (o.br + rad) * (o.br + rad)) continue;
+    if (isMirror(o) && keepMirrorSide(m, o, rad, sx, sy)) continue;
     const pts = o.points, n = pts.length;
     let best = Infinity, qx = 0, qy = 0;
     for (let i = 0, j = n - 1; i < n; j = i++) {
@@ -3297,9 +3317,10 @@ const MIRROR_ICON = svgIcon('<path d="M3 16.5h18"/><path d="M6.5 16.5l-2 3.5M10.
 
 // Toy-local styles (kit.css stays shared), more specific than the kit's own rules: the color bar (six
 // round swatches in one pill), a slightly tighter toolbar, and a help card whose "How to play" column
-// is wide enough for the objects row on one line (the "Everywhere" column keeps room to spare).
+// is wide enough for the objects row on one line, also in the fallback fonts a computer uses offline when
+// the kit's web fonts cannot load (the "Everywhere" column keeps room to spare).
 const TOY_CSS = `
-@media (min-width: 861px) { .kit-help-cols { grid-template-columns: 1.7fr 1fr; } }
+@media (min-width: 861px) { .kit-help-cols { grid-template-columns: 2fr 1fr; } }
 .bm-swatches { display: flex; align-items: center; gap: 2px; padding: 2px; border-radius: 999px;
   background: rgba(0, 0, 0, 0.3); box-shadow: inset 0 0 0 1px var(--line); }
 .bm-swatches .kit-tool.is-swatch { width: 38px; height: 40px; padding: 0; justify-content: center;
