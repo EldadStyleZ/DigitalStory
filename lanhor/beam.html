@@ -721,7 +721,7 @@ function recomputeBeams() {
  * small for its moths then grows into the brightest light around it (growBands). */
 const MAP = {
   cols: 0, rows: 0, n: 0, cw: 1, ch: 1, max: 0, builtAt: -9, active: 0,
-  L: new Float32Array(0), sx: new Float32Array(0), sy: new Float32Array(0), ok: new Uint8Array(0), mark: new Uint8Array(0),
+  L: new Float32Array(0), sx: new Float32Array(0), sy: new Float32Array(0), ok: new Uint8Array(0), mark: new Uint8Array(0), ring: new Uint8Array(0),
   reg: new Int16Array(0), crowd: new Float32Array(0), w: new Float32Array(0),
   peak: [], isBand: [], floor: [], cells: [],   // per region: brightest L, real band or slope, lowest L it holds, size
 };
@@ -764,7 +764,7 @@ function buildMap() {
   if (n !== M.n) {
     M.n = n;
     for (const k of ['L', 'sx', 'sy', 'crowd', 'w']) M[k] = new Float32Array(n);
-    M.ok = new Uint8Array(n); M.mark = new Uint8Array(n); M.reg = new Int16Array(n);
+    M.ok = new Uint8Array(n); M.mark = new Uint8Array(n); M.ring = new Uint8Array(n); M.reg = new Int16Array(n);
   }
   M.cols = cols; M.rows = rows; M.cw = R.w / cols; M.ch = R.h / rows;
   for (let j = 0, c = 0; j < rows; j++) {
@@ -838,6 +838,7 @@ const mapRing = [];
 function growBands() {
   const M = MAP, nr = M.peak.length, cols = M.cols, rows = M.rows;
   M.floor.length = nr; M.cells.length = nr; mapLoad.length = nr;
+  M.ring.fill(0);   // for a grown cell: how many rings out from its band it was taken
   for (let r = 0; r < nr; r++) { M.floor[r] = BAND * M.peak[r]; M.cells[r] = 0; mapLoad[r] = 0; }
   for (let c = 0; c < M.n; c++) if (M.reg[c] >= 0) M.cells[M.reg[c]]++;
   if (!nr) { M.active = 0; return; }
@@ -872,7 +873,7 @@ function growBands() {
     };
     front.length = 0;
     for (let c = 0; c < M.n; c++) if (M.reg[c] === r) pushAround(c);
-    while (M.cells[r] < need && front.length) {
+    for (let ring = 1; M.cells[r] < need && front.length; ring++) {
       mapRing.length = 0;
       for (const q of front) mapRing.push(q);
       front.length = 0;
@@ -881,7 +882,7 @@ function growBands() {
         if (M.cells[r] >= need) break;
         if (!open(q, r)) continue;
         if (M.reg[q] >= 0) M.cells[M.reg[q]]--;
-        M.reg[q] = r; M.cells[r]++;
+        M.reg[q] = r; M.cells[r]++; M.ring[q] = Math.min(255, ring);
         if (M.L[q] < M.floor[r]) M.floor[r] = M.L[q];
         pushAround(q);   // the next ring
       }
@@ -990,8 +991,8 @@ function setDest(m, x, y, region, bandL) {
 /** Pick a destination from the light map. Across the room (inRegion false): a cell of the brightest
  *  band, nearer ones first. Inside the moth's own band (inRegion true): any cell of its region but the
  *  ones right next to it, so it keeps travelling all over the band. Cells that other moths head for or
- *  sit in count less, so a swarm spreads out; the cells a band grew by count less the dimmer they are,
- *  so the swarm stays densest in the brightest light. */
+ *  sit in count less, so a swarm spreads out; the cells a band grew by count less the further out they
+ *  are, so the swarm stays densest round its brightest spot. */
 function pickDest(m, inRegion) {
   const M = MAP, n = M.n, s = S.scale;
   if (!(M.max > 0) || (inRegion && !(m.region >= 0 && m.region < M.peak.length))) return false;
@@ -1005,12 +1006,12 @@ function pickDest(m, inRegion) {
   let total = 0;
   for (let c = 0; c < n; c++) {
     let w = 0;
-    const r = M.reg[c], core = r >= 0 ? BAND * M.peak[r] : 0, grown = r >= 0 && M.L[c] < core;
+    const r = M.reg[c], grown = M.ring[c] > 0;   // grown: a cell the band took in to fit its moths
     if (M.ok[c] && (inRegion ? r === m.region : M.L[c] >= thr || (grown && M.peak[r] >= thr))) {
       const d = Math.hypot(M.sx[c] - m.x, M.sy[c] - m.y);
       const near = inRegion ? (d < 70 * s || c === cur ? 0.08 : 1) : 1 / (1 + d / (220 * s));
       w = near / (1 + 1.5 * M.crowd[c]);
-      if (grown) w *= Math.pow(M.L[c] / core, 3);
+      if (grown) w *= Math.pow(0.6, M.ring[c]);
     }
     M.w[c] = w; total += w;
   }
