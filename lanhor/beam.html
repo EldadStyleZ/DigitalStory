@@ -96,7 +96,7 @@ const S = {
   color: 'red',
   selLamp: null, selObj: null,
   hover: { lamp: null, obj: null, handle: false, frame: false },
-  ghost: { x: 0, y: 0, nx: 0, ny: 1, angle: 0, on: false, id: 0, fx: { pulse: 0, jolt: 0 } },   // doubles as a lamp for drawing
+  ghost: { x: 0, y: 0, nx: 0, ny: 1, angle: 0, on: false, id: 0, fx: { pulse: 0 } },   // doubles as a lamp for drawing
   drag: null,
   dirty: true,
   mapDirty: true,     // the light map is behind the beams
@@ -397,7 +397,7 @@ function makeLamp(s, color) {
   Object.defineProperty(l, 'fx', {
     value: {
       inKey: [0, 0, 0, 0, '', -1],                 // inputs of the last computeBeam
-      poly: [], polyColor: '', path: null, far: 40, grad: null, gradKey: '', power: 1, pulse: 0, flick: 1, jolt: 0,
+      poly: [], polyColor: '', path: null, far: 40, grad: null, gradKey: '', power: 1, pulse: 0, flick: 1,
       painted: { path: null, vis: -1, key: '' },   // what the sprite floor currently shows for this beam
     },
     enumerable: false,
@@ -625,8 +625,11 @@ function litDist(px, py, l) {
 }
 /** What one beam adds to the light strength L at distance d: 1 at the lamp, 0.65 from `reach` on. */
 const strengthAt = (d) => 1 - FALLOFF * Math.min(1, d / reachPx());
-/** Visible brightness of one beam at distance d (rims, glass glow, dust). */
-const glowAt = (d) => 1 / (1 + d / reachPx());
+/** Visible brightness of lamp l at (x, y), 0 when dark (rim light, glass glow, dust). */
+function beamGlow(x, y, l) {
+  const d = litDist(x, y, l);
+  return d < 0 ? 0 : 1 / (1 + d / reachPx());
+}
 
 /** Light at a point: L sums every lamp that lights it, whatever its color, so overlaps are stronger.
  *  Also reports how many lamps light it, their colors as a bit mask and the strongest of them. */
@@ -684,17 +687,15 @@ function recomputeBeams() {
       if (nx * (mx - o.bx) + ny * (my - o.by) < 0) { nx = -nx; ny = -ny; }
       for (const l of S.lamps) {
         if (!l.on || nx * (l.ox - mx) + ny * (l.oy - my) <= 0) continue;
-        const d = litDist(mx + nx * 2, my + ny * 2, l);
-        if (d >= 0) el[j * NC + CI[l.color]] += glowAt(d);
+        el[j * NC + CI[l.color]] += beamGlow(mx + nx * 2, my + ny * 2, l);
       }
     }
     let g = 0;
     if (o.glass) {
-      const glassGlowAt = (x, y, l) => { const d = litDist(x, y, l); return d < 0 ? 0 : glowAt(d); };
       for (const l of S.lamps) {
         if (l.color !== o.glass) continue;
-        g = Math.max(g, glassGlowAt(o.bx, o.by, l));
-        for (const p of pts) g = Math.max(g, glassGlowAt(lerp(p.x, o.bx, 0.35), lerp(p.y, o.by, 0.35), l));
+        g = Math.max(g, beamGlow(o.bx, o.by, l));
+        for (const p of pts) g = Math.max(g, beamGlow(lerp(p.x, o.bx, 0.35), lerp(p.y, o.by, 0.35), l));
       }
     }
     o.glow = g;
@@ -809,12 +810,14 @@ function buildMap() {
 function makeMoth(x, y, look) {
   const m = {
     x, y, vx: 0, vy: 0, h: rand(0, TAU), wh: rand(0, TAU),
-    state: 'wander', target: null,
+    state: 'wander', dest: null,   // dest: where it flies while the light draws it
+    L: 0, n: 0,                    // light strength at its position, and how many lamps make it
+    region: -1, bandL: 0,          // the bright band it is committed to: light-map region and its peak
     size: rand(0.9, 1.1), look: look != null ? look : U.randi(0, MOTH_LOOKS.length - 1),
     p1: rand(0, TAU), p2: rand(0, TAU), p3: rand(0, TAU), flap: rand(0, TAU),
-    unlitT: 0, switchT: 0, lostT: 0, dazeT: 0, spin: 1,
-    orbitA: rand(0, TAU), orbitDir: Math.random() < 0.5 ? 1 : -1, bumpT: rand(0.5, 1.4),
-    glow: 0, glowColor: 'red', squash: 0, lastLit: -9,
+    darkT: 0, outT: 0, lostT: 0, dazeT: 0, spin: 1,
+    nextT: 0, stuckT: 0, bestD: Infinity, loopT: 0, loopA: 0,
+    glow: 0, glowMask: 0, boost: 0, squash: 0, lastLit: -9, cueAt: -9,
   };
   Object.defineProperty(m, 'fx', { value: { trail: new Float32Array(TRAIL * 2), tn: 0, th: 0 }, enumerable: false });
   return m;
@@ -856,7 +859,7 @@ function setCreatureCount(n) {
 function scatter() {
   for (const m of S.moths) {
     let ax = rand(-1, 1), ay = rand(-1, 1);
-    if (m.target) { ax += (m.x - m.target.x) * 0.02; ay += (m.y - m.target.y) * 0.02; }
+    if (m.dest) { ax += (m.x - m.dest.x) * 0.02; ay += (m.y - m.dest.y) * 0.02; }
     const d = Math.hypot(ax, ay) || 1, sp = rand(260, 380) * S.scale;
     loseLight(m);
     m.dazeT = rand(0.9, 1.4); m.lostT = m.dazeT + 0.2;
@@ -865,69 +868,160 @@ function scatter() {
   Kit.sfx('whoosh', { pitch: 1.2 });
 }
 
-function seekLight(m, l) {
-  const wasDark = !m.target;
-  m.target = l; m.state = 'seek'; m.unlitT = 0; m.switchT = 0; m.glowColor = l.color;
-  if (wasDark && Kit.time - m.lastLit > 1.2) {
-    burst(m.x, m.y, BASE[l.color], 9, 120);
+/** A beam reached a moth: it starts for the brightest band. */
+function startSeek(m, pr) {
+  if (Kit.time - m.lastLit > 1.2) {
+    burst(m.x, m.y, BASE[pr.lamp.color], 9, 120);
     Kit.sfx('chirp', { gap: 220, vol: 0.55, pitch: rand(0.9, 1.15) });
     if (!S.litToastShown) {
       S.litToastShown = true;
       Kit.toast(Kit.pick('A moth spotted the light', 'An agent entered the light'), { tone: 'good' });
     }
   }
-  m.lastLit = Kit.time;
+  m.state = 'seek'; m.darkT = 0; m.lastLit = Kit.time;
+  plan(m, false);
 }
 
 function loseLight(m) {
-  m.target = null; m.state = 'lost';
+  m.state = 'lost'; m.dest = null; m.region = -1;
   m.lostT = rand(0.6, 1); m.dazeT = 0.35; m.spin = Math.random() < 0.5 ? -1 : 1;
 }
 
-/** The point moths circle: in front of the lens along the beam, kept clear of the wall. */
-const focus = { x: 0, y: 0 };
-function orbitFocus(l, r) {
-  let fx = Math.cos(l.angle) * r * 1.3, fy = Math.sin(l.angle) * r * 1.3;
-  const n = fx * l.nx + fy * l.ny, minN = r * 0.8;
-  if (n < minN) { fx += l.nx * (minN - n); fy += l.ny * (minN - n); }
-  focus.x = l.ox + fx; focus.y = l.oy + fy;
-  return focus;
+function setDest(m, x, y, region, bandL) {
+  if (m.dest) { m.dest.x = x; m.dest.y = y; } else m.dest = { x, y };
+  m.region = region; m.bandL = bandL;
+  m.nextT = rand(2, 4) / tw('roam');
+  m.stuckT = 0; m.bestD = Infinity;
 }
 
-/** A moth at its lamp (circling it, or still arriving at the swarm) is lit while the lamp is on,
- *  it stays in the swarm around the focus (same reach as the orbit → seek switch) and nothing
- *  blocks the lens. The cone is only a few px wide there, so the plain lit test would flicker and
- *  send swarm moths off to another lamp's beam and back. */
-function orbitLit(m, l, r) {
-  if (!l.on) return false;
-  const F = orbitFocus(l, r);
-  return U.dist(m.x, m.y, F.x, F.y) < r * 3.4 &&
-    !segBlocked(l.ox, l.oy, l.ox + Math.cos(l.angle) * r, l.oy + Math.sin(l.angle) * r, l.color);
-}
-
-/** Decide which lamp (if any) a moth follows, with hysteresis so it commits to one beam. */
-function senseLight(m, dt) {
-  if (m.dazeT > 0) { m.dazeT -= dt; return; }
-  const orbitR = 30 * S.scale;
-  let best = null, bestI = 0, curI = 0;
-  for (const l of S.lamps) {
-    let I;
-    if (l === m.target) {
-      I = orbitLit(m, l, orbitR) ? 1 : litAmount(m.x, m.y, l, 10 * DEG);
-      curI = I;
-    } else I = litAmount(m.x, m.y, l);
-    if (I > bestI) { bestI = I; best = l; }
+/** Pick a destination from the light map. Across the room (inRegion false): a cell of the brightest
+ *  band, nearer ones first. Inside the moth's own band (inRegion true): a cell of its region, rather
+ *  one a little way off so it keeps travelling. Cells that other moths head for or sit in count less,
+ *  so a swarm spreads out over the band. */
+function pickDest(m, inRegion) {
+  const M = MAP, n = M.n, s = S.scale;
+  if (!(M.max > 0) || (inRegion && !(m.region >= 0 && m.region < M.peak.length))) return false;
+  M.crowd.fill(0);
+  for (const o of S.moths) {
+    if (o === m) continue;
+    if (o.dest) M.crowd[cellIndex(o.dest.x, o.dest.y)] += 1;
+    M.crowd[cellIndex(o.x, o.y)] += 0.4;
   }
-  if (m.target) {
-    if (curI > 0) {
-      m.unlitT = 0;
-      m.lastLit = Kit.time;
-      if (best !== m.target && bestI > curI * 1.5) { m.switchT += dt; if (m.switchT > 0.6) seekLight(m, best); } else m.switchT = 0;
-    } else {
-      m.unlitT += dt;
-      if (m.unlitT > 0.3) { if (best) seekLight(m, best); else loseLight(m); }
+  const thr = BAND * M.max, cur = m.dest ? cellIndex(m.dest.x, m.dest.y) : -1;
+  let total = 0;
+  for (let c = 0; c < n; c++) {
+    let w = 0;
+    if (M.ok[c] && (inRegion ? M.reg[c] === m.region : M.L[c] >= thr)) {
+      const d = Math.hypot(M.sx[c] - m.x, M.sy[c] - m.y);
+      const near = inRegion ? (d < 70 * s || c === cur ? 0.08 : 1 / (1 + d / (500 * s))) : 1 / (1 + d / (220 * s));
+      w = near / (1 + 1.5 * M.crowd[c]);
     }
-  } else if (best) seekLight(m, best);
+    M.w[c] = w; total += w;
+  }
+  if (total <= 0) return false;
+  let r = Math.random() * total, pick = -1;
+  for (let c = 0; c < n; c++) {
+    if (M.w[c] <= 0) continue;
+    pick = c; r -= M.w[c];
+    if (r <= 0) break;
+  }
+  const reg = M.reg[pick], bandL = reg >= 0 ? M.peak[reg] : M.L[pick];
+  // a random open spot in that cell still in the band (a little inside its edge), else the cell's sample point
+  const R = S.room, ci = pick % M.cols, cj = (pick - ci) / M.cols, clear = spotClear();
+  const need = Math.min(M.L[pick], BAND * bandL * 1.03);
+  let x = M.sx[pick], y = M.sy[pick];
+  for (let k = 0; k < 6; k++) {
+    const px = R.x + (ci + Math.random()) * M.cw, py = R.y + (cj + Math.random()) * M.ch;
+    if (openSpot(px, py, clear) && lightAt(px, py) >= need) { x = px; y = py; break; }
+  }
+  setDest(m, x, y, reg, bandL);
+  return true;
+}
+
+/** The map missed this moth's beam (too narrow to sample): an open spot nearby that is about as bright. */
+function pickNear(m) {
+  const s = S.scale, own = lightAt(m.x, m.y), clear = spotClear();
+  if (own <= 0) return false;
+  for (let k = 0; k < 12; k++) {
+    const a = rand(0, TAU), d = rand(30, 140) * s, x = m.x + Math.cos(a) * d, y = m.y + Math.sin(a) * d;
+    if (openSpot(x, y, clear) && lightAt(x, y) >= own * 0.95) { setDest(m, x, y, -1, own); return true; }
+  }
+  return false;
+}
+
+/** A new destination inside the moth's own band, or across the room in the brightest band. */
+function plan(m, inRegion) {
+  const prev = m.region;
+  const ok = (inRegion && pickDest(m, true)) || pickDest(m, false) || pickNear(m);
+  if (ok && !inRegion && m.region !== prev) m.state = 'seek';
+  return ok;
+}
+
+/** Light-map region at (x, y), or the brightest one next to it (the spot itself may have just been covered). */
+function regionNear(x, y) {
+  const M = MAP;
+  if (!M.n) return -1;
+  const c = cellIndex(x, y);
+  if (M.reg[c] >= 0) return M.reg[c];
+  const ci = c % M.cols, cj = (c - ci) / M.cols;
+  let best = -1;
+  for (let j = Math.max(0, cj - 1); j <= Math.min(M.rows - 1, cj + 1); j++) {
+    for (let i = Math.max(0, ci - 1); i <= Math.min(M.cols - 1, ci + 1); i++) {
+      const r = M.reg[j * M.cols + i];
+      if (r >= 0 && (best < 0 || M.peak[r] > M.peak[best])) best = r;
+    }
+  }
+  return best;
+}
+
+/** After the map changes: follow a band that moved, leave one that went dark, and stream to a band
+ *  that clearly beats the committed one (BEAT). An equal band elsewhere never steals a moth. */
+function replanAll() {
+  const M = MAP;
+  for (const m of S.moths) {
+    if (!m.dest) continue;
+    const r = regionNear(m.dest.x, m.dest.y), destL = lightAt(m.dest.x, m.dest.y);
+    if (r >= 0) { m.region = r; m.bandL = M.peak[r]; } else m.region = -1;
+    if (destL <= 0 && lightAt(m.x, m.y) <= 0) loseLight(m);
+    else if (destL <= 0 || r < 0 || M.max >= BEAT * m.bandL) plan(m, false);
+    else if (destL < BAND * m.bandL || !openSpot(m.dest.x, m.dest.y, spotClear())) plan(m, true);
+  }
+}
+
+/** Take in the light at the moth's position (pr); entering an overlap gets a small cue. */
+function feelLight(m, pr) {
+  if (pr.n >= 2 && m.n < 2 && (m.state === 'seek' || m.state === 'roam') && Kit.time - m.cueAt > 2.5) {
+    m.cueAt = Kit.time; m.squash = 0.8;
+    burst(m.x, m.y, SH.white, 6, 110);
+    Kit.sfx('chime', { gap: 320, vol: 0.22, pitch: 1.1 + 0.12 * (pr.n - 2) });
+    if (!S.overlapToastShown) {
+      S.overlapToastShown = true;
+      Kit.toast(Kit.pick('Two beams shine brighter than one', 'Two lights add up to a stronger one'), { tone: 'good' });
+    }
+  }
+  m.L = pr.L; m.n = pr.n;
+  if (pr.mask) m.glowMask = pr.mask;
+}
+
+/** One moth's decisions for this step. */
+function think(m, pr, dt) {
+  if (m.dazeT > 0) { m.dazeT -= dt; return; }
+  const lit = pr.n > 0;
+  if (m.state === 'wander' || m.state === 'lost') {
+    if (lit) startSeek(m, pr);
+    return;
+  }
+  // a short grace carries it across a thin shadow
+  if (lit) { m.darkT = 0; m.lastLit = Kit.time; } else if ((m.darkT += dt) > DARK_GRACE) { loseLight(m); return; }
+  if (!m.dest && !plan(m, false)) return;
+  const inBand = m.L >= BAND * m.bandL;
+  if (m.state === 'seek') { if (inBand) { m.state = 'roam'; m.outT = 0; } } else if (inBand) m.outT = 0;
+  else if ((m.outT += dt) > 1.2) m.state = 'seek';   // drifted out of its band: hurry back in
+  const d = Math.hypot(m.dest.x - m.x, m.dest.y - m.y);
+  if (d < m.bestD - 6 * S.scale) { m.bestD = d; m.stuckT = 0; } else m.stuckT += dt;
+  m.nextT -= dt;
+  // never hover: a new spot in the band on arrival, every few seconds while roaming, or when blocked
+  if (d < 35 * S.scale || m.stuckT > 1.6 || (m.state === 'roam' && m.nextT <= 0)) plan(m, m.region >= 0);
 }
 
 // neighbour separation (module-level scratch keeps the hot loop allocation-free)
@@ -1005,46 +1099,37 @@ function pushOutOfObstacles(m, rad) {
 
 const steer = { ax: 0, ay: 0 };
 function updateMoths(dt, t) {
-  const s = S.scale, spd = tw('speed'), pull = tw('pull');
-  const wanderV = 45 * s * spd, seekV = 170 * s * spd * Math.sqrt(pull), orbitR = 30 * s, rad = 12 * s;
+  const s = S.scale, spd = tw('speed'), pull = tw('pull'), restless = tw('roam');
+  const wanderV = 45 * s * spd, seekV = 170 * s * spd * Math.sqrt(pull), roamV = 110 * s * spd * (0.65 + 0.35 * restless), rad = 12 * s;
   const R = S.room, rcx = R.x + R.w / 2, rcy = R.y + R.h / 2;
   sepR = 30 * s;
   hash.cell = Math.max(24, sepR);
   hash.clear();
   for (const m of S.moths) hash.insert(m, m.x, m.y);
-  let lit = 0;
+  let lit = 0, level = 0, roamLevel = 0;
   for (const m of S.moths) {
-    senseLight(m, dt);
+    const pr = sampleLight(m.x, m.y);
+    feelLight(m, pr);
+    think(m, pr, dt);
     steer.ax = 0; steer.ay = 0;
-    const l = m.target;
-    if (l && (m.state === 'seek' || m.state === 'orbit')) {
-      const F = orbitFocus(l, orbitR), fx = F.x, fy = F.y;
-      if (m.state === 'seek') {
-        let dx = fx - m.x, dy = fy - m.y;
-        const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
-        const taper = clamp(d / (170 * s), 0.25, 1);
-        const wob = (Math.sin(t * 9.3 + m.p1) * 0.6 + Math.sin(t * 23.7 + m.p2) * 0.4) * taper;
-        const v = seekV * (0.9 + 0.2 * Math.sin(t * 3.1 + m.p3)) * clamp(d / (70 * s), 0.55, 1);
-        const tx = dx * v - dy * wob * v * 0.75, ty = dy * v + dx * wob * v * 0.75;
-        const k = 4.5 * pull;
-        steer.ax += (tx - m.vx) * k; steer.ay += (ty - m.vy) * k;
-        avoidObstacles(m, 55 * s, 700 * s, steer);
-        if (Math.random() < dt * 1.2) { const j = rand(-1, 1) * 70 * s; m.vx += -dy * j; m.vy += dx * j; }
-        if (d < orbitR * 1.35) m.state = 'orbit';
-      } else {
-        m.orbitA += m.orbitDir * (4.6 + Math.sin(t * 1.7 + m.p1) * 1.6) * dt;
-        if (Math.random() < dt * 0.35) m.orbitDir *= -1;
-        m.bumpT -= dt;
-        const rr = orbitR * (0.72 + 0.36 * Math.sin(t * 3.3 + m.p2));
-        let gx = fx + Math.cos(m.orbitA) * rr, gy = fy + Math.sin(m.orbitA) * rr;
-        if (m.bumpT < 0) {
-          gx = l.x; gy = l.y;
-          if (U.dist(m.x, m.y, l.ox, l.oy) < 14 * s || m.bumpT < -0.6) bumpLamp(m, l);
-        }
-        steer.ax += (gx - m.x) * 26 - m.vx * 4.2 + rand(-1, 1) * 900 * s;
-        steer.ay += (gy - m.y) * 26 - m.vy * 4.2 + rand(-1, 1) * 900 * s;
-        if (U.dist(m.x, m.y, fx, fy) > orbitR * 3.4) m.state = 'seek';
+    const roaming = m.state === 'roam';
+    if (m.dest && (roaming || m.state === 'seek')) {
+      let dx = m.dest.x - m.x, dy = m.dest.y - m.y;
+      const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
+      // now and then a roaming moth throws a quick, curious loop
+      if (roaming && m.loopT <= 0 && Math.random() < dt * 0.25 * restless) { m.loopT = rand(0.45, 0.7); m.loopA = 0; m.spin = Math.random() < 0.5 ? -1 : 1; }
+      if (m.loopT > 0) {
+        m.loopT -= dt; m.loopA += m.spin * dt * 11;
+        const c = Math.cos(m.loopA), sn = Math.sin(m.loopA), rx = dx * c - dy * sn;
+        dy = dx * sn + dy * c; dx = rx;
       }
+      const wob = (Math.sin(t * 9.3 + m.p1) * 0.6 + Math.sin(t * 23.7 + m.p2) * 0.4) * (roaming ? 0.9 : 0.75 * clamp(d / (170 * s), 0.25, 1));
+      const v = (roaming ? roamV : seekV * clamp(d / (70 * s), 0.55, 1)) * (0.88 + 0.24 * Math.sin(t * 3.1 + m.p3));
+      const tx = dx * v - dy * wob * v, ty = dy * v + dx * wob * v;
+      const k = roaming ? 3.2 : 4.5 * pull;
+      steer.ax += (tx - m.vx) * k; steer.ay += (ty - m.vy) * k;
+      avoidObstacles(m, 55 * s, (roaming ? 520 : 700) * s, steer);
+      if (Math.random() < dt * (roaming ? 1.6 : 1.2)) { const j = rand(-1, 1) * (roaming ? 85 : 70) * s; m.vx += -dy * j; m.vy += dx * j; }
     } else if (m.state === 'lost') {
       m.lostT -= dt;
       const damp = Math.exp(-dt * 2.6);
@@ -1059,40 +1144,37 @@ function updateMoths(dt, t) {
       steer.ax += (Math.cos(m.wh) * v - m.vx) * 2.5; steer.ay += (Math.sin(m.wh) * v - m.vy) * 2.5;
       avoidObstacles(m, 50 * s, 220 * s, steer);
     }
-    // separation keeps a swarm from collapsing into one dot
+    // separation spreads a swarm over its band instead of collapsing it into one dot
     sepM = m; sepAx = 0; sepAy = 0;
     hash.query(m.x, m.y, sepR, sepVisit);
-    const sepK = m.state === 'orbit' ? 2600 * s : 900 * s;
+    const sepK = (roaming ? 1300 : 900) * s;
     steer.ax += sepAx * sepK; steer.ay += sepAy * sepK;
 
     m.vx += steer.ax * dt; m.vy += steer.ay * dt;
-    const maxV = (m.state === 'orbit' ? 330 : m.state === 'seek' ? 170 * 1.6 * Math.sqrt(pull) : 260) * s * spd;
+    const maxV = roaming ? roamV * 1.9 : m.state === 'seek' ? seekV * 1.6 : 260 * s * spd;
     const sp = Math.hypot(m.vx, m.vy);
     if (sp > maxV) { m.vx *= maxV / sp; m.vy *= maxV / sp; }
     moveMoth(m, dt, rad);
 
     if (m.state !== 'lost' && sp > 4) m.h = U.angleLerp(m.h, Math.atan2(m.vy, m.vx), 1 - Math.exp(-dt * 11));
-    const rate = m.state === 'orbit' ? 21 : m.state === 'seek' ? 16 : m.state === 'lost' ? 4.5 : 7.5;
+    // in an overlap it glows brighter and flaps faster
+    m.boost += (clamp(m.n - 1, 0, 2) - m.boost) * (1 - Math.exp(-dt * 4));
+    const rate = roaming ? 13 + 3.5 * m.boost : m.state === 'seek' ? 16 + 2 * m.boost : m.state === 'lost' ? 4.5 : 7.5;
     m.flap += dt * TAU * rate * (0.9 + 0.2 * Math.sin(m.p3));
-    m.glow += ((m.target ? 1 : 0) - m.glow) * (1 - Math.exp(-dt * 5));
+    m.glow += ((roaming || m.state === 'seek' ? 1 : 0) - m.glow) * (1 - Math.exp(-dt * 5));
     m.squash = Math.max(0, m.squash - dt * 4);
     const f = m.fx;
     f.trail[f.th * 2] = m.x; f.trail[f.th * 2 + 1] = m.y;
     f.th = (f.th + 1) % TRAIL; f.tn = Math.min(TRAIL, f.tn + 1);
-    if (m.target) lit++;
+    if (m.n) {
+      lit++;
+      level = Math.max(level, m.n);
+      if (roaming) roamLevel = Math.max(roamLevel, m.n);
+    }
   }
   if (lit !== S.litCount) { S.litCount = lit; updateCounts(); }
-}
-
-function bumpLamp(m, l) {
-  m.bumpT = rand(0.55, 1.5);
-  m.squash = 1;
-  // bounce back out along the beam, into the light
-  m.vx = Math.cos(l.angle) * 190 * S.scale + rand(-80, 80) * S.scale;
-  m.vy = Math.sin(l.angle) * 190 * S.scale + rand(-80, 80) * S.scale;
-  l.fx.jolt = 1;
-  burst(m.x, m.y, BASE[l.color], 4, 90);
-  Kit.sfx('bite', { gap: 220, vol: 0.18, pitch: rand(1.2, 1.7) });
+  const lv = roamLevel || level;
+  if (lv !== S.level) { S.level = lv; showLevel(); }
 }
 
 // ================================================================== particles + dust
@@ -2166,8 +2248,7 @@ function buildLampSprites() {
 function drawLampHead(ctx, l, alpha, color, power, t) {
   const s = S.scale, fx = l.fx, dpr = Kit.dpr, A = lampAtlas, C = LAMP_CELL;
   const k = s * 1.3 * (1 + fx.pulse * 0.28);
-  const a = l.angle + fx.jolt * Math.sin(t * 60) * 0.06;
-  const c = Math.cos(a) * k * dpr, sn = Math.sin(a) * k * dpr, row = COLORS.indexOf(color);
+  const c = Math.cos(l.angle) * k * dpr, sn = Math.sin(l.angle) * k * dpr, row = CI[color];
   ctx.setTransform(c, sn, -sn, c, l.x * dpr, l.y * dpr);
   if (power < 0.98) { ctx.globalAlpha = alpha; ctx.drawImage(A, 0, row * A.ch, A.cw, A.ch, C.x, C.y, C.w, C.h); }
   if (power > 0.02) { ctx.globalAlpha = alpha * power; ctx.drawImage(A, A.cw, row * A.ch, A.cw, A.ch, C.x, C.y, C.w, C.h); }
@@ -2452,7 +2533,6 @@ function render(ctx, rdt) {
       fx.flick = target && fx.power < 1 && !abs ? (Math.random() < 0.35 ? 0.25 : 1) : 1;
     } else fx.flick = 1;
     fx.pulse = Math.max(0, fx.pulse - rdt * 2.6);
-    fx.jolt = Math.max(0, fx.jolt - rdt * 5);
   }
   for (const o of S.obstacles) {
     if (o.pop < 1) { o.pop = Math.min(1, o.pop + rdt / 0.45); updateObstacle(o); if (o.pop >= 1) clampObstacle(o); S.dirty = true; }
