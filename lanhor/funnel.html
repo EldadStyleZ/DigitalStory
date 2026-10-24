@@ -46,7 +46,7 @@ const STUCK_T = 1.3;                                 // after this long inside, 
 const ROT_MAX = 2.4, ROT_K = 7.5;                    // A / D: top spin (rad/s) and ease stiffness
 // turning: a funnel slides up to TURN_REACH from its spot to clear the rock; while it eases it may come TURN_SLACK closer
 // than at rest (the gap between its wall and the rock stays wider than a particle, so nothing is squeezed into a wall)
-const TURN_REACH = 80, TURN_SLACK = 2.5, TURN_K = 16;
+const TURN_REACH = 80, TURN_SLACK = 2.5, TURN_K = 16, TURN_HOME = 3;   // TURN_HOME: drift back home (1/s)
 const MOVE_MAX = 300, MOVE_K = 10;                   // arrow keys: top speed (world/s) and ease stiffness
 const GLIDE_K = 13;
 const CLICK_PX = 5, CLICK_MS = 350;
@@ -540,32 +540,46 @@ function turnSpot(f, a, x0, y0) {
   SPOT.x = TS.x; SPOT.y = TS.y;
   return SPOT;
 }
-/** One frame of turning: the funnel rides exactly on its turn spot, so it keeps working while it clears the rock.
- *  Where that spot jumps (or the turn starts away from it) the difference goes into an offset that eases out,
- *  critically damped, so the motion stays smooth. With no spot nearby the funnel hovers, inert, and settles once it
- *  stops. Returns true while an offset is still easing out. */
+/** One frame of turning. The turn spot is solved on from last frame's spot, drawn a little toward home, so it moves
+ *  continuously (and drifts home whenever there is room); the funnel rides exactly on it and keeps working while it
+ *  clears the rock. Only when that spot is lost is it solved again from home: the jump goes into an offset that eases
+ *  out, critically damped. With no spot nearby the funnel hovers, inert, and settles once it stops.
+ *  Returns true while it is still moving on its own (offset easing out, or drifting home). */
 function turnStep(f, rdt) {
   if (f.gliding) { f.gliding = false; f.evx = f.vx; f.evy = f.vy; }   // a glide in progress hands its speed on
-  // from home when possible (it comes back there), else on from where it was a frame ago
-  const T = turnSpot(f, f.angle, f.hx, f.hy) || (f.turnT ? turnSpot(f, f.angle, f.tpx, f.tpy) : null);
+  const x0 = f.x, y0 = f.y;
+  let T, jump = false;
+  if (f.turnT) {
+    const k = 1 - Math.exp(-TURN_HOME * rdt), hx = (f.hx - f.tpx) * k, hy = (f.hy - f.tpy) * k;
+    T = turnSpot(f, f.angle, f.tpx + hx, f.tpy + hy);
+    // a slide moves the spot about as far as the funnel's ends turn (plus the pull home); more is a jump, eased out
+    if (T && Math.hypot(T.x - f.tpx, T.y - f.tpy) > Math.abs(f.angle - f.tpa) * 95 + Math.hypot(hx, hy) + 0.5) jump = true;
+    if (!T) { T = turnSpot(f, f.angle, f.hx, f.hy); jump = true; }
+  } else T = turnSpot(f, f.angle, f.x, f.y) || turnSpot(f, f.angle, f.hx, f.hy);
+  if (!T) { T = findSpot(f, f.hx, f.hy, f.angle, TURN_REACH); jump = true; }   // room the push cannot reach (behind a pillar)
   if (!T) {
+    // no room nearby at this angle: it hovers, inert, coasting to a stop (a settle glide takes the speed on)
+    const d = Math.exp(-TURN_K * rdt), m = (1 - d) / TURN_K;
+    f.x += f.fvx * m; f.y += f.fvy * m; f.fvx *= d; f.fvy *= d;
+    f.vx = f.fvx; f.vy = f.fvy;
     f.turnT = false; f.ex = f.ey = f.evx = f.evy = 0;
     f.lifted = !fits(f, f.x, f.y, f.angle);
     if (f.lifted) f.user = true;
     return false;
   }
-  const tx = T.x, ty = T.y;
+  const tx = T.x, ty = T.y, moved = f.turnT ? Math.hypot(tx - f.tpx, ty - f.tpy) : 0;
   if (!f.turnT) { f.ex = f.x - tx; f.ey = f.y - ty; }
-  else if (Math.hypot(tx - f.tpx, ty - f.tpy) > 1.5 + 120 * rdt) { f.ex += f.tpx - tx; f.ey += f.tpy - ty; }   // a jump, not a slide
-  f.turnT = true; f.tpx = tx; f.tpy = ty;
+  else if (jump) { f.ex += f.tpx - tx; f.ey += f.tpy - ty; }
+  f.turnT = true; f.tpx = tx; f.tpy = ty; f.tpa = f.angle;
   cdStep(f.ex, f.evx, 0, TURN_K, rdt); f.ex = CD.p; f.evx = CD.v;
   cdStep(f.ey, f.evy, 0, TURN_K, rdt); f.ey = CD.p; f.evy = CD.v;
   const easing = Math.abs(f.ex) + Math.abs(f.ey) > 0.02 || Math.abs(f.evx) + Math.abs(f.evy) > 0.5;
   if (!easing) f.ex = f.ey = f.evx = f.evy = 0;
   f.x = tx + f.ex; f.y = ty + f.ey;
+  f.fvx = (f.x - x0) / rdt; f.fvy = (f.y - y0) / rdt;
   f.lifted = !fits(f, f.x, f.y, f.angle, TURN_SLACK);
   if (f.lifted) f.user = true;
-  return easing;
+  return easing || moved > 0.1;
 }
 /** Local hit test (body plus a small margin). */
 function onFunnel(f, wx, wy, pad) {
@@ -600,7 +614,8 @@ function makeFunnel(x, y, angle, power) {
     w: 0, wd: 0,                          // spin: angular velocity and its rate
     mvx: 0, mvy: 0, mvax: 0, mvay: 0,     // arrow-key motion: velocity and its rate
     vx: 0, vy: 0, tx: x, ty: y,           // glide
-    hx: x, hy: y, ex: 0, ey: 0, evx: 0, evy: 0, easing: false, turnT: false, tpx: 0, tpy: 0,   // turning: home, eased offset, last turn spot
+    hx: x, hy: y, ex: 0, ey: 0, evx: 0, evy: 0, easing: false,   // turning: home spot, eased offset
+    turnT: false, tpx: 0, tpy: 0, tpa: 0, fvx: 0, fvy: 0,          // last turn spot and angle, speed while turning
     lifted: true, gliding: false, hand: false, user: false,
     pop: 0, lift: 1, hot: 0, glow: 0, flash: 0, inside: 0, through: 0, el: null, ui: null,
   };
