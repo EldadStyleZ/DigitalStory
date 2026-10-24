@@ -1,0 +1,2146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Toy</title>
+<link rel="stylesheet" href="kit.css">
+</head>
+<body>
+<script src="kit.js"></script>
+<script>
+'use strict';
+/* Toy 04 — Funnel.
+ * Particles race through a rounded maze (a signed distance field with one connected free space).
+ * Every funnel pulls particles into its red mouth, carries them through the cone and shoots them
+ * out of its blue spout: everything that goes in comes out. A power slider rides on each funnel.
+ */
+
+// ================================================================== config
+const U = Kit.util;
+const { TAU, clamp, lerp } = U;
+
+const WORLD_W = 1600, WORLD_H = 880;
+const GRID = 4;                                      // SDF sample spacing (world units)
+const GW = WORLD_W / GRID + 1, GH = WORLD_H / GRID + 1;
+const DEFAULT_SEED = 7;
+const MIN_PARTICLES = 50, MAX_PARTICLES = 2000;
+const BASE_SPEED = 220;                              // cruising speed at 1× (world units / s)
+const MAX_FUNNELS = 12;
+const R_MAX = 5;                                     // largest particle radius the tweak allows
+const PASS = R_MAX + 1.5;                            // free-space threshold for the connectivity check
+
+// funnel shape, local frame: +x runs from the red mouth to the blue spout; profile = wall center line
+const F_LEN = 150, F_HALF = F_LEN / 2, F_WALL = 4;  // F_WALL: half thickness of a side wall
+const PROF_X = [-75, -45, -15, 15, 45, 75];
+const PROF_H = [45, 31, 22.5, 17.5, 14.5, 14.5];    // inner spout opening = 2 × (14.5 − 4) = 21 units
+const F_BOUND = Math.hypot(F_HALF, PROF_H[0]) + F_WALL + R_MAX + 2;
+const PILL_AT = -14;                                 // the slider sits on the wide part of the body
+// forces in world units / s² at 1× speed and 100 % power. Pull and push are mirror images with one power: the same
+// FIELD_ACC, reach (the Reach tweak), falloff, line-of-sight rule and rock rule (FIELD_CLEAR: no field where rock lies
+// that close ahead of the particle, world units). KICK: the spout's ejection boost (world units / s)
+const FIELD_ACC = 2300, CARRY_ACC = 1700, KICK = 300, FIELD_CLEAR = 40;
+const RELAX_UP = 4, RELAX_DOWN = 1.15;               // back to cruising speed (1/s): quick after bounces, slow after a kick
+const WANDER = 1.5;                                  // random-walk heading noise (rad / √s)
+const VMAX = 1500;
+const STUCK_T = 1.3;                                 // after this long inside, a nudge guarantees the exit
+const ROT_MAX = 2.4, ROT_K = 7.5;                    // A / D: top spin (rad/s) and ease stiffness
+// turning: a funnel slides up to TURN_REACH from its spot to clear the rock, following its turn spot on a spring
+// (TURN_FOLLOW, 1/s); it keeps working while it is within TURN_SLACK of clearance at rest (the gap between its wall and
+// the rock stays wider than a particle, so nothing is squeezed into a wall). The spot slides at most as fast as the
+// funnel's ends turn (TURN_SWEEP per radian) and crosses to room beyond the rock at TURN_GLIDE (world/s);
+// TURN_HOME: drift back home (1/s)
+const TURN_REACH = 80, TURN_SLACK = 2.5, TURN_FOLLOW = 32, TURN_SWEEP = F_HALF, TURN_GLIDE = 160, TURN_HOME = 3;
+const MOVE_MAX = 300, MOVE_K = 10;                   // arrow keys: top speed (world/s) and ease stiffness
+const GLIDE_K = 13;
+const CLICK_PX = 5, CLICK_MS = 350;
+
+const COL = { red: '#ff4d6d', blue: '#4aa3ff', violet: '#b48cff', part: '#ece8ff' };
+const SH = { bg: '#0d0d10', band: '#2c2c34', mid: '#5a5a66', light: '#9a9aa6', white: '#ffffff', red: '#ff3b30', blue: '#0a84ff' };   // Shapes palette
+const DEFAULTS = { size: 3.5, bounce: 0.9, reach: 2.5, fields: false };
+const tw = (id) => (Kit.tweaks[id] !== undefined ? Kit.tweaks[id] : DEFAULTS[id]);
+
+const CSS = `
+/* kit-glass blurs what lies behind it; over a canvas that changes every frame a software compositor redoes
+   that blur every frame (about 10 ms at 1920 × 1080). The panels sit over the plain backdrop here, so a
+   denser fill looks the same and keeps the frame rate up. */
+.kit-glass { backdrop-filter: none; -webkit-backdrop-filter: none; background: rgba(24, 20, 48, 0.96); }
+/* kit.css gives the Sprites / Shapes buttons z-index 1, which paints them through the help overlay */
+.kit-help { z-index: 20; }
+.fn-layer { position: fixed; inset: 0; pointer-events: none; z-index: 5; overflow: hidden; }
+.fn-pos { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+.fn-pill {
+  --p: 0.6; --k: 1; --tc: #b48cff;
+  position: absolute; left: 0; top: 0;
+  transform: translate(-50%, -50%) scale(var(--k));
+  display: flex; align-items: center; gap: 3px;
+  height: 24px; padding: 0 5px; border-radius: 12px; box-sizing: border-box;
+  /* light at rest, so the stream inside the cone shows through; solid when pointed at or dragged */
+  background: rgba(15, 11, 32, 0.42);
+  border: 1px solid rgba(236, 230, 255, 0.14);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  pointer-events: auto; touch-action: none; cursor: pointer;
+  transition: background .15s, border-color .15s, box-shadow .15s, opacity .25s, scale .25s;
+  animation: fn-in .38s cubic-bezier(.3, 1.5, .5, 1) both;
+}
+.fn-pill.is-hot, .fn-pill.is-drag { background: rgba(28, 22, 56, 0.88); border-color: rgba(236, 230, 255, 0.34); box-shadow: 0 3px 12px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.07); }
+.fn-pill.is-sel { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28), 0 0 0 2px rgba(180, 140, 255, 0.38); }
+.fn-pill.is-sel.is-hot, .fn-pill.is-sel.is-drag { box-shadow: 0 3px 12px rgba(0, 0, 0, 0.42), 0 0 0 2px rgba(180, 140, 255, 0.5); }
+.fn-pill.is-drag { border-color: color-mix(in srgb, var(--tc) 70%, white); }
+.fn-pill.is-lift { opacity: 0.55; }
+.fn-pill.is-out { opacity: 0; scale: 0.5; pointer-events: none; }
+body.view-abstract .fn-pill { background: rgba(13, 13, 16, 0.8); border-color: #5a5a66; box-shadow: none; }
+body.view-abstract .fn-pill.is-hot { background: #1c1c22; border-color: #9a9aa6; }
+body.view-abstract .fn-pill.is-sel { border-color: #ffffff; }
+@keyframes fn-in { from { opacity: 0; scale: 0.4; } }
+.fn-mk {
+  width: 11px; height: 18px; display: grid; place-items: center; flex: none;
+  font: 600 14px/1 var(--font-ui); color: #f1effb; border-radius: 6px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+  transition: opacity .15s, background .15s;
+}
+.fn-mk:hover { background: rgba(255, 255, 255, 0.1); }
+.fn-track { position: relative; width: 74px; height: 20px; flex: none; cursor: ew-resize; }
+.fn-ramp { position: absolute; left: 3px; top: 50%; width: 68px; height: 13px; margin-top: -6.5px; }
+.fn-ramp svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.fn-ramp-base { fill: rgba(236, 230, 255, 0.24); }
+.fn-ramp-fill { fill: url(#fn-grad); clip-path: inset(0 calc((1 - var(--p)) * 100%) 0 0); }
+body.view-abstract .fn-ramp-base { fill: #5a5a66; }
+body.view-abstract .fn-mk { text-shadow: none; }
+body.view-abstract .fn-ramp-fill { fill: url(#fn-grad-sh); }
+.fn-thumb {
+  position: absolute; top: 50%; left: calc(var(--p) * (100% - 38px)); width: 38px; height: 18px; margin-top: -9px;
+  border-radius: 9px; background: #f6f3ff; color: #1a0f2e;
+  display: grid; place-items: center;
+  font: 500 12.5px/1 var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55), 0 0 0 1.5px var(--tc);
+  pointer-events: none; white-space: nowrap;
+}
+body.view-abstract .fn-thumb { background: #ffffff; color: #0d0d10; box-shadow: none; }
+.fn-range { width: 118px; }
+.fn-readout { min-width: 44px; text-align: left; padding: 0 6px 0 4px; }
+`;
+
+// ================================================================== state
+const S = {
+  ready: false,
+  seed: DEFAULT_SEED,
+  sc: 1, ox: 0, oy: 0,                   // world → screen: sx = ox + x * sc
+  count: 600, speed: 1,
+  funnels: [], dead: [], slots: new Array(MAX_FUNNELS).fill(null),
+  sel: null, hover: null, pillHover: null, pillDrag: null,
+  press: null, drag: null,
+  undo: [],
+  ghost: null,                            // refused placement: { x, y, angle, t }
+  through: 0, exits: 0, statT: 0,
+  nextId: 1,
+  cursor: '',
+  layerDirty: true, layerAt: -1e9,
+  ui: {},
+};
+
+// particles: structure of arrays, allocated once
+const PX = new Float32Array(MAX_PARTICLES), PY = new Float32Array(MAX_PARTICLES);
+const VX = new Float32Array(MAX_PARTICLES), VY = new Float32Array(MAX_PARTICLES);
+const WARM = new Float32Array(MAX_PARTICLES), COOL = new Float32Array(MAX_PARTICLES);
+const INT = new Float32Array(MAX_PARTICLES);             // seconds spent inside the current funnel
+const INF = new Int8Array(MAX_PARTICLES).fill(-1);       // slot of the funnel a particle is inside, or −1
+const ENTRY = new Uint8Array(MAX_PARTICLES);             // 1 when it came in through the mouth
+let N = 0;
+const FA = new Array(MAX_FUNNELS).fill(null);            // landed funnels, refilled each step (no allocation)
+const keyHold = new Map();
+
+// ================================================================== world: signed distance field maze
+// SDF > 0 is free space (distance to the nearest wall), < 0 is inside a wall. Built from smooth unions of
+// rounded chambers and capsule tunnels, minus rounded obstacles; sampled on a grid, read bilinearly.
+const SDF = new Float32Array(GW * GH);
+const LABEL = new Int32Array(GW * GH);
+const QUEUE = new Int32Array(GW * GH);
+const MAP = { chambers: [], tunnels: [], obstacles: [], free: new Int32Array(GW * GH), freeN: 0, comps: 0 };
+
+const smin = (a, b, k) => { const h = Math.max(k - Math.abs(a - b), 0) / k; return Math.min(a, b) - h * h * k * 0.25; };
+const smax = (a, b, k) => -smin(-a, -b, k);
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const t = clamp(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy || 1), 0, 1);
+  return Math.hypot(px - ax - dx * t, py - ay - dy * t);
+}
+// shape kinds: 0 circle {x,y,r}, 1 capsule {x,y,x2,y2,r}, 2 rounded box {x,y,hx,hy,r,c,s}
+function sdShape(px, py, s) {
+  if (s.t === 0) return Math.hypot(px - s.x, py - s.y) - s.r;
+  if (s.t === 1) return segDist(px, py, s.x, s.y, s.x2, s.y2) - s.r;
+  const dx = px - s.x, dy = py - s.y;
+  const qx = Math.abs(dx * s.c + dy * s.s) - s.hx + s.r, qy = Math.abs(-dx * s.s + dy * s.c) - s.hy + s.r;
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - s.r;
+}
+function bound(s) {   // bounding circle, for culling
+  if (s.t === 0) { s.bx = s.x; s.by = s.y; s.br = s.r; }
+  else if (s.t === 1) { s.bx = (s.x + s.x2) / 2; s.by = (s.y + s.y2) / 2; s.br = Math.hypot(s.x2 - s.x, s.y2 - s.y) / 2 + s.r; }
+  else { s.bx = s.x; s.by = s.y; s.br = Math.hypot(s.hx, s.hy); }
+  return s;
+}
+const circle = (x, y, r) => bound({ t: 0, x, y, r });
+const capsule = (x, y, x2, y2, r) => bound({ t: 1, x, y, x2, y2, r });
+const rbox = (x, y, hx, hy, r, a) => bound({ t: 2, x, y, hx, hy, r: Math.min(r, hx, hy), c: Math.cos(a), s: Math.sin(a) });
+
+/** Field of one compound (smooth union of its parts). */
+function sdGroup(px, py, g) {
+  let d = 1e9;
+  for (const s of g.parts) {
+    if (Math.hypot(px - s.bx, py - s.by) - s.br > d + g.k) continue;
+    d = d > 1e8 ? sdShape(px, py, s) : smin(d, sdShape(px, py, s), g.k);
+  }
+  return d;
+}
+const chamberField = (px, py, ch) => sdGroup(px, py, ch);
+// smooth-union widths that keep every join round: tunnel into tunnel (no thorn of rock where two meet at a slant),
+// tunnels into chambers, and a finger into the wall it grows from (a fillet on both sides, even at a slant)
+const TUNNEL_MELT = 52, MOUTH_FLARE = 30, FINGER_FILLET = 30;
+const BORDER = rbox(WORLD_W / 2, WORLD_H / 2, WORLD_W / 2 - 22, WORLD_H / 2 - 22, 80, 0);
+
+/** "Carved" field: negative inside the free space. */
+function carved(px, py) {
+  let f = 1e9;
+  for (const ch of MAP.chambers) {
+    if (Math.hypot(px - ch.bx, py - ch.by) - ch.br - ch.k * 0.25 > f) continue;
+    f = Math.min(f, chamberField(px, py, ch));
+  }
+  // the tunnels melt into each other generously (g), so two that meet at a slant leave a round knob of rock between
+  // them instead of a thorn; together they flare into the chambers
+  let g = 1e9;
+  for (const t of MAP.tunnels) {
+    if (Math.hypot(px - t.bx, py - t.by) - t.br > Math.min(f, g) + TUNNEL_MELT + 2) continue;
+    let d = 1e9;
+    for (const s of t.parts) d = Math.min(d, sdShape(px, py, s));
+    g = g > 1e8 ? d : smin(g, d, TUNNEL_MELT);
+  }
+  if (g < 1e8) f = smin(f, g, MOUTH_FLARE);
+  f = smax(f, sdShape(px, py, BORDER), 24);
+  for (const o of MAP.obstacles) {
+    const k = o.fillet || 14;
+    if (Math.hypot(px - o.bx, py - o.by) - o.br > -f + k + 2) continue;
+    f = smax(f, -sdGroup(px, py, o), k);
+  }
+  return f;
+}
+
+function computeField() {
+  for (let j = 0; j < GH; j++) {
+    const y = j * GRID;
+    for (let i = 0; i < GW; i++) {
+      const x = i * GRID;
+      SDF[j * GW + i] = (i === 0 || j === 0 || i === GW - 1 || j === GH - 1) ? -40 : -carved(x, y);
+    }
+  }
+}
+
+/** Bilinear SDF read (world units). Outside the world counts as deep wall. */
+function sdfAt(x, y) {
+  const gx = x / GRID, gy = y / GRID;
+  if (!(gx >= 0 && gy >= 0 && gx < GW - 1 && gy < GH - 1)) return -40;
+  const i = gx | 0, j = gy | 0, fx = gx - i, fy = gy - j, k = j * GW + i;
+  const a = SDF[k], b = SDF[k + 1], c = SDF[k + GW], d = SDF[k + GW + 1];
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+
+/** Label 4-connected components of cells with SDF > th. Returns sizes (index = label − 1). */
+function labelComponents(th) {
+  LABEL.fill(0);
+  const sizes = [];
+  for (let s = 0; s < GW * GH; s++) {
+    if (LABEL[s] || !(SDF[s] > th)) continue;
+    const id = sizes.length + 1;
+    let head = 0, tail = 0;
+    QUEUE[tail++] = s; LABEL[s] = id;
+    while (head < tail) {
+      const k = QUEUE[head++], i = k % GW;
+      if (i > 0 && !LABEL[k - 1] && SDF[k - 1] > th) { LABEL[k - 1] = id; QUEUE[tail++] = k - 1; }
+      if (i < GW - 1 && !LABEL[k + 1] && SDF[k + 1] > th) { LABEL[k + 1] = id; QUEUE[tail++] = k + 1; }
+      if (k >= GW && !LABEL[k - GW] && SDF[k - GW] > th) { LABEL[k - GW] = id; QUEUE[tail++] = k - GW; }
+      if (k < GW * (GH - 1) && !LABEL[k + GW] && SDF[k + GW] > th) { LABEL[k + GW] = id; QUEUE[tail++] = k + GW; }
+    }
+    sizes.push(tail);
+  }
+  return sizes;
+}
+function components() { const n = labelComponents(PASS).length; MAP.comps = n; return n; }
+
+/** Join every stray pocket to the main space with a smooth tunnel; seal crumbs too small to matter. */
+function ensureConnected() {
+  for (let iter = 0; iter < 14; iter++) {
+    const sizes = labelComponents(PASS);
+    if (sizes.length <= 1) break;
+    let main = 0;
+    for (let k = 1; k < sizes.length; k++) if (sizes[k] > sizes[main]) main = k;
+    const deep = sizes.map(() => -1);
+    for (let s = 0; s < GW * GH; s++) { const l = LABEL[s] - 1; if (l >= 0 && l !== main && (deep[l] < 0 || SDF[s] > SDF[deep[l]])) deep[l] = s; }
+    for (let l = 0; l < sizes.length; l++) {
+      if (l === main) continue;
+      const s = deep[l], x = (s % GW) * GRID, y = Math.floor(s / GW) * GRID;
+      if (sizes[l] < 70) { const c = circle(x, y, SDF[s] + 5); MAP.obstacles.push({ parts: [c], k: 1, bx: c.bx, by: c.by, br: c.br }); continue; }
+      let best = -1, bd = 1e18;
+      for (let q = 0; q < GW * GH; q++) {
+        if (LABEL[q] - 1 !== main) continue;
+        const qx = (q % GW) * GRID - x, qy = Math.floor(q / GW) * GRID - y, d = qx * qx + qy * qy - SDF[q] * 40;
+        if (d < bd) { bd = d; best = q; }
+      }
+      const bx = (best % GW) * GRID, by = Math.floor(best / GW) * GRID;
+      addTunnel(-1, -1, [[x, y], [bx, by]], 26, true, true);
+    }
+    computeField();
+  }
+  // last resort (never needed for the seeds tested): fill whatever is still cut off
+  const sizes = labelComponents(PASS);
+  if (sizes.length > 1) {
+    let main = 0;
+    for (let k = 1; k < sizes.length; k++) if (sizes[k] > sizes[main]) main = k;
+    for (let s = 0; s < GW * GH; s++) if (LABEL[s] && LABEL[s] - 1 !== main) SDF[s] = -1;
+  }
+  MAP.freeN = 0;
+  labelComponents(PASS);
+  for (let s = 0; s < GW * GH; s++) if (LABEL[s] === 1 && SDF[s] > R_MAX + 6) MAP.free[MAP.freeN++] = s;
+  MAP.comps = components();
+}
+
+/** A tunnel grazing a chamber can leave a thin lens of rock with pointed ends. Every rock island shallower than SLIVER
+ *  (each designed obstacle is at least 9 units deep) is melted by a short free capsule laid from one end to the other. */
+const SLIVER = 5;
+function meltSlivers() {
+  for (let s = 0; s < GW * GH; s++) SDF[s] = -SDF[s];   // label the rock instead of the free space
+  const n = labelComponents(0).length, depth = new Float32Array(n);
+  for (let s = 0; s < GW * GH; s++) if (LABEL[s]) depth[LABEL[s] - 1] = Math.max(depth[LABEL[s] - 1], SDF[s]);
+  for (let s = 0; s < GW * GH; s++) SDF[s] = -SDF[s];
+  const far = (l, x, y) => {   // the cell of island l farthest from (x, y)
+    let best = 0, bd = -1;
+    for (let s = 0; s < GW * GH; s++) if (LABEL[s] === l) { const d = Math.hypot((s % GW) * GRID - x, Math.floor(s / GW) * GRID - y); if (d > bd) { bd = d; best = s; } }
+    return [(best % GW) * GRID, Math.floor(best / GW) * GRID];
+  };
+  let melted = 0;
+  for (let l = 1; l <= n; l++) {
+    if (depth[l - 1] >= SLIVER) continue;
+    const s0 = LABEL.indexOf(l), a = far(l, (s0 % GW) * GRID, Math.floor(s0 / GW) * GRID), b = far(l, a[0], a[1]);
+    addTunnel(-1, -1, [a, b], 2 * depth[l - 1] + 10, true, true);
+    melted++;
+  }
+  if (melted) computeField();
+}
+
+function addTunnel(a, b, pts, w, narrow, fix) {
+  const parts = [];
+  for (let i = 0; i + 1 < pts.length; i++) parts.push(capsule(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], w / 2));
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const p of pts) { x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]); x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]); }
+  const t = { a, b, pts, w, narrow, fix: !!fix, parts, bx: (x0 + x1) / 2, by: (y0 + y1) / 2, br: Math.hypot(x1 - x0, y1 - y0) / 2 + w };
+  MAP.tunnels.push(t);
+  return t;
+}
+
+/** Build the maze for a seed: six rounded chambers on a jittered 3 × 2 grid, joined by narrow curved
+ *  tunnels and wide gaps (a spanning tree plus loops), with pillars, pebbles and fingers inside. */
+function generate(seed) {
+  const rnd = U.mulberry32((seed >>> 0) * 2654435761 + 1013);
+  const R = (a, b) => a + (b - a) * rnd();
+  MAP.chambers = []; MAP.tunnels = []; MAP.obstacles = [];
+  const cols = 3, rows = 2, cw = WORLD_W / cols, chh = WORLD_H / rows;
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const jx = R(-30, 30), jy = R(-20, 20);
+    const cx = (c + 0.5) * cw + jx, cy = (r + 0.5) * chh + jy;
+    const mx = cw / 2 - 32 - Math.abs(jx), my = chh / 2 - 32 - Math.abs(jy);
+    const hx = mx * R(0.84, 0.97), hy = my * R(0.8, 0.95), a = R(-0.08, 0.08);
+    const parts = [rbox(cx, cy, hx * 0.96, hy * 0.96, Math.min(hx, hy) * R(0.55, 0.85), a)];
+    const lobes = 1 + (rnd() < 0.55 ? 1 : 0);
+    for (let l = 0; l < lobes; l++) {
+      const rho = Math.min(mx, my) * R(0.38, 0.55), ang = R(0, TAU);
+      parts.push(circle(cx + Math.cos(ang) * (mx - rho) * R(0.75, 1), cy + Math.sin(ang) * (my - rho) * R(0.75, 1), rho));
+    }
+    let br = 0;
+    for (const p of parts) br = Math.max(br, Math.hypot(p.bx - cx, p.by - cy) + p.br);
+    MAP.chambers.push({ x: cx, y: cy, hx: mx, hy: my, parts, k: 50, bx: cx, by: cy, br, col: c, row: r });
+  }
+  // connections: random spanning tree over the grid neighbours, then one or two loops
+  const edges = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const i = r * cols + c;
+    if (c + 1 < cols) edges.push([i, i + 1]);
+    if (r + 1 < rows) edges.push([i, i + cols]);
+  }
+  for (let i = edges.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [edges[i], edges[j]] = [edges[j], edges[i]]; }
+  const root = MAP.chambers.map((_, i) => i);
+  const find = (i) => (root[i] === i ? i : (root[i] = find(root[i])));
+  const used = [], spare = [];
+  for (const e of edges) { const a = find(e[0]), b = find(e[1]); if (a !== b) { root[a] = b; used.push(e); } else spare.push(e); }
+  used.push(...spare.slice(0, rnd() < 0.5 ? 1 : 2));
+  // one long, curved tunnel between diagonal neighbours, through the solid rock in between
+  const diag = [[0, 4], [1, 3], [1, 5], [2, 4]][Math.floor(rnd() * 4)];
+  // at least three narrow tunnels and two wide gaps
+  const kinds = used.map((_, i) => (i < 3 ? 'narrow' : i < 5 ? 'wide' : rnd() < 0.5 ? 'narrow' : 'wide'));
+  for (let i = kinds.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [kinds[i], kinds[j]] = [kinds[j], kinds[i]]; }
+  used.forEach((e, n) => {
+    const A = MAP.chambers[e[0]], B = MAP.chambers[e[1]];
+    const narrow = kinds[n] === 'narrow';
+    const dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy);
+    const bend = narrow && rnd() < 0.7 ? R(0.18, 0.34) * (rnd() < 0.5 ? -1 : 1) * len : R(-0.05, 0.05) * len;
+    const qx = (A.x + B.x) / 2 - (dy / len) * bend, qy = (A.y + B.y) / 2 + (dx / len) * bend;
+    const pts = [];
+    for (let k = 0; k <= 10; k++) {
+      const t = k / 10, u = 1 - t;
+      pts.push([u * u * A.x + 2 * u * t * qx + t * t * B.x, u * u * A.y + 2 * u * t * qy + t * t * B.y]);
+    }
+    addTunnel(e[0], e[1], pts, narrow ? R(22, 30) : R(66, 96), narrow);
+  });
+  {
+    const A = MAP.chambers[diag[0]], B = MAP.chambers[diag[1]], dx = B.x - A.x, dy = B.y - A.y, len = Math.hypot(dx, dy);
+    const bend = R(0.12, 0.22) * (rnd() < 0.5 ? -1 : 1) * len, qx = (A.x + B.x) / 2 - (dy / len) * bend, qy = (A.y + B.y) / 2 + (dx / len) * bend;
+    const pts = [];
+    for (let k = 0; k <= 14; k++) { const t = k / 14, u = 1 - t; pts.push([u * u * A.x + 2 * u * t * qx + t * t * B.x, u * u * A.y + 2 * u * t * qy + t * t * B.y]); }
+    addTunnel(diag[0], diag[1], pts, R(22, 27), true);
+  }
+  // where each connection leaves each chamber: obstacles keep clear of these mouths
+  const mouths = [];
+  for (const t of MAP.tunnels) for (const end of [0, 1]) {
+    const ch = MAP.chambers[end ? t.b : t.a], pts = end ? t.pts.slice().reverse() : t.pts;
+    const e = tunnelEntrance(ch, pts);
+    if (e) mouths.push({ x: e.x, y: e.y, r: t.w / 2 });
+  }
+  // obstacles: pillars, pebble clusters, capsules, rounded blocks, and fingers from the walls
+  const clearOf = (x, y, rad, gap) => mouths.every((m) => Math.hypot(x - m.x, y - m.y) > rad + m.r + gap)
+    && MAP.obstacles.every((o) => Math.hypot(x - o.bx, y - o.by) > rad + o.br + 44);
+  // a finger also keeps clear of the tunnels that only pass its chamber (such as the long diagonal one): poking into
+  // one would pinch it to a sharp waist or cut it
+  const clearOfPassing = (ci, ax, ay, bx, by, r) => MAP.tunnels.every((t) => t.a === ci || t.b === ci || t.parts.every((s) => {
+    for (let k = 0; k <= 8; k++) if (sdShape(ax + ((bx - ax) * k) / 8, ay + ((by - ay) * k) / 8, s) < r + FINGER_FILLET + 4) return false;
+    return true;
+  }));
+  for (const ch of MAP.chambers) {
+    const want = 2 + Math.floor(R(0, 3));
+    for (let tries = 0, made = 0; tries < 60 && made < want; tries++) {
+      const x = ch.x + R(-0.8, 0.8) * ch.hx, y = ch.y + R(-0.8, 0.8) * ch.hy;
+      const kind = Math.floor(R(0, 4));
+      let parts, rad;
+      if (kind === 0) { rad = R(14, 30); parts = [circle(x, y, rad)]; }
+      else if (kind === 1) {
+        parts = [circle(x, y, R(11, 17))];
+        for (let k = 0, n = 1 + Math.floor(R(1, 3)); k < n; k++) { const a = R(0, TAU), d = R(14, 22); parts.push(circle(x + Math.cos(a) * d, y + Math.sin(a) * d, R(8, 13))); }
+        rad = 36;
+      } else if (kind === 2) {
+        const a = R(0, Math.PI), l = R(26, 50), r = R(10, 15);
+        parts = [capsule(x - Math.cos(a) * l, y - Math.sin(a) * l, x + Math.cos(a) * l, y + Math.sin(a) * l, r)];
+        rad = l + r;
+      } else { const hx = R(24, 40), hy = R(14, 22); parts = [rbox(x, y, hx, hy, 12, R(0, Math.PI))]; rad = Math.hypot(hx, hy); }
+      if (chamberField(x, y, ch) > -(rad + 46) || !clearOf(x, y, rad, 60)) continue;
+      MAP.obstacles.push({ parts, k: 12, bx: x, by: y, br: rad });
+      made++;
+    }
+    if (rnd() < 0.65) {   // a rounded finger reaching in from the chamber wall
+      for (let tries = 0; tries < 12; tries++) {
+        const a = R(0, TAU), ux = Math.cos(a), uy = Math.sin(a);
+        let d = 0;
+        while (d < 400 && chamberField(ch.x + ux * d, ch.y + uy * d, ch) < 0) d += 4;
+        const ex = ch.x + ux * d, ey = ch.y + uy * d, l = R(46, 84), r = R(11, 16);
+        const tx = ex - ux * l, ty = ey - uy * l;
+        if (d < 120 || !clearOf(tx, ty, r, 70) || !clearOf(ex, ey, r, 50) || !clearOfPassing(MAP.chambers.indexOf(ch), ex, ey, tx, ty, r)) continue;
+        const p = capsule(ex + ux * 24, ey + uy * 24, tx, ty, r);
+        MAP.obstacles.push({ parts: [p], k: 1, fillet: FINGER_FILLET, bx: p.bx, by: p.by, br: p.br });
+        break;
+      }
+    }
+  }
+  computeField();
+  meltSlivers();
+  ensureConnected();
+  S.seed = seed;
+}
+
+/** First point along a chamber-to-chamber path that lies outside the start chamber. */
+function tunnelEntrance(ch, pts) {
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const [ax, ay] = pts[i], [bx, by] = pts[i + 1], l = Math.hypot(bx - ax, by - ay);
+    for (let d = 0; d < l; d += 3) {
+      const x = ax + ((bx - ax) * d) / l, y = ay + ((by - ay) * d) / l;
+      if (chamberField(x, y, ch) > 0) return { x, y, dx: (bx - ax) / l, dy: (by - ay) / l };
+    }
+  }
+  return null;
+}
+
+/** Free length of a ray before it meets a wall (capped). */
+function rayFree(x, y, dx, dy, max, margin = 6) {
+  let d = 0;
+  while (d < max) {
+    const s = sdfAt(x + dx * d, y + dy * d);
+    if (s < margin) return d;
+    d += Math.max(2, s - margin);
+  }
+  return max;
+}
+
+// ================================================================== funnels: shape and placement
+// upper wall center line as 5 segments in local units; the lower wall mirrors it (y → −y)
+const SAX = new Float64Array(5), SAY = new Float64Array(5), SDX = new Float64Array(5), SDY = new Float64Array(5);
+const SIL = new Float64Array(5), SNX = new Float64Array(5), SNY = new Float64Array(5);   // 1/len², inward normal
+for (let k = 0; k < 5; k++) {
+  SAX[k] = PROF_X[k]; SAY[k] = PROF_H[k];
+  SDX[k] = PROF_X[k + 1] - PROF_X[k]; SDY[k] = PROF_H[k + 1] - PROF_H[k];
+  const l = Math.hypot(SDX[k], SDY[k]);
+  SIL[k] = 1 / (l * l); SNX[k] = SDY[k] / l; SNY[k] = -SDX[k] / l;
+}
+/** Half-width of the wall center line at local x (profile points are evenly spaced). */
+function hwAt(lx) {
+  const g = (lx - PROF_X[0]) / 30;
+  if (g <= 0) return PROF_H[0];
+  if (g >= 5) return PROF_H[5];
+  const k = g | 0;
+  return PROF_H[k] + (PROF_H[k + 1] - PROF_H[k]) * (g - k);
+}
+// placement samples: points along the upper wall (mirrored for the lower one) and along the axis
+const WS_X = [], WS_Y = [], AX_X = [], AX_R = [];
+for (let k = 0; k < 5; k++) {
+  const steps = Math.ceil(Math.hypot(SDX[k], SDY[k]) / 6);
+  for (let j = 0; j < steps; j++) { WS_X.push(SAX[k] + (SDX[k] * j) / steps); WS_Y.push(SAY[k] + (SDY[k] * j) / steps); }
+}
+WS_X.push(PROF_X[5]); WS_Y.push(PROF_H[5]);
+for (let k = 0; k <= 10; k++) { AX_X.push(-F_HALF + 15 * k); AX_R.push(hwAt(-F_HALF + 15 * k) - F_WALL); }
+const clearance = () => 2 * tw('size') + 3;
+
+/** Distance from a world point to the wall center lines of a funnel posed at (gx, gy, cos, sin). */
+let lastInCone = false;
+function wallDist(gx, gy, gc, gs, px, py) {
+  const dx = px - gx, dy = py - gy, lx = dx * gc + dy * gs, ly = Math.abs(-dx * gs + dy * gc);
+  lastInCone = lx >= -F_HALF && lx <= F_HALF && ly < hwAt(lx);
+  if (lx < -F_HALF - 60 || lx > F_HALF + 60 || ly > PROF_H[0] + 60) return 1e9;
+  let best = 1e18;
+  for (let k = 0; k < 5; k++) {
+    const t = clamp(((lx - SAX[k]) * SDX[k] + (ly - SAY[k]) * SDY[k]) * SIL[k], 0, 1);
+    const ex = lx - SAX[k] - SDX[k] * t, ey = ly - SAY[k] - SDY[k] * t;
+    best = Math.min(best, ex * ex + ey * ey);
+  }
+  return Math.sqrt(best);
+}
+/** Does funnel A (ax, ay, ac, as) touch or sit inside funnel B? Checks A's wall samples against B. */
+function touches(ax, ay, ac, as, bx, by, bc, bs, gap) {
+  for (let k = 0; k < WS_X.length; k++) for (let side = -1; side <= 1; side += 2) {
+    const lx = WS_X[k], ly = WS_Y[k] * side;
+    if (wallDist(bx, by, bc, bs, ax + ac * lx - as * ly, ay + as * lx + ac * ly) < gap || lastInCone) return true;
+  }
+  return false;
+}
+/** True when a funnel at (x, y, a) keeps clear of the walls and of the other resting funnels (slack: allowed shortfall). */
+function fits(f, x, y, a, slack = 0) {
+  if (!(x > 0 && y > 0 && x < WORLD_W && y < WORLD_H)) return false;
+  const c = Math.cos(a), s = Math.sin(a), cl = clearance() - slack, wl = F_WALL + cl, ax = slack * 0.6;
+  for (let k = 0; k <= 10; k++) if (sdfAt(x + c * AX_X[k], y + s * AX_X[k]) < AX_R[k] * 0.9 - ax) return false;   // nothing inside the cone
+  for (let k = 0; k < WS_X.length; k++) {
+    const lx = WS_X[k], ly = WS_Y[k];
+    if (sdfAt(x + c * lx - s * ly, y + s * lx + c * ly) < wl || sdfAt(x + c * lx + s * ly, y + s * lx - c * ly) < wl) return false;
+  }
+  for (const g of S.funnels) {
+    if (g === f || g.hand) continue;
+    const gx = g.gliding ? g.tx : g.x, gy = g.gliding ? g.ty : g.y;
+    if (Math.hypot(gx - x, gy - y) > 2 * F_BOUND + cl) continue;
+    const gap = 2 * F_WALL + cl;
+    if (touches(x, y, c, s, gx, gy, g.c, g.s, gap) || touches(gx, gy, g.c, g.s, x, y, c, s, gap)) return false;
+  }
+  return true;
+}
+/** Nearest spot (rings outward) where funnel f fits with its current angle. */
+const SPOT = { x: 0, y: 0 };
+function findSpot(f, x, y, a, maxR = 900) {
+  if (fits(f, x, y, a)) { SPOT.x = x; SPOT.y = y; return SPOT; }
+  for (let rad = 5; rad <= maxR; rad += 5) {
+    const n = Math.max(8, Math.round((TAU * rad) / 7)), a0 = rad * 0.61;
+    for (let k = 0; k < n; k++) {
+      const t = a0 + (k * TAU) / n, px = x + Math.cos(t) * rad, py = y + Math.sin(t) * rad;
+      if (fits(f, px, py, a)) { SPOT.x = px; SPOT.y = py; return SPOT; }
+    }
+  }
+  return null;
+}
+const TS = { x: 0, y: 0, moved: 0 };   // the pose turnSpot is solving for
+/** Push the pose (TS.x, TS.y) at angle (c, s) so that sample (lx, ly) keeps `need` units from the rock. */
+function pushOut(c, s, lx, ly, need) {
+  const px = TS.x + c * lx - s * ly, py = TS.y + s * lx + c * ly, p = need - sdfAt(px, py);
+  if (p <= 0.02) return;
+  const gx = sdfAt(px + 1.5, py) - sdfAt(px - 1.5, py), gy = sdfAt(px, py + 1.5) - sdfAt(px, py - 1.5), gl = Math.hypot(gx, gy);
+  if (gl < 1e-6) return;
+  TS.x += (gx / gl) * p; TS.y += (gy / gl) * p; TS.moved = Math.max(TS.moved, p);
+}
+/** Turning: where funnel f has to sit at angle a to keep clear of the rock. It is pushed out of the walls from a start
+ *  pose (translation only, like a stick turned in a box), so the spot moves smoothly with the angle and, started from
+ *  home, is home again whenever the funnel fits there. Null when there is no such spot within TURN_REACH of home. */
+function turnSpot(f, a, x0, y0) {
+  const c = Math.cos(a), s = Math.sin(a), wl = F_WALL + clearance() + 0.75;
+  TS.x = x0; TS.y = y0;
+  // sweeps of projections onto every clearance constraint in turn (they converge where the funnel can fit)
+  for (let sweep = 0; sweep < 24; sweep++) {
+    TS.moved = 0;
+    for (let k = 0; k <= 10; k++) pushOut(c, s, AX_X[k], 0, AX_R[k] * 0.9 + 0.75);
+    for (let k = 0; k < WS_X.length; k++) { pushOut(c, s, WS_X[k], WS_Y[k], wl); pushOut(c, s, WS_X[k], -WS_Y[k], wl); }
+    if (Math.hypot(TS.x - f.hx, TS.y - f.hy) > TURN_REACH) return null;
+    if (TS.moved === 0) break;
+  }
+  if (!fits(f, TS.x, TS.y, a)) return null;
+  SPOT.x = TS.x; SPOT.y = TS.y;
+  return SPOT;
+}
+/** One frame of turning. The turn spot is solved on from last frame's spot, drawn a little toward home, so it moves
+ *  continuously (and drifts home whenever there is room); the funnel follows it on a critically damped spring, so its
+ *  path stays smooth, and keeps working while it fits. A solution farther away than the funnel's ends turn is other
+ *  room (beyond a pillar): the spot never jumps there but crosses over at a steady pace while the funnel, inert,
+ *  floats after it. With no room nearby the spot waits; the funnel glides to free space once it stops (settle).
+ *  Returns true while it is still moving on its own (catching up, or drifting home). */
+function turnStep(f, rdt) {
+  if (f.gliding) { f.gliding = false; f.fvx = f.vx; f.fvy = f.vy; }   // a glide in progress hands its speed on
+  if (!f.turnT) { f.turnT = true; f.cross = false; f.tpx = f.x; f.tpy = f.y; f.tpa = f.angle; }
+  const k = 1 - Math.exp(-TURN_HOME * rdt), hx = (f.hx - f.tpx) * k, hy = (f.hy - f.tpy) * k;
+  const step = Math.abs(f.angle - f.tpa) * TURN_SWEEP + Math.hypot(hx, hy) + 0.3;
+  f.tpa = f.angle;
+  let T = f.cross ? null : turnSpot(f, f.angle, f.tpx + hx, f.tpy + hy);
+  if (T && Math.hypot(T.x - f.tpx, T.y - f.tpy) > step) T = null;   // that is other room: no jumping there
+  if (T) { f.tpx = T.x; f.tpy = T.y; }
+  else {
+    const R = turnSpot(f, f.angle, f.hx, f.hy) || findSpot(f, f.hx, f.hy, f.angle, TURN_REACH);
+    if (R) {
+      const dx = R.x - f.tpx, dy = R.y - f.tpy, d = Math.hypot(dx, dy), s = Math.max(step, TURN_GLIDE * rdt);
+      f.cross = d > s;
+      if (f.cross) { f.tpx += (dx / d) * s; f.tpy += (dy / d) * s; } else { f.tpx = R.x; f.tpy = R.y; }
+    } else f.cross = false;   // no room nearby at this angle: the spot waits
+  }
+  const x0 = f.x, y0 = f.y;
+  cdStep(f.x, f.fvx, f.tpx, TURN_FOLLOW, rdt); f.x = CD.p; f.fvx = CD.v;
+  cdStep(f.y, f.fvy, f.tpy, TURN_FOLLOW, rdt); f.y = CD.p; f.fvy = CD.v;
+  f.vx = f.fvx; f.vy = f.fvy;   // a settle glide takes the speed on
+  f.lifted = !fits(f, f.x, f.y, f.angle, TURN_SLACK);
+  if (f.lifted) f.user = true;
+  return Math.hypot(f.x - x0, f.y - y0) > 0.01 || Math.hypot(f.fvx, f.fvy) > 0.5 || Math.hypot(f.tpx - f.x, f.tpy - f.y) > 0.05;
+}
+/** Local hit test (body plus a small margin). */
+function onFunnel(f, wx, wy, pad) {
+  const dx = wx - f.x, dy = wy - f.y, lx = dx * f.c + dy * f.s, ly = Math.abs(-dx * f.s + dy * f.c);
+  return lx >= -F_HALF - F_WALL - pad && lx <= F_HALF + F_WALL + pad && ly <= hwAt(lx) + F_WALL + pad;
+}
+function funnelAt(wx, wy, pad = 7) {
+  for (let i = S.funnels.length - 1; i >= 0; i--) if (onFunnel(S.funnels[i], wx, wy, pad)) return S.funnels[i];
+  return null;
+}
+/** How open the space is ahead of the spout and behind the mouth for a funnel at (x, y, a). */
+function openness(x, y, a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return rayFree(x + c * F_HALF, y + s * F_HALF, c, s, 420, 10) + 0.7 * rayFree(x - c * F_HALF, y - s * F_HALF, -c, -s, 420, 10);
+}
+
+// exact critically damped step toward a fixed target (value p, rate v, stiffness k): frame-rate independent
+const CD = { p: 0, v: 0, i: 0 };   // new value, new rate, integral of the value over dt
+function cdStep(p, v, target, k, dt) {
+  const e0 = p - target, B = v + k * e0, ex = Math.exp(-k * dt), k2 = 1 / (k * k);
+  CD.p = target + (e0 + B * dt) * ex;
+  CD.v = (v - B * k * dt) * ex;
+  CD.i = target * dt + (e0 * (1 - ex)) / k + B * (k2 - ex * (dt / k + k2));
+  return CD;
+}
+
+// ================================================================== funnels: life cycle
+function makeFunnel(x, y, angle, power) {
+  const f = {
+    id: S.nextId++, slot: S.slots.indexOf(null), x, y, angle, power: clamp(power, 0, 1),
+    c: Math.cos(angle), s: Math.sin(angle),
+    w: 0, wd: 0,                          // spin: angular velocity and its rate
+    mvx: 0, mvy: 0, mvax: 0, mvay: 0,     // arrow-key motion: velocity and its rate
+    vx: 0, vy: 0, tx: x, ty: y,           // glide
+    hx: x, hy: y, easing: false,                                   // turning: home spot, still moving on its own
+    turnT: false, cross: false, tpx: 0, tpy: 0, tpa: 0, fvx: 0, fvy: 0,   // turn spot and angle, crossing over, speed
+    lifted: true, gliding: false, hand: false, user: false,
+    pop: 0, lift: 1, hot: 0, glow: 0, flash: 0, inside: 0, through: 0, el: null, ui: null,
+  };
+  S.slots[f.slot] = f;
+  S.funnels.push(f);
+  makePill(f);
+  return f;
+}
+/** Bring a lifted funnel down: right here if it fits, else glide to the nearest free spot. */
+function settle(f) {
+  const spot = findSpot(f, f.x, f.y, f.angle);
+  if (!spot) { destroyFunnel(f, { noUndo: true, silent: true }); Kit.toast('No room for that funnel', { tone: 'bad' }); return false; }
+  f.hx = spot.x; f.hy = spot.y;
+  if (Math.hypot(spot.x - f.x, spot.y - f.y) < 0.5) land(f);
+  else { f.tx = spot.x; f.ty = spot.y; f.gliding = true; f.lifted = true; }
+  return true;
+}
+function land(f) {
+  const wasUp = f.lift > 0.3 && f.pop >= 1;
+  f.lifted = false; f.gliding = false; f.vx = 0; f.vy = 0;
+  if (wasUp && f.user) {
+    Kit.sfx('place', { pitch: 0.85, vol: 0.4, gap: 80 });
+    emit(1, f.x, f.y, 0, 0, 0.5, F_HALF + 12, 3);
+  }
+  f.user = false;
+}
+function addFunnel(x, y, angle, power = 0.6, opts = {}) {
+  if (S.funnels.length >= MAX_FUNNELS) {
+    if (!opts.quiet) { Kit.toast(`Up to ${MAX_FUNNELS} funnels`, { tone: 'bad' }); Kit.sfx('buzz'); }
+    return null;
+  }
+  const f = makeFunnel(x, y, angle, power);
+  if (!settle(f)) return null;
+  if (!opts.keepSel) select(f);
+  if (!opts.quiet) {
+    Kit.sfx('pop', { pitch: 1.1 });
+    burst(x - f.c * F_HALF, y - f.s * F_HALF, 1, 10, 160);
+    burst(x + f.c * F_HALF, y + f.s * F_HALF, 2, 8, 160);
+  }
+  updateCounts();
+  return f;
+}
+function destroyFunnel(f, opts = {}) {
+  const i = S.funnels.indexOf(f);
+  if (i < 0) return false;
+  S.funnels.splice(i, 1);
+  S.slots[f.slot] = null;
+  for (let p = 0; p < N; p++) if (INF[p] === f.slot) { INF[p] = -1; INT[p] = 0; }   // release what was inside
+  if (!opts.noUndo) { S.undo.push({ x: f.gliding ? f.tx : f.x, y: f.gliding ? f.ty : f.y, angle: f.angle, power: f.power }); if (S.undo.length > 24) S.undo.shift(); }
+  f.die = 0;
+  S.dead.push(f);
+  removePill(f);
+  if (S.sel === f) S.sel = null;
+  if (S.hover === f) S.hover = null;
+  if (S.pillHover === f) S.pillHover = null;
+  if (S.pillDrag === f) S.pillDrag = null;
+  if (S.press && S.press.f === f) S.press = null;
+  if (S.drag && S.drag.f === f) S.drag = null;
+  if (!opts.silent) {
+    Kit.sfx('remove', { pitch: 0.9 });
+    Kit.sfx('pop', { pitch: 0.55, vol: 0.7 });
+    burst(f.x - f.c * F_HALF, f.y - f.s * F_HALF, 1, 18, 260);
+    burst(f.x + f.c * F_HALF, f.y + f.s * F_HALF, 2, 14, 260);
+    burst(f.x, f.y, 3, 14, 200);
+    if (!opts.noUndo) Kit.toast('Funnel removed · Z to undo', { tone: 'info' });
+  }
+  updateCounts();
+  refreshHint();
+  return true;
+}
+function undo() {
+  const u = S.undo.pop();
+  if (!u) { Kit.toast('Nothing to undo', { tone: 'info' }); return null; }
+  if (S.funnels.length >= MAX_FUNNELS) { S.undo.push(u); Kit.toast(`Up to ${MAX_FUNNELS} funnels`, { tone: 'bad' }); Kit.sfx('buzz'); return null; }
+  const f = addFunnel(u.x, u.y, u.angle, u.power, { quiet: true });
+  if (f) { Kit.sfx('chime', { pitch: 1.2, vol: 0.6 }); burst(u.x, u.y, 3, 16, 180); Kit.toast('Funnel back', { tone: 'good' }); }
+  return f;
+}
+function clearFunnels() {
+  if (!S.funnels.length) return;
+  for (const f of S.funnels.slice()) destroyFunnel(f, { silent: true });
+  Kit.sfx('remove', { pitch: 0.7 });
+  Kit.toast('Funnels cleared · Z brings them back one by one', { tone: 'info', ms: 2200 });
+}
+function setPower(f, p) {
+  p = clamp(p, 0, 1);
+  if (!f || p === f.power) return;
+  f.power = p;
+  syncPill(f);
+}
+/** The best angle at (x, y): fits right here if possible, with open space ahead and behind. */
+function bestAngle(x, y) {
+  let best = 0, bs = -1, fitA = null, fs = -1;
+  for (let k = 0; k < 24; k++) {
+    const a = (k / 24) * TAU, sc = openness(x, y, a);
+    if (sc > bs) { bs = sc; best = a; }
+    if (sc > fs && fits(null, x, y, a)) { fs = sc; fitA = a; }
+  }
+  return fitA !== null ? fitA : best;
+}
+/** Right-click: a new funnel at the cursor, refused (shaking red ghost + buzz) on walls and on other funnels. */
+function createAtCursor(wx, wy) {
+  const on = funnelAt(wx, wy);
+  if (sdfAt(wx, wy) < 3 || on) {
+    S.ghost = { x: wx, y: wy, angle: on ? on.angle : S.sel ? S.sel.angle : 0, t: Kit.realTime };
+    if (on) on.flash = 0.8;
+    Kit.sfx('buzz');
+    return null;
+  }
+  return addFunnel(wx, wy, bestAngle(wx, wy), 0.6);
+}
+/** Toolbar / test: a new funnel in a random open spot. */
+function addFunnelFree() {
+  if (S.funnels.length >= MAX_FUNNELS) return addFunnel(0, 0, 0);
+  let best = null, bs = -1;
+  for (let tries = 0, found = 0; tries < 500 && found < 14; tries++) {
+    const s = MAP.free[(Math.random() * MAP.freeN) | 0], x = (s % GW) * GRID, y = Math.floor(s / GW) * GRID, a0 = Math.random() * TAU;
+    for (let k = 0; k < 8; k++) {
+      const a = a0 + (k * TAU) / 8;
+      if (!fits(null, x, y, a)) continue;
+      found++;
+      const sc = openness(x, y, a);
+      if (sc > bs) { bs = sc; best = { x, y, a }; }
+      break;
+    }
+  }
+  if (!best) { Kit.toast('No free spot for a funnel', { tone: 'bad' }); Kit.sfx('buzz'); return null; }
+  return addFunnel(best.x, best.y, best.a, 0.6);
+}
+
+/** Per frame on wall-clock time: spin, arrow moves, glides, landing, and the visual easing. */
+function updateFunnels(rdt) {
+  const keyDir = (Kit.held('KeyD') ? 1 : 0) - (Kit.held('KeyA') ? 1 : 0);
+  const rotT = keyDir ? rotTarget() : null;
+  if (rotT && rotT !== S.sel) select(rotT);
+  const mx = (Kit.held('ArrowRight') ? 1 : 0) - (Kit.held('ArrowLeft') ? 1 : 0);
+  const my = (Kit.held('ArrowDown') ? 1 : 0) - (Kit.held('ArrowUp') ? 1 : 0);
+  const ml = Math.hypot(mx, my) || 1;
+  const fade = (v, target, rate) => (Math.abs(target - v) < 1e-3 ? target : v + (target - v) * (1 - Math.exp(-rate * rdt)));
+  for (let fi = S.funnels.length - 1; fi >= 0; fi--) {
+    const f = S.funnels[fi];
+    f.pop = Math.min(1, f.pop + rdt / 0.42);
+    const dragged = !!(S.drag && S.drag.f === f);
+    // spin with eased angular velocity: speeds up, holds, slows to a stop
+    const wT = f === rotT ? keyDir * ROT_MAX : 0;
+    if (wT || f.w || f.wd) {
+      cdStep(f.w, f.wd, wT, ROT_K, rdt);
+      f.angle += CD.i; f.w = CD.p; f.wd = CD.v;
+      if (!wT && Math.abs(f.w) < 2e-4 && Math.abs(f.wd) < 2e-3) { f.w = 0; f.wd = 0; }
+      f.c = Math.cos(f.angle); f.s = Math.sin(f.angle);
+    }
+    const spinning = wT !== 0 || f.w !== 0;
+    // arrow keys move the selected funnel with eased speed; it hovers while it travels
+    const tx = f === S.sel && !dragged ? (mx / ml) * MOVE_MAX : 0, ty = f === S.sel && !dragged ? (my / ml) * MOVE_MAX : 0;
+    if (tx || ty || f.mvx || f.mvy || f.mvax || f.mvay) {
+      cdStep(f.mvx, f.mvax, tx, MOVE_K, rdt); const dx = CD.i; f.mvx = CD.p; f.mvax = CD.v;
+      cdStep(f.mvy, f.mvay, ty, MOVE_K, rdt); const dy = CD.i; f.mvy = CD.p; f.mvay = CD.v;
+      if (!tx && !ty && Math.hypot(f.mvx, f.mvy) < 0.3 && Math.hypot(f.mvax, f.mvay) < 3) { f.mvx = f.mvy = f.mvax = f.mvay = 0; }
+      f.x = clamp(f.x + dx, 20, WORLD_W - 20); f.y = clamp(f.y + dy, 20, WORLD_H - 20);
+      f.hand = true; f.lifted = true; f.gliding = false;
+    } else if (f.hand && !dragged) { f.hand = false; f.user = true; if (!settle(f)) continue; }
+    if (f.hand || dragged) { f.easing = false; f.turnT = false; f.fvx = f.fvy = 0; }
+    else {
+      // turning: it slides just clear of the rock and keeps working; it only hovers where there is no room nearby
+      if (spinning || f.easing) f.easing = turnStep(f, rdt);
+      else { f.turnT = false; if (f.lifted && !f.gliding && !settle(f)) continue; }
+      if (f.gliding) {
+        cdStep(f.x, f.vx, f.tx, GLIDE_K, rdt); f.x = CD.p; f.vx = CD.v;
+        cdStep(f.y, f.vy, f.ty, GLIDE_K, rdt); f.y = CD.p; f.vy = CD.v;
+        if (Math.hypot(f.x - f.tx, f.y - f.ty) < 0.25 && Math.hypot(f.vx, f.vy) < 6) {
+          f.x = f.tx; f.y = f.ty;
+          if (fits(f, f.x, f.y, f.angle)) land(f); else { f.gliding = false; f.user = true; }
+        }
+      }
+    }
+    f.lift = fade(f.lift, f.lifted ? 1 : 0, 12);
+    f.hot = fade(f.hot, f === hovered() || dragged ? 1 : 0, 14);
+    f.glow = fade(f.glow, f.lifted ? f.power * 0.25 : f.power, 8);
+    f.flash = Math.max(0, f.flash - rdt * 3);
+  }
+  for (let i = S.dead.length - 1; i >= 0; i--) { const f = S.dead[i]; f.die += rdt / 0.42; if (f.die >= 1) S.dead.splice(i, 1); }
+}
+
+// ================================================================== particles
+function inFunnel(x, y, pad) { for (const f of S.funnels) if (onFunnel(f, x, y, pad)) return true; return false; }
+function spawnAt(i) {
+  const r = tw('size');
+  let x = PX[i], y = PY[i];
+  for (let tries = 0; tries < 60; tries++) {
+    const s = MAP.free[(Math.random() * MAP.freeN) | 0];
+    const cx = (s % GW) * GRID + (Math.random() - 0.5) * GRID, cy = Math.floor(s / GW) * GRID + (Math.random() - 0.5) * GRID;
+    if (sdfAt(cx, cy) < r + 2) continue;
+    x = cx; y = cy;
+    if (!inFunnel(cx, cy, 6)) break;
+  }
+  const a = Math.random() * TAU, v = BASE_SPEED * S.speed;
+  PX[i] = x; PY[i] = y; VX[i] = Math.cos(a) * v; VY[i] = Math.sin(a) * v;
+  WARM[i] = 0; COOL[i] = 0; INT[i] = 0; INF[i] = -1; ENTRY[i] = 0;
+}
+function copyParticle(from, to) {
+  PX[to] = PX[from]; PY[to] = PY[from]; VX[to] = VX[from]; VY[to] = VY[from];
+  WARM[to] = WARM[from]; COOL[to] = COOL[from]; INT[to] = INT[from]; INF[to] = INF[from]; ENTRY[to] = ENTRY[from];
+}
+/** Live count change: new particles sparkle in at random free spots, removed ones fade out. */
+function setParticleCount(n, quiet) {
+  n = clamp(Math.round(n), MIN_PARTICLES, MAX_PARTICLES);
+  const fxCap = quiet ? 0 : 80;
+  let k = 0;
+  while (N < n) { spawnAt(N); if (k++ < fxCap) emit(1, PX[N], PY[N], 0, 0, 0.4, 7, 3); N++; }
+  while (N > n) {
+    const j = (Math.random() * N) | 0;
+    if (k++ < fxCap) emit(2, PX[j], PY[j], VX[j] * 0.2, VY[j] * 0.2, 0.45, tw('size'), 0);
+    copyParticle(N - 1, j);
+    N--;
+  }
+  S.count = n;
+  syncCountUI();
+}
+/** Live speed change: every particle's velocity scales with it at once (relaxing would take seconds when slowing). */
+function setSpeed(x) {
+  const v = clamp(Math.round(x * 10) / 10, 0.2, 3), k = v / S.speed;
+  if (k !== 1) for (let i = 0; i < N; i++) { VX[i] *= k; VY[i] *= k; }
+  S.speed = v;
+  syncSpeedUI();
+}
+
+/** True when the straight line a → b stays out of the walls (three samples are enough at this scale). */
+function lineClear(ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  return sdfAt(ax + dx * 0.25, ay + dy * 0.25) > 0 && sdfAt(ax + dx * 0.5, ay + dy * 0.5) > 0 && sdfAt(ax + dx * 0.75, ay + dy * 0.75) > 0;
+}
+
+// contact with one funnel during a sub-step. Writes the new state to C; returns 0 outside, 1 inside, 2 just left by the spout
+const C = { x: 0, y: 0, vx: 0, vy: 0, u: 0 };
+function funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, wasIn, fromMouth) {
+  const c = f.c, s = f.s, dx = x - f.x, dy = y - f.y;
+  let lx = dx * c + dy * s;
+  const ly0 = -dx * s + dy * c, sg = ly0 < 0 ? -1 : 1;
+  let ay = ly0 * sg, lvx = vx * c + vy * s, avy = (-vx * s + vy * c) * sg;
+  // the previous position decides which side of a wall the particle belongs to: no passing through. In front of the
+  // mouth or the spout counts as the inner side (hwAt holds the lip height there), so a particle about to enter that
+  // grazes a lip's inner face stays in front of the opening instead of being put out beside the funnel
+  const qx = px - f.x, qy = py - f.y, plx = qx * c + qy * s, ply = Math.abs(-qx * s + qy * c);
+  const before = ply < hwAt(plx);
+  let best = 1e9, bi = 0, bt = 0;
+  for (let k = 0; k < 5; k++) {
+    let t = ((lx - SAX[k]) * SDX[k] + (ay - SAY[k]) * SDY[k]) * SIL[k];
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const ex = lx - SAX[k] - SDX[k] * t, ey = ay - SAY[k] - SDY[k] * t, d2 = ex * ex + ey * ey;
+    if (d2 < best) { best = d2; bi = k; bt = t; }
+  }
+  const lim = F_WALL + r;
+  if (best < lim * lim) {
+    const cx = SAX[bi] + SDX[bi] * bt, cy = SAY[bi] + SDY[bi] * bt, d = Math.sqrt(best);
+    let nx, ny;
+    if (d > 1e-6) { nx = (lx - cx) / d; ny = (ay - cy) / d; } else { nx = before ? SNX[bi] : -SNX[bi]; ny = before ? SNY[bi] : -SNY[bi]; }
+    if (!((bi === 0 && bt === 0) || (bi === 4 && bt === 1))) {   // along the wall (not at a rounded lip)
+      const side = nx * SNX[bi] + ny * SNY[bi];
+      if (before ? side < 0 : side > 0) { const fl = before ? 1 : -1; nx = SNX[bi] * fl; ny = SNY[bi] * fl; }
+    }
+    lx = cx + nx * lim; ay = cy + ny * lim;
+    const vn = lvx * nx + avy * ny;
+    if (vn < 0) { lvx -= (1 + bounce) * vn * nx; avy -= (1 + bounce) * vn * ny; }
+  }
+  let code = 0;
+  if (lx >= -F_HALF && lx <= F_HALF && ay < hwAt(lx)) {
+    // inside the cone: carried toward the spout, gently centered; a stuck particle gets nudged out (out of the
+    // spout while the funnel works; at power 0 back the way it came, so an idle funnel pumps nothing either way)
+    code = 1;
+    const P = f.power, acc = S.speed * S.speed;
+    let push = CARRY_ACC * acc * P;
+    if (tIn > STUCK_T) {
+      const dir = P > 0 || !fromMouth ? 1 : -1;
+      push += dir * 520 * (tIn - STUCK_T + 0.3);
+      if (lvx * dir < 0) lvx *= 0.8;
+    }
+    lvx += push * h;
+    avy -= ay * 26 * acc * P * h;
+    avy *= 1 - Math.min(0.5, 3.5 * P * h);
+    C.u = (lx + F_HALF) / F_LEN;
+  } else if (wasIn && lx > F_HALF - 0.5) code = 2;
+  const ly = ay * sg, lvy = avy * sg;
+  C.x = f.x + lx * c - ly * s; C.y = f.y + lx * s + ly * c;
+  C.vx = lvx * c - lvy * s; C.vy = lvx * s + lvy * c;
+  return code;
+}
+
+/** The resting funnels, which are the ones that act, into FA; returns how many. */
+function workingFunnels() {
+  let nf = 0;
+  for (const f of S.funnels) if (!f.lifted) FA[nf++] = f;
+  return nf;
+}
+/** The fields of the first nf funnels of FA on a particle at (x, y) outside every funnel, into FLD: acceleration ax, ay
+ *  (world units / s²), pulled (how hard it is pulled, for the red tint) and d2 (squared distance to the nearest funnel).
+ *  Pull and push mirror each other. In the red half-space in front of the mouth a particle is drawn toward the mouth
+ *  center; in the blue half-space behind the spout it is driven away from the spout center. Both use the same power,
+ *  reach, falloff (1 − d / reach)², line-of-sight test and rock rule: a field never presses a particle into rock, so it
+ *  is off where rock lies within FIELD_CLEAR ahead of the particle in the direction it is driven. The pull ends in its
+ *  mouth; without the rock rule an equally strong push pins particles in a thin layer on rock that faces a spout. */
+const FLD = { ax: 0, ay: 0, pulled: 0, d2: 0 };
+function fieldAt(x, y, nf, reach, acc) {
+  const reach2 = reach * reach;
+  let ax = 0, ay = 0, pulled = 0, dmin2 = 1e18;
+  for (let q = 0; q < nf; q++) {
+    const f = FA[q], dx = x - f.x, dy = y - f.y, lx = dx * f.c + dy * f.s;
+    dmin2 = Math.min(dmin2, dx * dx + dy * dy);
+    const P = f.power, side = lx < -F_HALF ? -1 : lx > F_HALF ? 1 : 0;   // −1 red (mouth) side, +1 blue (spout) side
+    if (P <= 0 || !side) continue;
+    const ox = f.x + side * f.c * F_HALF, oy = f.y + side * f.s * F_HALF, ex = x - ox, ey = y - oy, d2 = ex * ex + ey * ey;
+    if (d2 >= reach2 || d2 <= 1 || !lineClear(x, y, ox, oy)) continue;
+    const d = Math.sqrt(d2), ux = (side * ex) / d, uy = (side * ey) / d;   // the direction the field drives it
+    if (sdfAt(x + ux * FIELD_CLEAR * 0.5, y + uy * FIELD_CLEAR * 0.5) <= 0 || sdfAt(x + ux * FIELD_CLEAR, y + uy * FIELD_CLEAR) <= 0) continue;
+    const fall = 1 - d / reach, a = (side * FIELD_ACC * acc * P * fall * fall) / d;
+    ax += ex * a; ay += ey * a;   // along +e (away from the spout) on the blue side, along −e (toward the mouth) on the red
+    if (side < 0 && fall * P > pulled) pulled = fall * P;
+  }
+  FLD.ax = ax; FLD.ay = ay; FLD.pulled = pulled; FLD.d2 = dmin2;
+}
+
+/** One simulation step for every particle: random walk, funnel fields, sub-stepped motion and bounces. */
+function simulate(dt) {
+  if (dt <= 0) return;
+  const sp = S.speed, cruise = BASE_SPEED * sp, acc = sp * sp, r = tw('size'), bounce = tw('bounce'), reach = tw('reach') * F_LEN;
+  const relaxUp = 1 - Math.exp(-RELAX_UP * dt), relaxDown = 1 - Math.exp(-RELAX_DOWN * dt), wander = WANDER * Math.sqrt(dt) * 2.449, vmax = VMAX * sp, maxStep = r + 2.5;
+  const carryV = CARRY_ACC * acc * dt, B2 = F_BOUND * F_BOUND;
+  for (const f of S.funnels) f.inside = 0;
+  const nf = workingFunnels();
+  let exits = 0;
+  for (let i = 0; i < N; i++) {
+    let x = PX[i], y = PY[i], vx = VX[i], vy = VY[i];
+    const x0 = x, y0 = y;
+    let slot = INF[i], tIn = INT[i], ax = 0, ay = 0, pulled = 0, near = slot >= 0, u = 0;
+    if (slot < 0) {
+      // gas-like random walk at cruising speed
+      let v = Math.hypot(vx, vy);
+      if (v < 1) { const a = Math.random() * TAU; vx = Math.cos(a); vy = Math.sin(a); v = 1; }
+      const turn = (Math.random() + Math.random() - 1) * wander * Math.min(1, cruise / v);
+      const ct = Math.cos(turn), st = Math.sin(turn), rx = vx * ct - vy * st;
+      vy = vx * st + vy * ct; vx = rx;
+      const k = (v + (cruise - v) * (v < cruise ? relaxUp : relaxDown)) / v;
+      vx *= k; vy *= k;
+      // pull and push (a funnel's walls shield what is inside it from the other funnels' fields)
+      fieldAt(x, y, nf, reach, acc);
+      ax = FLD.ax; ay = FLD.ay; pulled = FLD.pulled;
+      // funnel walls are checked for every particle that can reach a funnel this step, counting the field it gets now
+      const rch = F_BOUND + (Math.hypot(vx, vy) + Math.hypot(ax, ay) * dt + 500) * dt;
+      near = FLD.d2 < rch * rch;
+    }
+    // sub-steps no longer than about one radius, so nothing tunnels through a wall
+    const vEst = Math.hypot(vx, vy) + Math.hypot(ax, ay) * dt + (near ? carryV + 600 * dt : 0);
+    const n = Math.min(120, Math.ceil((vEst * dt) / maxStep) || 1), h = dt / n;
+    for (let st = 0; st < n; st++) {
+      vx += ax * h; vy += ay * h;
+      const px = x, py = y;
+      x += vx * h; y += vy * h;
+      let inSlot = -1;
+      if (near) {
+        for (let q = 0; q < nf; q++) {
+          const f = FA[q], dx = x - f.x, dy = y - f.y;
+          if (dx * dx + dy * dy > B2) continue;
+          const code = funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, slot === f.slot, ENTRY[i] === 1);
+          x = C.x; y = C.y; vx = C.vx; vy = C.vy;
+          if (code === 1) { inSlot = f.slot; u = C.u; }
+          else if (code === 2) {   // out of the spout: the blue kick, scaled by the same power as the fields
+            const kv = KICK * sp * f.power;
+            vx += f.c * kv; vy += f.s * kv;
+            COOL[i] = 1; WARM[i] = 0;
+            if (ENTRY[i]) { exits++; f.through++; }
+            ENTRY[i] = 0;
+          }
+        }
+      }
+      if (inSlot !== slot) {
+        if (inSlot >= 0) { ENTRY[i] = u < 0.5 ? 1 : 0; tIn = 0; near = true; }
+        slot = inSlot;
+      }
+      if (slot >= 0) tIn += h;
+      // maze walls: push out along the SDF normal, reflect with a little spin
+      let d = sdfAt(x, y);
+      if (d < r) {
+        let nx = 0, ny = 0;
+        for (let it = 0; it < 4 && d < r; it++) {
+          const gx = sdfAt(x + 1.5, y) - sdfAt(x - 1.5, y), gy = sdfAt(x, y + 1.5) - sdfAt(x, y - 1.5), gl = Math.hypot(gx, gy);
+          if (gl < 1e-6) break;
+          nx = gx / gl; ny = gy / gl;
+          x += nx * (r - d + 0.05); y += ny * (r - d + 0.05);
+          d = sdfAt(x, y);
+        }
+        const vn = vx * nx + vy * ny;
+        if (vn < 0) {
+          vx -= (1 + bounce) * vn * nx; vy -= (1 + bounce) * vn * ny;
+          const sp2 = (Math.random() - 0.5) * 0.3, ct = Math.cos(sp2), sn = Math.sin(sp2), rx = vx * ct - vy * sn;
+          vy = vx * sn + vy * ct; vx = rx;
+        }
+      }
+    }
+    if (sdfAt(x, y) < r * 0.5) { x = x0; y = y0; vx = -vx; vy = -vy; }   // never ends a step inside a wall
+    const v2 = vx * vx + vy * vy;
+    if (v2 > vmax * vmax) { const k = vmax / Math.sqrt(v2); vx *= k; vy *= k; }
+    PX[i] = x; PY[i] = y; VX[i] = vx; VY[i] = vy;
+    INF[i] = slot; INT[i] = slot >= 0 ? tIn : 0;
+    if (slot >= 0) { WARM[i] = 1 - u; COOL[i] = u; S.slots[slot].inside++; }
+    else { WARM[i] = Math.max(WARM[i] - dt * 1.6, pulled); COOL[i] = Math.max(0, COOL[i] - dt * 0.7); }
+  }
+  S.exits += exits;
+}
+
+// ================================================================== effects (sparks, rings, fades)
+const MAX_FX = 700;
+const FXX = new Float32Array(MAX_FX), FXY = new Float32Array(MAX_FX), FXVX = new Float32Array(MAX_FX), FXVY = new Float32Array(MAX_FX);
+const FXL = new Float32Array(MAX_FX), FXM = new Float32Array(MAX_FX), FXS = new Float32Array(MAX_FX);
+const FXK = new Uint8Array(MAX_FX), FXC = new Uint8Array(MAX_FX);
+const FX_SPRITE = [COL.part, COL.red, COL.blue, COL.violet];
+const FX_SHAPE = [SH.white, SH.red, SH.blue, SH.light];
+let fxN = 0;
+/** kind 0 spark, 1 ring, 2 fading dot; color 0 neutral, 1 red, 2 blue, 3 violet. World units. */
+function emit(kind, x, y, vx, vy, life, size, col) {
+  if (fxN >= MAX_FX) return;
+  const i = fxN++;
+  FXK[i] = kind; FXX[i] = x; FXY[i] = y; FXVX[i] = vx; FXVY[i] = vy; FXL[i] = life; FXM[i] = life; FXS[i] = size; FXC[i] = col;
+}
+function burst(x, y, col, n, speed) {
+  for (let k = 0; k < n; k++) {
+    const a = Math.random() * TAU, v = speed * (0.35 + Math.random() * 0.65);
+    emit(0, x, y, Math.cos(a) * v, Math.sin(a) * v, 0.35 + Math.random() * 0.4, 1.6 + Math.random() * 1.8, col);
+  }
+  emit(1, x, y, 0, 0, 0.5, 26, col);
+}
+function updateFx(rdt) {
+  const damp = Math.exp(-4 * rdt);
+  for (let i = fxN - 1; i >= 0; i--) {
+    FXL[i] -= rdt;
+    if (FXL[i] <= 0) {
+      const j = --fxN;
+      FXK[i] = FXK[j]; FXX[i] = FXX[j]; FXY[i] = FXY[j]; FXVX[i] = FXVX[j]; FXVY[i] = FXVY[j];
+      FXL[i] = FXL[j]; FXM[i] = FXM[j]; FXS[i] = FXS[j]; FXC[i] = FXC[j];
+      continue;
+    }
+    FXX[i] += FXVX[i] * rdt; FXY[i] += FXVY[i] * rdt;
+    FXVX[i] *= damp; FXVY[i] *= damp;
+  }
+}
+
+// ================================================================== power slider on each funnel (screen-aligned DOM)
+let pillLayer = null;
+const PILL_W = 114, PILL_H = 24, THUMB_W = 38;   // the value text stays ≥ 10.5 px at the smallest scale
+const pillScale = () => clamp(S.sc * 1.15, 0.84, 1.15);
+// the power ramp: thin at the weak end, thick and rounded at the strong end
+const RAMP = '<path d="M1 5.3 L61.5 0 A6.5 6.5 0 0 1 61.5 13 L1 7.7 A1.2 1.2 0 0 1 1 5.3 Z"/>';
+const RAMP_DEFS = '<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>'
+  + '<linearGradient id="fn-grad"><stop offset="0" stop-color="#ff4d6d"/><stop offset="0.55" stop-color="#b48cff"/><stop offset="1" stop-color="#4aa3ff"/></linearGradient>'
+  + '<linearGradient id="fn-grad-sh"><stop offset="0" stop-color="#ff3b30"/><stop offset="0.5" stop-color="#ff3b30"/><stop offset="0.5" stop-color="#0a84ff"/><stop offset="1" stop-color="#0a84ff"/></linearGradient>'
+  + '</defs></svg>';
+function makePill(f) {
+  const pos = document.createElement('div');
+  pos.className = 'fn-pos';
+  const pill = document.createElement('div');
+  pill.className = 'fn-pill';
+  pill.innerHTML = '<span class="fn-mk" data-step="-1">−</span><div class="fn-track"><div class="fn-ramp">'
+    + `<svg class="fn-ramp-base" viewBox="0 0 68 13">${RAMP}</svg><svg class="fn-ramp-fill" viewBox="0 0 68 13">${RAMP}</svg></div>`
+    + '<div class="fn-thumb"><span></span></div></div><span class="fn-mk" data-step="1">+</span>';
+  pos.append(pill);
+  pillLayer.append(pos);
+  f.el = pos;
+  f.ui = { pill, track: pill.querySelector('.fn-track'), val: pill.querySelector('.fn-thumb span'), minus: pill.firstChild, plus: pill.lastChild, x: NaN, y: NaN, k: NaN, cls: '', p: -1, tick: -1 };
+  pill.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.button !== 0 || !S.funnels.includes(f)) return;
+    select(f);
+    const step = e.target.closest('[data-step]');
+    if (step) { setPower(f, notch(f.power, 10, +step.dataset.step)); tick(f, true); return; }
+    S.pillDrag = f;
+    try { pill.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    powerFromX(f, e.clientX);
+  });
+  pill.addEventListener('pointermove', (e) => { if (S.pillDrag === f) powerFromX(f, e.clientX); });
+  const end = () => { if (S.pillDrag === f) S.pillDrag = null; };
+  pill.addEventListener('pointerup', end);
+  pill.addEventListener('pointercancel', end);
+  pill.addEventListener('lostpointercapture', end);
+  pill.addEventListener('pointerenter', () => { S.pillHover = f; });
+  pill.addEventListener('pointerleave', () => { if (S.pillHover === f) S.pillHover = null; });
+  pill.addEventListener('contextmenu', (e) => e.preventDefault());
+  pill.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!S.funnels.includes(f)) return;
+    const d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+    if (!d) return;
+    select(f);
+    setPower(f, notch(f.power, 20, -Math.sign(d)));
+    tick(f, true);
+  }, { passive: false });
+  syncPill(f);
+}
+/** The next notch (of `per` per 100 %) above (dir 1) or below (dir −1) power p: "+" from 75 % is 80 %, not 90 %. */
+const notch = (p, per, dir) => (dir > 0 ? Math.floor(p * per + 1e-6) + 1 : Math.ceil(p * per - 1e-6) - 1) / per;
+function powerFromX(f, clientX) {
+  const r = f.ui.track.getBoundingClientRect(), th = THUMB_W * f.ui.k;
+  setPower(f, Math.round(clamp((clientX - r.left - th / 2) / (r.width - th), 0, 1) * 100) / 100);
+  tick(f, false);
+}
+/** A soft click whenever the power crosses a 5 % notch (pitch follows the power). */
+function tick(f, always) {
+  const n = Math.round(f.power * 20);
+  if (always || n !== f.ui.tick) Kit.sfx('click', { pitch: 0.7 + f.power * 0.8, vol: 0.55, gap: always ? 0 : 35 });
+  f.ui.tick = n;
+}
+function syncPill(f) {
+  const ui = f.ui;
+  if (!ui) return;
+  const p = Math.round(f.power * 100) / 100;
+  if (p === ui.p) return;
+  ui.p = p;
+  ui.pill.style.setProperty('--p', p);
+  ui.pill.style.setProperty('--tc', Kit.isAbstract ? (p < 0.5 ? SH.red : SH.blue) : U.mixHex(COL.red, COL.blue, p));
+  ui.val.textContent = Math.round(p * 100) + ' %';
+  // the stronger end lights up: "+" grows brighter with power, "−" with weakness
+  ui.minus.style.opacity = (0.4 + 0.6 * (1 - p)).toFixed(2);
+  ui.plus.style.opacity = (0.4 + 0.6 * p).toFixed(2);
+}
+function removePill(f) {
+  const el = f.el;
+  if (!el) return;
+  f.ui.pill.classList.add('is-out');
+  setTimeout(() => el.remove(), 320);
+  f.el = null;
+}
+/** Every frame: keep each slider on its funnel, screen-aligned, inside the play area. */
+function positionPills() {
+  const pr = Kit.playRect, k = pillScale(), hw = (PILL_W * k) / 2 + 3, hh = (PILL_H * k) / 2 + 3;
+  for (const f of S.funnels) {
+    const ui = f.ui;
+    let x = S.ox + (f.x + f.c * PILL_AT) * S.sc, y = S.oy + (f.y + f.s * PILL_AT) * S.sc - f.lift * 5;
+    x = clamp(x, pr.x + hw, pr.x + pr.w - hw);
+    y = clamp(y, pr.y + hh, pr.y + pr.h - hh);
+    // whole pixels at rest (crisp text); sub-pixel while it moves or turns, so it glides instead of stepping
+    if (!f.lifted && !f.easing && f.w === 0 && f.wd === 0 && f.lift < 0.01) { x = Math.round(x); y = Math.round(y); }
+    else { x = Math.round(x * 64) / 64; y = Math.round(y * 64) / 64; }
+    if (x !== ui.x || y !== ui.y) { f.el.style.transform = `translate(${x}px,${y}px)`; ui.x = x; ui.y = y; }
+    if (k !== ui.k) { ui.pill.style.setProperty('--k', k); ui.k = k; }
+    const cls = (f === S.sel ? ' is-sel' : '') + (f.hot > 0.5 || S.pillHover === f ? ' is-hot' : '')
+      + (S.pillDrag === f ? ' is-drag' : '') + (f.lifted && f.lift > 0.5 ? ' is-lift' : '');
+    if (cls !== ui.cls) { ui.pill.className = 'fn-pill' + cls; ui.cls = cls; }
+  }
+}
+
+// ================================================================== selection + input
+const toWorldX = (sx) => (sx - S.ox) / S.sc, toWorldY = (sy) => (sy - S.oy) / S.sc;
+function select(f) {
+  if (S.sel === f) return;
+  S.sel = f;
+  if (f) f.flash = 0.6;
+  refreshHint();
+}
+const hovered = () => S.pillHover || (S.drag ? S.drag.f : S.hover);
+const rotTarget = () => hovered() || S.sel;
+function refreshHint() {
+  Kit.setHint(S.sel ? 'Hold A or D to turn it · W or S sets its power · arrows move it · Delete removes it' : null);
+}
+function cycle(dir) {
+  const n = S.funnels.length;
+  if (!n) return;
+  const i = S.funnels.indexOf(S.sel);
+  const f = S.funnels[i < 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n];
+  select(f);
+  f.flash = 1;
+  Kit.sfx('click', { pitch: 1.3 });
+}
+function setCursor(c) { if (c !== S.cursor) { S.cursor = c; Kit.canvas.style.cursor = c; } }
+function updateHover(p) {
+  S.hover = S.drag ? S.drag.f : funnelAt(toWorldX(p.x), toWorldY(p.y));
+  setCursor(S.drag ? 'grabbing' : S.hover ? 'grab' : 'default');
+}
+function pointerDown(p) {
+  if (!S.ready) return;
+  updateHover(p);
+  const wx = toWorldX(p.x), wy = toWorldY(p.y);
+  if (p.button === 2) { createAtCursor(wx, wy); return; }
+  if (p.button !== 0 || !S.hover) return;
+  const f = S.hover;
+  select(f);
+  S.press = { f, sx: p.x, sy: p.y, t: performance.now(), ox: f.x - wx, oy: f.y - wy };
+}
+function pointerMove(p) {
+  if (!S.ready) return;
+  const pr = S.press;
+  if (pr && !(p.buttons & 1)) { pointerUp(p); return; }   // the release happened where we could not hear it
+  if (pr) {
+    const f = pr.f;
+    if (!S.drag && Math.hypot(p.x - pr.sx, p.y - pr.sy) >= CLICK_PX) {
+      S.drag = { f };
+      f.hand = true; f.lifted = true; f.gliding = false;
+      f.mvx = f.mvy = f.mvax = f.mvay = 0;
+      Kit.sfx('click', { pitch: 0.7 });
+    }
+    if (S.drag) {
+      f.x = clamp(toWorldX(p.x) + pr.ox, 20, WORLD_W - 20);
+      f.y = clamp(toWorldY(p.y) + pr.oy, 20, WORLD_H - 20);
+    }
+  }
+  updateHover(p);
+}
+function pointerUp(p) {
+  const pr = S.press;
+  S.press = null;
+  if (pr) {
+    const f = pr.f;
+    if (S.drag) { S.drag = null; f.hand = false; f.user = true; settle(f); }
+    else if (performance.now() - pr.t < CLICK_MS && Math.hypot(p.x - pr.sx, p.y - pr.sy) < CLICK_PX) destroyFunnel(f);
+  }
+  updateHover(p);
+}
+function wheel(p, e) {
+  updateHover(p);
+  const f = S.hover;
+  if (!f) return;
+  let d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+  if (e.deltaMode === 1) d *= 33;
+  select(f);
+  f.wd += clamp(d / 100, -3, 3) * 0.2 * ROT_K * ROT_K;   // a spin impulse: about 11° per notch, eased in and out
+}
+function powerStep(code, k) {
+  const f = S.sel;
+  if (f) setPower(f, f.power + (code === 'KeyW' ? 0.05 : -0.05) * k);
+}
+function keydown(e) {
+  const c = e.code;
+  if (c === 'KeyA' || c === 'KeyD') {
+    if (!e.repeat && !rotTarget() && S.funnels.length) Kit.toast('Point at a funnel or press Tab to pick one', { tone: 'info' });
+    return true;
+  }
+  if (c === 'KeyW' || c === 'KeyS') {
+    if (!e.repeat) {
+      if (!S.sel && S.funnels.length) Kit.toast('Press Tab to pick a funnel', { tone: 'info' });
+      powerStep(c, 1);
+      if (S.sel) tick(S.sel, true);
+      keyHold.set(c, Kit.realTime);
+    }
+    return true;
+  }
+  if (/^Arrow/.test(c)) return true;
+  switch (c) {
+    case 'Tab': cycle(e.shiftKey ? -1 : 1); return true;
+    case 'Delete': case 'Backspace': case 'KeyX': if (!e.repeat && S.sel) destroyFunnel(S.sel); return true;
+    case 'KeyN': if (!e.repeat) newMap(); return true;
+    case 'KeyZ': if (!e.repeat) undo(); return true;
+    default: return false;
+  }
+}
+function keyup(e) { keyHold.delete(e.code); }
+/** W / S held: power keeps changing (on wall time, so it also works while paused). */
+function pollKeys(rdt) {
+  for (const [code, t0] of keyHold) {
+    if (!Kit.keys.has(code)) { keyHold.delete(code); continue; }
+    if (Kit.realTime - t0 > 0.28) powerStep(code, rdt * 12);
+  }
+}
+
+// ================================================================== scene: default setup, new maps
+function placeDefaultFunnels() {
+  // one in a big chamber with its spout aimed into a narrow tunnel: it visibly pumps particles through
+  let a1 = null;
+  for (const t of MAP.tunnels) {
+    if (!t.narrow || t.fix) continue;
+    for (const end of [0, 1]) {
+      const ci = end ? t.b : t.a, ch = MAP.chambers[ci], e = tunnelEntrance(ch, end ? t.pts.slice().reverse() : t.pts);
+      if (!e) continue;
+      const a = Math.atan2(e.dy, e.dx);
+      for (let back = F_HALF + 6; back < F_HALF + 80; back += 6) {
+        const x = e.x - e.dx * back, y = e.y - e.dy * back;
+        if (!fits(null, x, y, a)) continue;
+        const score = rayFree(x - e.dx * F_HALF, y - e.dy * F_HALF, -e.dx, -e.dy, 500, 10) - back * 0.5;
+        if (!a1 || score > a1.score) a1 = { x, y, a, ci, score };
+        break;
+      }
+    }
+  }
+  const f1 = a1 && addFunnel(a1.x, a1.y, a1.a, 0.6, { quiet: true, keepSel: true });
+  // one elsewhere, aimed across another chamber: the longest open run ahead of the spout wins
+  let a2 = null;
+  MAP.chambers.forEach((ch, ci) => {
+    if (a1 && ci === a1.ci) return;
+    for (let gy = -0.6; gy <= 0.61; gy += 0.3) for (let gx = -0.6; gx <= 0.61; gx += 0.3) {
+      const x = ch.x + gx * ch.hx, y = ch.y + gy * ch.hy;
+      for (let k = 0; k < 16; k++) {
+        const a = (k / 16) * TAU, c = Math.cos(a), s = Math.sin(a);
+        const ahead = rayFree(x + c * F_HALF, y + s * F_HALF, c, s, 640, 10);
+        if (ahead < 240 || (a2 && ahead + 300 < a2.score)) continue;
+        if (!fits(null, x, y, a)) continue;
+        const score = ahead + 0.5 * rayFree(x - c * F_HALF, y - s * F_HALF, -c, -s, 300, 10);
+        if (!a2 || score > a2.score) a2 = { x, y, a, score };
+      }
+    }
+  });
+  if (a2) addFunnel(a2.x, a2.y, a2.a, 0.6, { quiet: true, keepSel: true });
+  return f1;
+}
+/** Default scene (load and R): the current map, 600 particles, two funnels at 60 %, already streaming. */
+function buildDefaultScene() {
+  S.ready = false;
+  for (const f of S.funnels.slice()) destroyFunnel(f, { noUndo: true, silent: true });
+  S.dead.length = 0; S.undo.length = 0; fxN = 0;
+  S.ghost = null; S.sel = null; S.press = null; S.drag = null; S.hover = null;
+  setSpeed(1);
+  N = 0;
+  setParticleCount(600, true);
+  const f1 = placeDefaultFunnels();
+  for (const f of S.funnels) { f.pop = 1; f.lift = 0; f.glow = f.power; }
+  select(f1 || S.funnels[0] || null);
+  Kit.setHint(null);   // keep the opening hint until someone touches a funnel
+  for (let k = 0; k < 100; k++) simulate(1 / 60);
+  S.exits = 0;
+  S.through = S.funnels.reduce((n, f) => n + f.through, 0) / (100 / 60);
+  for (const f of S.funnels) f.through = 0;
+  S.ready = true;
+  updateCounts();
+}
+/** A new maze (random seed unless given). Particles in new walls jump to free spots; funnels glide clear. */
+function newMap(seed) {
+  seed = seed != null ? seed >>> 0 : 1 + Math.floor(Math.random() * 999999);
+  generate(seed);
+  const r = tw('size');
+  for (let i = 0; i < N; i++) { INF[i] = -1; INT[i] = 0; if (sdfAt(PX[i], PY[i]) < r + 1) spawnAt(i); }
+  for (const f of S.funnels) { f.hand = true; f.lifted = true; f.gliding = false; f.user = true; }
+  for (const f of S.funnels.slice()) { f.hand = false; settle(f); }
+  S.layerDirty = true; S.layerAt = -1e9;
+  if (S.ready) { Kit.sfx('whoosh', { pitch: 1.1 }); Kit.toast('New map', { tone: 'info' }); }
+  return MAP.comps;
+}
+function updateCounts() {
+  Kit.setStat('funnels', `${S.funnels.length}/${MAX_FUNNELS}`, { neutral: true });
+  if (S.ui.add) S.ui.add.disabled = S.funnels.length >= MAX_FUNNELS;
+  if (S.ui.clear) S.ui.clear.disabled = S.funnels.length === 0;
+}
+
+// ================================================================== rendering: layout and the maze layer
+function layout() {
+  const pr = Kit.playRect;
+  S.sc = Math.min(pr.w / WORLD_W, pr.h / WORLD_H);
+  S.ox = pr.x + (pr.w - WORLD_W * S.sc) / 2;
+  S.oy = pr.y + (pr.h - WORLD_H * S.sc) / 2;
+  S.layerDirty = true;
+}
+const layer = document.createElement('canvas');
+const tmpLayer = document.createElement('canvas');
+const BOARD_R = 26;   // rounded corners of the board (world units)
+
+/** Paint the backdrop, then shade the maze per device pixel straight from the SDF (smooth, anti-aliased). */
+function buildLayer() {
+  const W = Kit.W, H = Kit.H, dpr = Kit.dpr, abs = Kit.isAbstract, sc = S.sc;
+  layer.width = Math.max(1, Math.round(W * dpr));
+  layer.height = Math.max(1, Math.round(H * dpr));
+  const g = layer.getContext('2d', { alpha: false });
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (abs) { g.fillStyle = SH.bg; g.fillRect(0, 0, W, H); }
+  else {
+    const bg = g.createRadialGradient(W * 0.5, H * 0.42, 0, W * 0.5, H * 0.42, Math.hypot(W, H) * 0.62);
+    bg.addColorStop(0, '#17132f'); bg.addColorStop(1, '#09071a');
+    g.fillStyle = bg; g.fillRect(0, 0, W, H);
+    g.save();
+    g.shadowColor = 'rgba(0, 0, 0, 0.65)'; g.shadowBlur = 36; g.shadowOffsetY = 10;
+    g.fillStyle = '#100d24';
+    U.roundRect(g, S.ox, S.oy, WORLD_W * sc, WORLD_H * sc, BOARD_R * sc);
+    g.fill();
+    g.restore();
+  }
+  const x0 = Math.floor(S.ox * dpr), y0 = Math.floor(S.oy * dpr);
+  const pw = Math.ceil((S.ox + WORLD_W * sc) * dpr) - x0, ph = Math.ceil((S.oy + WORLD_H * sc) * dpr) - y0;
+  if (pw < 2 || ph < 2) return;
+  tmpLayer.width = pw; tmpLayer.height = ph;
+  const t = tmpLayer.getContext('2d'), img = t.createImageData(pw, ph), D = img.data;
+  const upp = 1 / (sc * dpr);                      // world units per device pixel
+  const bhx = WORLD_W / 2 - BOARD_R, bhy = WORLD_H / 2 - BOARD_R;
+  const LX = -0.55, LY = -0.83;                    // light from the top left
+  const F0 = U.hexToRgb(SH.bg), F1 = U.hexToRgb(SH.band), F2 = U.hexToRgb(SH.mid);   // Shapes: floor, rock, outline
+  for (let py = 0; py < ph; py++) {
+    const wy = ((y0 + py + 0.5) / dpr - S.oy) / sc;
+    for (let px = 0; px < pw; px++) {
+      const wx = ((x0 + px + 0.5) / dpr - S.ox) / sc;
+      const qx = Math.abs(wx - WORLD_W / 2) - bhx, qy = Math.abs(wy - WORLD_H / 2) - bhy;
+      const bd = Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - BOARD_R;
+      const cover = clamp(0.5 - bd / upp, 0, 1);
+      const o = (py * pw + px) * 4;
+      if (cover <= 0) { D[o + 3] = 0; continue; }
+      const d = sdfAt(wx, wy), dp = d / upp, wall = clamp(0.5 - dp, 0, 1);
+      let r, gg, b;
+      if (abs) {
+        // flat floor, flat walls, one plain outline
+        const line = clamp(1.25 - Math.abs(dp + 0.4), 0, 1);
+        r = lerp(lerp(F0.r, F1.r, wall), F2.r, line); gg = lerp(lerp(F0.g, F1.g, wall), F2.g, line); b = lerp(lerp(F0.b, F1.b, wall), F2.b, line);
+      } else {
+        let nx = 0, ny = 0;
+        if (d < 14 && d > -14) {
+          const gx = sdfAt(wx + 1.5, wy) - sdfAt(wx - 1.5, wy), gy = sdfAt(wx, wy + 1.5) - sdfAt(wx, wy - 1.5), gl = Math.hypot(gx, gy) || 1;
+          nx = gx / gl; ny = gy / gl;
+        }
+        const lit = nx * LX + ny * LY;
+        // floor: deep indigo, lighter in open space, shaded close to walls, with a faint dot grid
+        const open = U.smoothstep(0, 150, d), ao = 0.58 + 0.42 * U.smoothstep(0, 20, d);
+        const gxm = (((wx % 40) + 40) % 40) - 20, gym = (((wy % 40) + 40) % 40) - 20;
+        const dot = clamp(1.4 - Math.hypot(gxm, gym) / (upp * 1.1), 0, 1) * 0.5;
+        const n = ((px * 73856093) ^ (py * 19349663)) & 7;
+        let fr = (17 + open * 9) * ao + dot * 22 + n * 0.5, fg = (14 + open * 8) * ao + dot * 20 + n * 0.5, fb = (36 + open * 20) * ao + dot * 42 + n * 0.6;
+        // walls: lit bevel along the edge, darker deep inside
+        const depth = -d, deep = U.smoothstep(0, 28, depth), bevel = 1 - U.smoothstep(0, 9, depth);
+        let wr = lerp(56, 30, deep), wg = lerp(46, 25, deep), wb = lerp(104, 62, deep);
+        if (depth > 14) {   // faint engraved contour lines follow the rock's shape
+          const q = ((depth - 14) % 18) - 9, iso = Math.exp(-(q * q) / (upp * upp * 0.9)) * 0.55 * U.smoothstep(14, 30, depth);
+          wr += iso * 14; wg += iso * 12; wb += iso * 30;
+        }
+        if (lit > 0) { wr += bevel * lit * 74; wg += bevel * lit * 64; wb += bevel * lit * 130; }
+        else { const k = 1 + bevel * lit * 0.4; wr *= k; wg *= k; wb *= k; }
+        r = lerp(fr, wr, wall); gg = lerp(fg, wg, wall); b = lerp(fb, wb, wall);
+        // a crisp glowing contour
+        const rim = Math.exp(-(dp * dp) / 2.2);
+        r += rim * 70; gg += rim * 56; b += rim * 140;
+      }
+      D[o] = r; D[o + 1] = gg; D[o + 2] = b; D[o + 3] = cover * 255;
+    }
+  }
+  t.putImageData(img, 0, 0);
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.drawImage(tmpLayer, x0, y0);
+  S.layerDirty = false;
+  S.layerAt = performance.now();
+}
+
+
+// ================================================================== rendering: shared helpers
+/** Wall center line, smoothed through the profile points (deviates < 1 unit from the collision polyline). */
+function wallPath(ctx, side) {
+  ctx.moveTo(PROF_X[0], PROF_H[0] * side);
+  for (let k = 1; k < 5; k++) ctx.quadraticCurveTo(PROF_X[k], PROF_H[k] * side, (PROF_X[k] + PROF_X[k + 1]) / 2, ((PROF_H[k] + PROF_H[k + 1]) / 2) * side);
+  ctx.lineTo(PROF_X[5], PROF_H[5] * side);
+}
+function bodyPath(ctx) {
+  ctx.beginPath();
+  wallPath(ctx, 1);
+  ctx.lineTo(PROF_X[5], -PROF_H[5]);
+  for (let k = 4; k >= 1; k--) ctx.quadraticCurveTo(PROF_X[k + 1], -PROF_H[k + 1], (PROF_X[k] + PROF_X[k + 1]) / 2, -((PROF_H[k] + PROF_H[k + 1]) / 2));
+  ctx.quadraticCurveTo(PROF_X[1], -PROF_H[1], PROF_X[0], -PROF_H[0]);
+  ctx.closePath();
+}
+function bothWalls(ctx) { ctx.beginPath(); wallPath(ctx, 1); wallPath(ctx, -1); }
+/** Enter a funnel's local frame (world units); returns the scale used. */
+function enterFunnel(ctx, f, extra) {
+  const pop = f.pop < 1 ? Math.max(0.05, U.easeOutBack(f.pop)) : 1, k = S.sc * pop * (1 + f.lift * 0.05) * (extra || 1);
+  ctx.translate(S.ox + f.x * S.sc, S.oy + f.y * S.sc - f.lift * 5);
+  ctx.rotate(f.angle);
+  ctx.scale(k, k);
+  return k;
+}
+// particle color buckets: 0 neutral, 1–3 warming (pulled), 4–6 cooling (just ejected)
+const BK = 7;
+const BIDX = Array.from({ length: BK }, () => new Uint16Array(MAX_PARTICLES));
+const BN = new Int32Array(BK);
+const BCOL = [COL.part, U.mixHex(COL.part, COL.red, 0.35), U.mixHex(COL.part, COL.red, 0.7), COL.red, U.mixHex(COL.part, COL.blue, 0.35), U.mixHex(COL.part, COL.blue, 0.7), COL.blue];
+const BCOL_SH = [SH.white, SH.white, SH.red, SH.red, SH.white, SH.blue, SH.blue];
+function bucketize() {
+  BN.fill(0);
+  for (let i = 0; i < N; i++) {
+    const w = WARM[i], c = COOL[i];
+    let b = 0;
+    if (w > c) { if (w > 0.12) b = w > 0.72 ? 3 : w > 0.4 ? 2 : 1; } else if (c > 0.12) b = c > 0.72 ? 6 : c > 0.4 ? 5 : 4;
+    BIDX[b][BN[b]++] = i;
+  }
+}
+const DASH = [6, 7], GHOST_DASH = [10, 8], NO_DASH = [];
+
+// ---- funnel sprites: painted once per scale and view, then blitted rotated every frame (much cheaper to raster)
+const SP_BX = F_HALF + 14, SP_BY = PROF_H[0] + 14;            // body sprite half extents (world units)
+const GLOW_M = 62, GLOW_S = 38;                                 // glow radii at the mouth and the spout
+const GLOW_LEVELS = 16;                                        // glow brightness steps (drawn at alpha 1: far cheaper)
+const FSP = { key: '', body: null, hot: null, shadow: null, glowM: null, glowS: null };
+function paintSprite(w0, h0, x0, y0, k, paint) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.ceil(w0 * k)); c.height = Math.max(1, Math.ceil(h0 * k));
+  const g = c.getContext('2d');
+  g.setTransform(k, 0, 0, k, -x0 * k, -y0 * k);
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  paint(g);
+  return c;
+}
+/** Glow discs at GLOW_LEVELS brightness steps, painted on first use. */
+function glowDiscs(r, k, col, a0, a1) {
+  const levels = [];
+  return (level) => levels[level] || (levels[level] = paintSprite(2 * r, 2 * r, -r, -r, k, (g) => {
+    const m = (level + 1) / GLOW_LEVELS, gr = g.createRadialGradient(0, 0, 0, 0, 0, r);
+    gr.addColorStop(0, U.rgba(col, a0 * m)); gr.addColorStop(0.42, U.rgba(col, a1 * m)); gr.addColorStop(1, U.rgba(col, 0));
+    g.fillStyle = gr; g.fillRect(-r, -r, 2 * r, 2 * r);
+  }));
+}
+function funnelSprites() {
+  const k = S.sc * Kit.dpr, key = Kit.view + ':' + k.toFixed(4);
+  if (FSP.key === key) return FSP;
+  FSP.key = key;
+  const abs = Kit.isAbstract, R = abs ? SHAPES : SPRITES, px = 1 / S.sc;   // px: one CSS pixel in world units
+  const body = (paint) => paintSprite(2 * SP_BX, 2 * SP_BY, -SP_BX, -SP_BY, k, paint);
+  FSP.body = body((g) => R.paintBody(g, px));
+  FSP.hot = body((g) => { g.strokeStyle = abs ? SH.white : '#d6c4ff'; g.lineWidth = F_WALL * 2 + 7; bothWalls(g); g.stroke(); });
+  FSP.shadow = abs ? null : body((g) => SPRITES.paintShadow(g));
+  FSP.glowM = abs ? null : glowDiscs(GLOW_M, k, COL.red, 0.5, 0.16);
+  FSP.glowS = abs ? null : glowDiscs(GLOW_S, k, COL.blue, 0.75, 0.22);
+  return FSP;
+}
+/** Blit an unrotated, centered sprite at a whole device pixel (the cheap path for the round glows). */
+function blitCentered(ctx, img, cx, cy) {
+  const d = Kit.dpr;
+  ctx.drawImage(img, Math.round(cx * d - img.width / 2) / d, Math.round(cy * d - img.height / 2) / d, img.width / d, img.height / d);
+}
+/** A resting funnel: its body pre-rotated once (exact angle and sub-pixel offset) into its own canvas, then
+ *  blitted without a transform each frame (a rotated blit costs ~15× more on a software canvas). */
+function blitResting(ctx, f, sp, x, y) {
+  const d = Kit.dpr, px = x * d, py = y * d, ix = Math.floor(px), iy = Math.floor(py), fx = px - ix, fy = py - iy;
+  let c = f.cache;
+  if (!c) c = f.cache = { cv: document.createElement('canvas'), body: null, angle: NaN, fx: -1, fy: -1, half: 0 };
+  if (c.body !== sp.body || c.angle !== f.angle || c.fx !== fx || c.fy !== fy) {
+    const half = Math.ceil(Math.hypot(SP_BX, SP_BY) * S.sc * d) + 2, k = S.sc * d;
+    c.body = sp.body; c.angle = f.angle; c.fx = fx; c.fy = fy; c.half = half;
+    c.cv.width = c.cv.height = 2 * half;
+    const g = c.cv.getContext('2d');
+    g.translate(half + fx, half + fy); g.rotate(f.angle); g.scale(k, k);
+    g.drawImage(sp.body, -SP_BX, -SP_BY, 2 * SP_BX, 2 * SP_BY);
+  }
+  ctx.drawImage(c.cv, (ix - c.half) / d, (iy - c.half) / d, (2 * c.half) / d, (2 * c.half) / d);
+}
+/** Show fields. Each resting funnel's pull and push bubbles are painted (rotated, cut to the board) into two small
+ *  canvases of its own, repainted only when the funnel, its power or the layout changes (a room-sized gradient costs a
+ *  software canvas several ms per funnel per frame). With the particle frame buffer, bubbles that have not changed for
+ *  a moment are baked into a copy of its background and cost nothing per frame; only changing ones are blitted. */
+const FIELD_LEVELS = 24, FIELD_SETTLE = 0.25;
+const fieldsLayer = document.createElement('canvas');
+const fieldShown = (f) => !f.lifted && f.power > 0;
+const boardClip = (g) => { U.roundRect(g, S.ox, S.oy, WORLD_W * S.sc, WORLD_H * S.sc, BOARD_R * S.sc); g.clip(); };
+const fieldLevel = (f) => Math.max(1, Math.round(f.glow * FIELD_LEVELS)) / FIELD_LEVELS;
+const fieldRadius = () => (tw('reach') * F_LEN) / 2;   // pull and push bubbles are the same size: their reach is the same
+/** Bring a funnel's bubble canvases up to date; null while it pops in or lands (then it is painted directly). */
+function fieldCache(f, R) {
+  if (f.pop < 1 || f.lift > 0.01) return null;
+  const d = Kit.dpr, sc = S.sc, P = fieldLevel(f);
+  const key = `${Kit.view}:${sc}:${S.ox}:${S.oy}:${d}:${tw('reach')}:${f.x}:${f.y}:${f.angle}:${P}`;
+  const c = f.fields || (f.fields = { key: '', since: 0, baked: false, parts: [0, 1].map(() => ({ cv: document.createElement('canvas'), x: 0, y: 0, on: false })) });
+  if (c.key === key) return c;
+  c.key = key; c.since = Kit.realTime;
+  const bx0 = S.ox * d, by0 = S.oy * d, bx1 = (S.ox + WORLD_W * sc) * d, by1 = (S.oy + WORLD_H * sc) * d;
+  for (let which = 0; which < 2; which++) {
+    const part = c.parts[which], r = fieldRadius(), off = which ? F_HALF + r : -F_HALF - r;
+    const cx = (S.ox + (f.x + f.c * off) * sc) * d, cy = (S.oy + (f.y + f.s * off) * sc) * d, rp = r * sc * d + 2;
+    const x0 = Math.floor(Math.max(cx - rp, bx0)), y0 = Math.floor(Math.max(cy - rp, by0)), x1 = Math.ceil(Math.min(cx + rp, bx1)), y1 = Math.ceil(Math.min(cy + rp, by1));
+    part.on = x1 > x0 && y1 > y0;
+    if (!part.on) continue;
+    part.x = x0; part.y = y0; part.cv.width = x1 - x0; part.cv.height = y1 - y0;
+    const g = part.cv.getContext('2d');
+    g.setTransform(d, 0, 0, d, -x0, -y0);
+    boardClip(g);
+    R.fields(g, f, P, which, r);
+  }
+  return c;
+}
+/** The frame buffer's background with every settled bubble baked in; rebuilt only when that set changes. */
+function fieldsBackground(R) {
+  let key = S.layerAt + '|';
+  for (const f of S.funnels) {
+    const c = fieldShown(f) ? fieldCache(f, R) : null;
+    if (f.fields) f.fields.baked = !!c && Kit.realTime - c.since >= FIELD_SETTLE;
+    if (c && c.baked) key += f.id + '@' + c.key + '|';
+  }
+  if (key !== PB.fkey) {
+    PB.fkey = key;
+    if (fieldsLayer.width !== layer.width || fieldsLayer.height !== layer.height) { fieldsLayer.width = layer.width; fieldsLayer.height = layer.height; }
+    const g = fieldsLayer.getContext('2d', { willReadFrequently: true });
+    g.drawImage(layer, 0, 0);
+    for (const f of S.funnels) if (f.fields && f.fields.baked) for (const p of f.fields.parts) if (p.on) g.drawImage(p.cv, p.x, p.y);
+    PB.bgF = new Uint32Array(g.getImageData(0, 0, layer.width, layer.height).data.buffer);
+  }
+  return PB.bgF;
+}
+/** Bubbles drawn on top of the frame: all of them on the vector path, only the changing ones over a baked background. */
+function drawFields(ctx, R, bakedIn) {
+  const d = Kit.dpr;
+  for (const f of S.funnels) {
+    if (!fieldShown(f)) continue;
+    const c = fieldCache(f, R);
+    if (!c) {   // popping in or landing: a few frames, painted directly
+      ctx.save(); boardClip(ctx);
+      for (let which = 0; which < 2; which++) R.fields(ctx, f, fieldLevel(f), which, fieldRadius());
+      ctx.restore();
+      continue;
+    }
+    if (bakedIn && c.baked) continue;
+    for (const part of c.parts) if (part.on) ctx.drawImage(part.cv, part.x / d, part.y / d, part.cv.width / d, part.cv.height / d);
+  }
+}
+/** A funnel: glows, shadow while lifted, hover outline, body; chevrons on top while it works. */
+function drawFunnel(ctx, f, rt, R, alpha, extra) {
+  const sp = funnelSprites(), sc = S.sc, x = S.ox + f.x * sc, y = S.oy + f.y * sc - f.lift * 5;
+  const pop = f.pop < 1 ? Math.max(0.05, U.easeOutBack(f.pop)) : 1, m = sc * pop * (1 + f.lift * 0.05) * extra;
+  ctx.save();
+  if (sp.glowM && pop > 0.6) {
+    const level = Math.round(alpha * (0.15 + 0.85 * f.glow) * GLOW_LEVELS) - 1, h = F_HALF * m;
+    if (level >= 0) {
+      ctx.globalCompositeOperation = 'lighter';
+      blitCentered(ctx, sp.glowM(level), x - f.c * h, y - f.s * h);
+      blitCentered(ctx, sp.glowS(level), x + f.c * h, y + f.s * h);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+  ctx.globalAlpha = alpha;
+  if (sp.shadow && f.lift > 0.02) {
+    ctx.save();
+    ctx.globalAlpha = alpha * Math.min(1, f.lift * 1.5);
+    ctx.translate(x + (3 + f.lift * 9) * sc, y + (6 + f.lift * 13) * sc);
+    ctx.rotate(f.angle); ctx.scale(m, m);
+    ctx.drawImage(sp.shadow, -SP_BX, -SP_BY, 2 * SP_BX, 2 * SP_BY);
+    ctx.restore();
+  }
+  const hot = Math.max(f.hot * 0.45, f.flash * 0.8);
+  if (hot <= 0.01 && m === sc && alpha === 1 && !f.lifted && f.w === 0 && f.wd === 0 && !f.easing) blitResting(ctx, f, sp, x, y);
+  else {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(f.angle); ctx.scale(m, m);
+    if (hot > 0.01) { ctx.globalAlpha = alpha * hot; ctx.drawImage(sp.hot, -SP_BX, -SP_BY, 2 * SP_BX, 2 * SP_BY); ctx.globalAlpha = alpha; }
+    ctx.drawImage(sp.body, -SP_BX, -SP_BY, 2 * SP_BX, 2 * SP_BY);
+    ctx.restore();
+  }
+  ctx.translate(x, y); ctx.rotate(f.angle); ctx.scale(m, m);
+  if (R.chevrons && !f.lifted && f.glow > 0.02) R.chevrons(ctx, f, rt, m);
+  ctx.restore();
+}
+
+// ================================================================== rendering: sprites (bright particles, glassy funnels)
+const CHEVRON = Array.from({ length: 16 }, (_, i) => U.mixHex('#2a2148', '#ffffff', 0.08 + (i / 15) * 0.32));
+const SPRITES = {
+  paintBody(g, px) {
+    const wall = g.createLinearGradient(-F_HALF, 0, F_HALF, 0);
+    wall.addColorStop(0, COL.red); wall.addColorStop(0.5, COL.violet); wall.addColorStop(1, COL.blue);
+    const fill = g.createLinearGradient(-F_HALF, 0, F_HALF, 0);
+    fill.addColorStop(0, 'rgba(255, 77, 109, 0.26)'); fill.addColorStop(0.5, 'rgba(180, 140, 255, 0.10)'); fill.addColorStop(1, 'rgba(74, 163, 255, 0.28)');
+    g.fillStyle = fill; bodyPath(g); g.fill();
+    g.strokeStyle = wall; g.lineWidth = F_WALL * 2; bothWalls(g); g.stroke();
+    g.strokeStyle = 'rgba(255, 255, 255, 0.6)'; g.lineWidth = 1.3 * px; bothWalls(g); g.stroke();
+    g.fillStyle = '#ffd0d9';
+    g.beginPath(); g.arc(PROF_X[0], PROF_H[0], F_WALL * 0.75, 0, TAU); g.arc(PROF_X[0], -PROF_H[0], F_WALL * 0.75, 0, TAU); g.fill();
+    g.fillStyle = '#d4ebff';
+    g.beginPath(); g.arc(PROF_X[5], PROF_H[5], F_WALL * 0.75, 0, TAU); g.arc(PROF_X[5], -PROF_H[5], F_WALL * 0.75, 0, TAU); g.fill();
+  },
+  paintShadow(g) {
+    g.strokeStyle = '#020108';
+    for (const [w, a] of [[F_WALL * 2 + 9, 0.12], [F_WALL * 2 + 5, 0.16], [F_WALL * 2 + 1.5, 0.22]]) { g.globalAlpha = a; g.lineWidth = w; bothWalls(g); g.stroke(); }
+  },
+  chevrons(ctx, f, t, m) {
+    // chevrons travel toward the spout, faster with more power; they swell in and out instead of fading
+    // (filled, opaque, pre-mixed with the cone's tint: translucent strokes are slow on a software canvas)
+    const P = f.glow, th = (2.6 / m) * S.sc;
+    ctx.fillStyle = CHEVRON[Math.min(15, Math.round(Math.min(1, P * 1.6) * 15))];
+    ctx.beginPath();
+    for (let c = 0; c < 3; c++) {
+      const ph = (t * (0.35 + 1.1 * P) + c / 3) % 1, lx = -F_HALF + 24 + ph * (F_LEN - 48), hw = (hwAt(lx) - F_WALL - 5) * Math.sin(ph * Math.PI);
+      ctx.moveTo(lx - hw * 0.4, -hw * 0.62); ctx.lineTo(lx, 0); ctx.lineTo(lx - hw * 0.4, hw * 0.62);
+      ctx.lineTo(lx - hw * 0.4 - th, hw * 0.62); ctx.lineTo(lx - th, 0); ctx.lineTo(lx - hw * 0.4 - th, -hw * 0.62);
+      ctx.closePath();
+    }
+    ctx.fill();
+  },
+  particles(ctx) {
+    // vector fallback for HiDPI screens (GPU canvases): one opaque fill per color bucket, dots plus short trails
+    bucketize();
+    const sc = S.sc, ox = S.ox, oy = S.oy, r = tw('size') * sc, fast = BASE_SPEED * S.speed * TRAIL_FROM;
+    for (let b = 0; b < BK; b++) {
+      const n = BN[b], idx = BIDX[b];
+      if (!n) continue;
+      ctx.beginPath();
+      for (let k = 0; k < n; k++) {
+        const i = idx[k], x = ox + PX[i] * sc, y = oy + PY[i] * sc;
+        ctx.moveTo(x + r, y);
+        ctx.arc(x, y, r, 0, TAU);
+        const vx = VX[i], vy = VY[i], v = Math.hypot(vx, vy);
+        if (v > fast) {
+          // fast ones leave a short tapered streak of shrinking dots
+          const L = Math.min((v - fast) * TRAIL_K, TRAIL_MAX), l = (L * sc) / v;
+          let tx = x - vx * l * 0.5, ty = y - vy * l * 0.5, tr = r * 0.72;
+          ctx.moveTo(tx + tr, ty); ctx.arc(tx, ty, tr, 0, TAU);
+          if (L > 4) { tx = x - vx * l; ty = y - vy * l; tr = r * 0.5; ctx.moveTo(tx + tr, ty); ctx.arc(tx, ty, tr, 0, TAU); }
+        }
+      }
+      ctx.fillStyle = BCOL[b];
+      ctx.fill();
+    }
+  },
+  fields(ctx, f, P, which, r) {
+    // a soft bubble in front of the mouth (pull, which 0) or behind the spout (push, which 1), strongest at the opening
+    ctx.save();
+    enterFunnel(ctx, f);
+    const x0 = which ? F_HALF : -F_HALF, dir = which ? 1 : -1, col = which ? '74, 163, 255' : '255, 77, 109', a = which ? 0.28 : 0.26;
+    const g = ctx.createRadialGradient(x0, 0, 0, x0 + dir * r, 0, r);
+    g.addColorStop(0, `rgba(${col}, ${a * P})`); g.addColorStop(0.4, `rgba(${col}, ${a * 0.4 * P})`); g.addColorStop(1, `rgba(${col}, 0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x0 + dir * r, 0, r, 0, TAU); ctx.fill();
+    ctx.restore();
+  },
+  fx(ctx) {
+    const sc = S.sc, ox = S.ox, oy = S.oy;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (let i = 0; i < fxN; i++) {
+      const k = FXL[i] / FXM[i], x = ox + FXX[i] * sc, y = oy + FXY[i] * sc, col = FX_SPRITE[FXC[i]];
+      if (FXK[i] === 1) {
+        ctx.globalAlpha = k * 0.7; ctx.strokeStyle = col; ctx.lineWidth = 2 * k + 0.6;
+        ctx.beginPath(); ctx.arc(x, y, FXS[i] * sc * (0.3 + 0.9 * U.easeOutCubic(1 - k)), 0, TAU); ctx.stroke();
+      } else {
+        ctx.globalAlpha = FXK[i] === 2 ? k * 0.6 : k;
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(x, y, FXS[i] * sc * (FXK[i] === 2 ? 1 + (1 - k) : 0.5 + k * 0.5), 0, TAU); ctx.fill();
+      }
+    }
+    ctx.restore();
+  },
+};
+
+// ================================================================== rendering: shapes (flat base colors, plain geometry)
+const SPLIT_H = hwAt(0);
+function wallHalf(ctx, side, spoutHalf) {
+  if (!spoutHalf) {
+    ctx.moveTo(PROF_X[0], PROF_H[0] * side);
+    for (let k = 1; k <= 2; k++) ctx.lineTo(PROF_X[k], PROF_H[k] * side);
+    ctx.lineTo(0, SPLIT_H * side);
+  } else {
+    ctx.moveTo(0, SPLIT_H * side);
+    for (let k = 3; k <= 5; k++) ctx.lineTo(PROF_X[k], PROF_H[k] * side);
+  }
+}
+const SHAPES = {
+  paintBody(g) {
+    // walls only (particles inside stay visible): red mouth half, blue spout half
+    g.lineWidth = F_WALL * 2;
+    g.strokeStyle = SH.red; g.beginPath(); wallHalf(g, 1, false); wallHalf(g, -1, false); g.stroke();
+    g.strokeStyle = SH.blue; g.beginPath(); wallHalf(g, 1, true); wallHalf(g, -1, true); g.stroke();
+  },
+  chevrons: null,
+  particles(ctx) {
+    bucketize();
+    const sc = S.sc, ox = S.ox, oy = S.oy, r = tw('size') * sc;
+    for (const group of SHAPE_GROUPS) {
+      ctx.beginPath();
+      for (const b of group) {
+        const idx = BIDX[b];
+        for (let k = 0, n = BN[b]; k < n; k++) {
+          const i = idx[k], x = ox + PX[i] * sc, y = oy + PY[i] * sc;
+          ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, TAU);
+        }
+      }
+      ctx.fillStyle = BCOL_SH[group[group.length - 1]];
+      ctx.fill();
+    }
+  },
+  fields(ctx, f, P, which, r) {
+    ctx.save();
+    enterFunnel(ctx, f);
+    ctx.globalAlpha = 0.12 * Math.min(1, P * 2);
+    ctx.fillStyle = which ? SH.blue : SH.red;
+    ctx.beginPath(); ctx.arc(which ? F_HALF + r : -F_HALF - r, 0, r, 0, TAU); ctx.fill();
+    ctx.restore();
+  },
+  fx(ctx) {
+    const sc = S.sc, ox = S.ox, oy = S.oy;
+    ctx.save();
+    for (let i = 0; i < fxN; i++) {
+      const k = FXL[i] / FXM[i], x = ox + FXX[i] * sc, y = oy + FXY[i] * sc, col = FX_SHAPE[FXC[i]];
+      ctx.globalAlpha = k;
+      if (FXK[i] === 1) {
+        ctx.strokeStyle = col; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(x, y, FXS[i] * sc * (0.3 + 0.9 * (1 - k)), 0, TAU); ctx.stroke();
+      } else {
+        ctx.fillStyle = col;
+        ctx.beginPath(); ctx.arc(x, y, FXS[i] * sc * (FXK[i] === 2 ? 1 : 0.5 + k * 0.5), 0, TAU); ctx.fill();
+      }
+    }
+    ctx.restore();
+  },
+};
+const SHAPE_GROUPS = [[0, 1, 4], [2, 3], [5, 6]];
+
+// ================================================================== rendering: particles stamped into a frame buffer
+// At 1× pixel density the maze layer is copied into a frame buffer, every particle is stamped in as an
+// anti-aliased, sub-pixel positioned dot (plus a trailing dot when fast), and one putImageData shows it.
+// On a software canvas this is several times cheaper than rastering 2000 vector shapes.
+const PB = { w: 0, h: 0, img: null, d32: null, bg: null, bgF: null, fkey: '', key: '', kers: null };   // bgF: bg with settled field bubbles
+const SUB = 4;                                   // sub-pixel phases per axis
+const RGB = new Uint8Array(BK * 3), RGB_SH = new Uint8Array(BK * 3);
+for (let b = 0; b < BK; b++) {
+  const c = U.hexToRgb(BCOL[b]), d = U.hexToRgb(BCOL_SH[b]);
+  RGB.set([c.r, c.g, c.b], b * 3); RGB_SH.set([d.r, d.g, d.b], b * 3);
+}
+const useStamp = () => Kit.dpr <= 1.25;
+// velocity streaks: from TRAIL_FROM × cruising speed, TRAIL_K world units of streak per unit/s faster, up to TRAIL_MAX
+const TRAIL_FROM = 1.15, TRAIL_K = 0.032, TRAIL_MAX = 11;
+/** Keep a copy of the finished maze layer as the frame buffer's background. */
+function captureLayer() {
+  if (!useStamp()) { PB.bg = null; return; }
+  const w = layer.width, h = layer.height;
+  PB.bg = new Uint32Array(layer.getContext('2d').getImageData(0, 0, w, h).data.buffer);
+  if (PB.w !== w || PB.h !== h || !PB.img) {
+    PB.w = w; PB.h = h;
+    PB.img = new ImageData(w, h);
+    PB.d32 = new Uint32Array(PB.img.data.buffer);
+  }
+}
+/** Dot kernels (head and trail), each in SUB × SUB sub-pixel phases, stored sparse: buffer offsets
+ *  relative to the dot's pixel; fully covered pixels first (plain stores), then the soft edge (weights 1–255). */
+function makeKernels(R, soft, W) {
+  const out = [];
+  for (const [rr, gain] of [[R, 1], [R * 0.72, 0.75], [0, 0], [R * 0.5, 0.5]]) {   // head, streak, halo, streak tip
+    if (!gain) { out.push(haloKernel(R, W)); continue; }
+    const h = Math.ceil(rr + soft + 1), phases = [];
+    for (let sy = 0; sy < SUB; sy++) for (let sx = 0; sx < SUB; sx++) {
+      const fx = (sx + 0.5) / SUB, fy = (sy + 0.5) / SUB, full = [], off = [], wt = [];
+      for (let y = -h; y <= h; y++) for (let x = -h; x <= h; x++) {
+        const a = Math.round(clamp((rr + soft / 2 - Math.hypot(x + 0.5 - fx, y + 0.5 - fy)) / soft, 0, 1) * gain * 256);
+        if (a >= 256) full.push(y * W + x);
+        else if (a > 0) { off.push(y * W + x); wt.push(a); }
+      }
+      phases.push({ full: Int32Array.from(full), off: Int32Array.from(off), wt: Int32Array.from(wt) });
+    }
+    out.push({ h, phases });
+  }
+  return out;
+}
+/** A soft halo around tinted particles (the glow of a stream); weights only, no solid core. */
+function haloKernel(R, W) {
+  const reach = R + 3.5, h = Math.ceil(reach + 1), phases = [];
+  for (let sy = 0; sy < SUB; sy++) for (let sx = 0; sx < SUB; sx++) {
+    const fx = (sx + 0.5) / SUB, fy = (sy + 0.5) / SUB, off = [], wt = [];
+    for (let y = -h; y <= h; y++) for (let x = -h; x <= h; x++) {
+      const d = Math.hypot(x + 0.5 - fx, y + 0.5 - fy);
+      if (d < R - 1) continue;   // the head covers the middle
+      const t = 1 - clamp((d - R * 0.4) / (reach - R * 0.4), 0, 1), a = Math.round(t * t * 0.34 * 256);
+      if (a >= 3) { off.push(y * W + x); wt.push(a); }
+    }
+    phases.push({ full: new Int32Array(0), off: Int32Array.from(off), wt: Int32Array.from(wt) });
+  }
+  return { h, phases };
+}
+function stamp(k, x, y, cr, cg, cb) {
+  const ix = x | 0, iy = y | 0, h = k.h;
+  if (ix < h || iy < h || ix + h >= PB.w || iy + h >= PB.h) return;
+  const ph = k.phases[(((y - iy) * SUB) | 0) * SUB + (((x - ix) * SUB) | 0)], d = PB.d32, base = iy * PB.w + ix;
+  const full = ph.full, off = ph.off, wt = ph.wt, solid = 0xff000000 | (cb << 16) | (cg << 8) | cr;
+  for (let j = 0, n = full.length; j < n; j++) d[base + full[j]] = solid;
+  for (let j = 0, n = off.length; j < n; j++) {
+    const o = base + off[j], p = d[o], a = wt[j], na = 256 - a;
+    const r = ((p & 255) * na + cr * a) >> 8, g = (((p >> 8) & 255) * na + cg * a) >> 8, b = (((p >> 16) & 255) * na + cb * a) >> 8;
+    d[o] = 0xff000000 | (b << 16) | (g << 8) | r;
+  }
+}
+function stampParticles() {
+  const abs = Kit.isAbstract, dpr = Kit.dpr, sc = S.sc * dpr, ox = S.ox * dpr, oy = S.oy * dpr;
+  const R = tw('size') * sc, key = (abs ? 'a' : 's') + R.toFixed(2) + ':' + PB.w;
+  if (PB.key !== key) { PB.key = key; PB.kers = makeKernels(R, abs ? 1.1 : 1.4, PB.w); }
+  const k0 = PB.kers[0], k1 = PB.kers[1], k2 = PB.kers[2], k3 = PB.kers[3], cols = abs ? RGB_SH : RGB, fast = BASE_SPEED * S.speed * TRAIL_FROM;
+  for (let i = 0; i < N; i++) {
+    const w = WARM[i], c = COOL[i];
+    let b = 0;
+    if (w > c) { if (w > 0.12) b = w > 0.72 ? 3 : w > 0.4 ? 2 : 1; } else if (c > 0.12) b = c > 0.72 ? 6 : c > 0.4 ? 5 : 4;
+    const cr = cols[b * 3], cg = cols[b * 3 + 1], cb = cols[b * 3 + 2], x = ox + PX[i] * sc, y = oy + PY[i] * sc;
+    if (!abs) {
+      if (b === 2 || b === 3 || b === 5 || b === 6) stamp(k2, x, y, cr, cg, cb);   // pulled and ejected ones glow
+      const vx = VX[i], vy = VY[i], v = Math.hypot(vx, vy);
+      if (v > fast) {   // fast ones leave a short tapered streak
+        const L = Math.min((v - fast) * TRAIL_K, TRAIL_MAX), l = (L * sc) / v;
+        stamp(k1, x - vx * l * 0.5, y - vy * l * 0.5, cr, cg, cb);
+        if (L > 4) stamp(k3, x - vx * l, y - vy * l, cr, cg, cb);
+      }
+    }
+    stamp(k0, x, y, cr, cg, cb);
+  }
+}
+// ================================================================== rendering: overlays + frame
+function drawOverlays(ctx, rt) {
+  const abs = Kit.isAbstract, sc = S.sc;
+  const f = S.sel;
+  if (f && S.funnels.includes(f)) {
+    ctx.save();
+    ctx.setLineDash(DASH);
+    ctx.lineDashOffset = -rt * 14;
+    ctx.strokeStyle = abs ? SH.light : 'rgba(180, 140, 255, 0.55)';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(S.ox + f.x * sc, S.oy + f.y * sc - f.lift * 5, (F_HALF + 18) * sc * (f.pop < 1 ? U.easeOutBack(f.pop) : 1), 0, TAU); ctx.stroke();
+    ctx.setLineDash(NO_DASH);
+    ctx.restore();
+  }
+  const g = S.ghost;
+  if (g) {
+    const k = 1 - (rt - g.t) / 0.6;
+    if (k <= 0) S.ghost = null;
+    else {
+      ctx.save();
+      ctx.translate(S.ox + g.x * sc + Math.sin(rt * 70) * 4 * k, S.oy + g.y * sc);
+      ctx.rotate(g.angle);
+      ctx.scale(sc, sc);
+      ctx.globalAlpha = k;
+      ctx.strokeStyle = abs ? SH.red : '#ff3b5c';
+      ctx.lineWidth = F_WALL * 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.setLineDash(GHOST_DASH);
+      ctx.beginPath(); wallPath(ctx, 1); wallPath(ctx, -1); ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+function render(ctx, rdt) {
+  if (!S.ready) { ctx.fillStyle = '#09071a'; ctx.fillRect(0, 0, Kit.W, Kit.H); return; }
+  const rt = Kit.realTime, R = Kit.isAbstract ? SHAPES : SPRITES;
+  pollKeys(rdt);
+  updateFunnels(rdt);
+  updateFx(rdt);
+  if (Kit.mouse.inside && !S.drag) updateHover(Kit.mouse);
+  if (S.layerDirty && performance.now() - S.layerAt > 140) { buildLayer(); captureLayer(); }
+  const stamped = useStamp() && PB.bg, fields = tw('fields');
+  if (stamped) { PB.d32.set(fields ? fieldsBackground(R) : PB.bg); stampParticles(); ctx.putImageData(PB.img, 0, 0); }
+  else ctx.drawImage(layer, 0, 0, Kit.W, Kit.H);
+  if (fields) drawFields(ctx, R, stamped);
+  // lifted funnels float above everything; with vector particles, resting ones lie under them
+  for (const f of S.funnels) if (!f.lifted) drawFunnel(ctx, f, rt, R, 1, 1);
+  if (!stamped) R.particles(ctx);
+  for (const f of S.funnels) if (f.lifted) drawFunnel(ctx, f, rt, R, 1, 1);
+  for (const f of S.dead) drawFunnel(ctx, f, rt, R, 1 - f.die, 1 + f.die * 0.3);
+  R.fx(ctx);
+  drawOverlays(ctx, rt);
+  positionPills();
+  S.statT -= rdt;
+  if (S.statT <= 0) {
+    S.statT = 0.25;
+    Kit.setStat('parts', N, { quiet: true });
+    Kit.setStat('through', Math.round(S.through) + '/s', { quiet: true });
+  }
+}
+
+// ================================================================== simulation entry point
+function update(dt) {
+  if (!S.ready) return;
+  simulate(dt);
+  S.through += (S.exits / dt - S.through) * (1 - Math.exp(-dt / 1.2));
+  S.exits = 0;
+}
+
+// ================================================================== UI wiring
+/** A toolbar range control (kit styling) with a live readout. */
+function rangeControl(group, o) {
+  const inp = document.createElement('input');
+  inp.type = 'range';
+  inp.className = 'kit-range fn-range';
+  inp.min = o.min; inp.max = o.max; inp.step = o.step; inp.value = o.value;
+  inp.setAttribute('aria-label', o.label);
+  inp.dataset.tip = o.tip;
+  group.append(inp);
+  const out = Kit.ui.readout(group, null);
+  out.classList.add('fn-readout');
+  const pct = () => inp.style.setProperty('--pct', ((inp.value - o.min) / (o.max - o.min)) * 100 + '%');
+  const show = (v) => { inp.value = v; out.textContent = o.fmt(v); pct(); };
+  inp.addEventListener('input', () => o.onInput(parseFloat(inp.value)));
+  inp.addEventListener('pointerup', () => inp.blur());   // give the keys back to the toy after a drag
+  show(o.value);
+  return { inp, out, show };
+}
+function syncCountUI() {
+  if (S.ui.count) S.ui.count.show(S.count);
+  Kit.setStat('parts', S.count, { quiet: true });
+}
+function syncSpeedUI() { if (S.ui.speed) S.ui.speed.show(S.speed); }
+
+function setup() {
+  const style = document.createElement('style');
+  style.textContent = CSS;
+  document.head.append(style);
+  pillLayer = document.createElement('div');
+  pillLayer.className = 'fn-layer';
+  pillLayer.innerHTML = RAMP_DEFS;
+  document.body.append(pillLayer);
+  generate(DEFAULT_SEED);
+  const gp = Kit.ui.group('Particles');
+  S.ui.count = rangeControl(gp, { min: MIN_PARTICLES, max: MAX_PARTICLES, step: 10, value: 600, label: 'Particles', tip: 'How many particles: 50 to 2000', fmt: String, onInput: (v) => setParticleCount(v) });
+  const gs = Kit.ui.group('Speed');
+  S.ui.speed = rangeControl(gs, { min: 0.2, max: 3, step: 0.1, value: 1, label: 'Speed', tip: 'How fast the particles move', fmt: (v) => v.toFixed(1) + '×', onInput: (v) => setSpeed(v) });
+  const gf = Kit.ui.group(null);
+  S.ui.add = Kit.ui.button({ parent: gf, icon: 'plus', label: 'Funnel', tip: 'Add a funnel in a free spot (or right-click empty space)', onClick: () => addFunnelFree() });
+  S.ui.clear = Kit.ui.button({ parent: gf, icon: 'trash', iconOnly: true, tip: 'Clear all funnels (Z brings them back)', onClick: clearFunnels });
+  Kit.ui.button({ parent: gf, icon: 'shuffle', label: 'New map', key: 'N', tip: 'Build a new maze', onClick: () => newMap() });
+}
+function viewChanged() {
+  S.layerDirty = true;
+  S.layerAt = -1e9;
+  for (const f of S.funnels) { if (f.ui) f.ui.p = -1; syncPill(f); }
+}
+
+Kit.init({
+  id: 'funnel',
+  number: '04',
+  accent: '#b48cff',
+  accentInk: '#1a0f2e',
+  title: 'Funnel',
+  hint: 'Drag a funnel to move it. Right-click empty space for a new one. Hold A or D to turn it.',
+  about: 'Particles race through a maze of rounded walls. Each funnel pulls them into its red mouth and shoots them out of its blue spout, with equal power. Everything that goes in comes out.',
+  controls: [
+    { keys: ['Right-click'], label: 'Add a funnel on empty space (up to 12)' },
+    { keys: ['Drag'], label: 'Move a funnel; it settles in free space' },
+    { keys: ['Click'], label: 'Remove a funnel (Z brings it back)' },
+    { keys: ['A', 'D'], label: 'Turn the hovered or selected funnel' },
+    { keys: ['Slider', 'W S'], label: 'Power: pull and push are always equal' },
+    { keys: ['Wheel'], label: 'Turn a funnel; over its slider, set power' },
+    { keys: ['Arrows'], label: 'Move the selected funnel' },
+    { keys: ['Tab', 'Esc'], label: 'Select the next funnel, or deselect' },
+    { keys: ['Delete', 'X'], label: 'Remove the selected funnel' },
+    { keys: ['N'], label: 'New map (R keeps this one)' },
+  ],
+  stats: [
+    { id: 'parts', label: 'Particles', value: 600 },
+    { id: 'funnels', label: 'Funnels', value: `0/${MAX_FUNNELS}` },
+    { id: 'through', label: 'Through', value: '0/s' },
+  ],
+  tweaks: [
+    { type: 'section', label: 'Particles' },
+    { type: 'range', id: 'size', label: 'Particle size', min: 2, max: R_MAX, step: 0.5, value: DEFAULTS.size, format: (v) => v.toFixed(1) },
+    { type: 'range', id: 'bounce', label: 'Wall bounciness', min: 0.5, max: 1, step: 0.05, value: DEFAULTS.bounce, format: (v) => Math.round(v * 100) + ' %' },
+    { type: 'section', label: 'Funnels' },
+    { type: 'range', id: 'reach', label: 'Reach', min: 1, max: 4, step: 0.25, value: DEFAULTS.reach, format: (v) => v.toFixed(2) + '× length', note: 'How far the pull reaches in front of the red mouth, and the push behind the blue spout. Both are always the same.' },
+    { type: 'toggle', id: 'fields', label: 'Show fields', value: DEFAULTS.fields, note: 'Draws the pull and push zones faintly.' },
+    { type: 'button', label: 'Clear funnels', onClick: clearFunnels },
+    { type: 'section', label: 'Map' },
+    { type: 'button', label: 'New map', onClick: () => newMap() },
+  ],
+  setup,
+  reset: buildDefaultScene,
+  update,
+  render,
+  resize: layout,
+  viewChanged,
+  pointerDown,
+  pointerMove,
+  pointerUp,
+  pointerLeave: () => { S.hover = null; if (!S.drag) setCursor('default'); },
+  wheel,
+  keydown,
+  keyup,
+  escape: () => select(null),
+});
+
+// ================================================================== test API
+// World units throughout (the world is WORLD_W × WORLD_H); toScreen / toWorld convert to CSS pixels.
+// funnels: the live objects: { id, x, y, angle (rad, mouth → spout), power (0–1), inside (particles in it now), lifted, ... }
+window.__toy = {
+  particles: {
+    get count() { return N; },
+    x: (i) => PX[i], y: (i) => PY[i], vx: (i) => VX[i], vy: (i) => VY[i],
+    insideOf: (i) => (INF[i] >= 0 ? S.slots[INF[i]] : null),
+    tint: (i) => ({ warm: WARM[i], cool: COOL[i] }),
+    get radius() { return tw('size'); },
+    // probes: put particle i at (x, y) with velocity (vx, vy), outside every funnel and untinted
+    place: (i, x, y, vx = 0, vy = 0) => { PX[i] = x; PY[i] = y; VX[i] = vx; VY[i] = vy; WARM[i] = 0; COOL[i] = 0; INT[i] = 0; INF[i] = -1; ENTRY[i] = 0; },
+  },
+  get funnels() { return S.funnels; },
+  toScreen: (wx, wy) => ({ x: S.ox + wx * S.sc, y: S.oy + wy * S.sc }),
+  toWorld: (sx, sy) => ({ x: toWorldX(sx), y: toWorldY(sy) }),
+  sdf: (wx, wy) => sdfAt(wx, wy),
+  components,
+  createFunnel: (wx, wy, angle = 0) => (sdfAt(wx, wy) < 3 || funnelAt(wx, wy, 4) ? null : addFunnel(wx, wy, angle, 0.6, { quiet: true })),
+  destroyFunnel: (f) => destroyFunnel(f),
+  undo,
+  setParticleCount: (n) => setParticleCount(n),
+  setSpeed,
+  setPower: (f, p) => setPower(f, p > 1 ? p / 100 : p),   // 0–1 (values above 1 are read as percent)
+  throughput: () => S.through,
+  insideTooLong: () => { let n = 0; for (let i = 0; i < N; i++) if (INF[i] >= 0 && INT[i] > 3) n++; return n; },
+  newMap: (seed) => newMap(seed),
+  // extras for tests
+  get seed() { return S.seed; },
+  get selected() { return S.sel; },
+  get ghost() { return S.ghost; },                        // the red ghost of a refused placement, while it shows
+  select: (f) => select(f),
+  get scale() { return S.sc; },
+  get reach() { return tw('reach') * F_LEN; },             // pull and push reach (world units)
+  // the pull + push acceleration (world units / s², current speed) the simulation gives a particle at (wx, wy) outside
+  // every funnel: the same function the simulation calls
+  field: (wx, wy) => { fieldAt(wx, wy, workingFunnels(), tw('reach') * F_LEN, S.speed * S.speed); return { ax: FLD.ax, ay: FLD.ay }; },
+  world: { w: WORLD_W, h: WORLD_H, funnelLength: F_LEN },
+  get map() { return { chambers: MAP.chambers.length, tunnels: MAP.tunnels.filter((t) => !t.fix).map((t) => ({ narrow: t.narrow, width: t.w })), fixes: MAP.tunnels.filter((t) => t.fix).length }; },
+  wallViolations: () => { let n = 0; for (let i = 0; i < N; i++) if (sdfAt(PX[i], PY[i]) <= 0) n++; return n; },
+  fits: (f, x, y, a) => fits(f, x, y, a),
+  localOf: (f, wx, wy) => { const dx = wx - f.x, dy = wy - f.y; return { x: dx * f.c + dy * f.s, y: -dx * f.s + dy * f.c, hw: hwAt(dx * f.c + dy * f.s) - F_WALL }; },
+  pillOf: (f) => (f.ui ? f.ui.pill : null),
+};
+</script>
+</body>
+</html>
