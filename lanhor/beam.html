@@ -826,7 +826,7 @@ function makeMoth(x, y, look) {
     size: rand(0.9, 1.1), look: look != null ? look : U.randi(0, MOTH_LOOKS.length - 1),
     p1: rand(0, TAU), p2: rand(0, TAU), p3: rand(0, TAU), flap: rand(0, TAU),
     darkT: 0, outT: 0, lostT: 0, dazeT: 0, spin: 1,
-    nextT: 0, stuckT: 0, bestD: Infinity, loopT: 0, loopA: 0,
+    nextT: 0, holdT: 0, stuckT: 0, bestD: Infinity, loopT: 0, loopA: 0,
     glow: 0, glowMask: 0, boost: 0, crowd: 0, squash: 0, lastLit: -9, cueAt: -9,
   };
   Object.defineProperty(m, 'fx', { value: { trail: new Float32Array(TRAIL * 2), tn: 0, th: 0, rings: new Int8Array([-1, -1, -1]) }, enumerable: false });
@@ -901,7 +901,7 @@ function setDest(m, x, y, region, bandL) {
   if (m.dest) { m.dest.x = x; m.dest.y = y; } else m.dest = { x, y };
   m.region = region; m.bandL = bandL;
   m.nextT = rand(2, 4) / tw('roam');
-  m.stuckT = 0; m.bestD = Infinity;
+  m.stuckT = 0; m.bestD = Infinity; m.holdT = 0.4;   // in a tiny band every spot is "arrived": hold each a moment
 }
 
 /** Pick a destination from the light map. Across the room (inRegion false): a cell of the brightest
@@ -1033,9 +1033,9 @@ function think(m, pr, dt) {
   else if ((m.outT += dt) > 1.2) m.state = 'seek';   // drifted out of its band: hurry back in
   const d = Math.hypot(m.dest.x - m.x, m.dest.y - m.y);
   if (d < m.bestD - 6 * S.scale) { m.bestD = d; m.stuckT = 0; } else m.stuckT += dt;
-  m.nextT -= dt;
+  m.nextT -= dt; m.holdT -= dt;
   // never hover: a new spot in the band on arrival, every few seconds while roaming, or when blocked
-  if (d < 35 * S.scale || m.stuckT > 1.6 || (m.state === 'roam' && m.nextT <= 0)) plan(m, m.region >= 0);
+  if ((d < 35 * S.scale && m.holdT <= 0) || m.stuckT > 1.6 || (m.state === 'roam' && m.nextT <= 0)) plan(m, m.region >= 0);
 }
 
 // neighbour separation (module-level scratch keeps the hot loop allocation-free)
