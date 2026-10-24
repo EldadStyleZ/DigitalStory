@@ -37,8 +37,9 @@ const PROF_H = [45, 31, 22.5, 17.5, 14.5, 14.5];    // inner spout opening = 2 �
 const F_BOUND = Math.hypot(F_HALF, PROF_H[0]) + F_WALL + R_MAX + 2;
 const PILL_AT = -14;                                 // the slider sits on the wide part of the body
 // forces in world units / s² at 1× speed and 100 % power. Pull and push are mirror images with one power: the same
-// FIELD_ACC, reach (the Reach tweak), falloff and line-of-sight rule. KICK: the spout's ejection boost (world units / s)
-const FIELD_ACC = 2300, CARRY_ACC = 1700, KICK = 300;
+// FIELD_ACC, reach (the Reach tweak), falloff, line-of-sight rule and rock rule (FIELD_CLEAR: no field where rock lies
+// that close ahead of the particle, world units). KICK: the spout's ejection boost (world units / s)
+const FIELD_ACC = 2300, CARRY_ACC = 1700, KICK = 300, FIELD_CLEAR = 40;
 const RELAX_UP = 4, RELAX_DOWN = 1.15;               // back to cruising speed (1/s): quick after bounces, slow after a kick
 const WANDER = 1.5;                                  // random-walk heading noise (rad / √s)
 const VMAX = 1500;
@@ -404,6 +405,12 @@ function generate(seed) {
   // obstacles: pillars, pebble clusters, capsules, rounded blocks, and fingers from the walls
   const clearOf = (x, y, rad, gap) => mouths.every((m) => Math.hypot(x - m.x, y - m.y) > rad + m.r + gap)
     && MAP.obstacles.every((o) => Math.hypot(x - o.bx, y - o.by) > rad + o.br + 44);
+  // a finger also keeps clear of the tunnels that only pass its chamber (such as the long diagonal one): poking into
+  // one would pinch it to a sharp waist or cut it
+  const clearOfPassing = (ci, ax, ay, bx, by, r) => MAP.tunnels.every((t) => t.a === ci || t.b === ci || t.parts.every((s) => {
+    for (let k = 0; k <= 8; k++) if (sdShape(ax + ((bx - ax) * k) / 8, ay + ((by - ay) * k) / 8, s) < r + FINGER_FILLET + 4) return false;
+    return true;
+  }));
   for (const ch of MAP.chambers) {
     const want = 2 + Math.floor(R(0, 3));
     for (let tries = 0, made = 0; tries < 60 && made < want; tries++) {
@@ -431,7 +438,7 @@ function generate(seed) {
         while (d < 400 && chamberField(ch.x + ux * d, ch.y + uy * d, ch) < 0) d += 4;
         const ex = ch.x + ux * d, ey = ch.y + uy * d, l = R(46, 84), r = R(11, 16);
         const tx = ex - ux * l, ty = ey - uy * l;
-        if (d < 120 || !clearOf(tx, ty, r, 70) || !clearOf(ex, ey, r, 50)) continue;
+        if (d < 120 || !clearOf(tx, ty, r, 70) || !clearOf(ex, ey, r, 50) || !clearOfPassing(MAP.chambers.indexOf(ch), ex, ey, tx, ty, r)) continue;
         const p = capsule(ex + ux * 24, ey + uy * 24, tx, ty, r);
         MAP.obstacles.push({ parts: [p], k: 1, fillet: FINGER_FILLET, bx: p.bx, by: p.by, br: p.br });
         break;
@@ -938,7 +945,9 @@ function workingFunnels() {
  *  (world units / s²), pulled (how hard it is pulled, for the red tint) and d2 (squared distance to the nearest funnel).
  *  Pull and push mirror each other. In the red half-space in front of the mouth a particle is drawn toward the mouth
  *  center; in the blue half-space behind the spout it is driven away from the spout center. Both use the same power,
- *  reach, falloff (1 − d / reach)² and line-of-sight test. */
+ *  reach, falloff (1 − d / reach)², line-of-sight test and rock rule: a field never presses a particle into rock, so it
+ *  is off where rock lies within FIELD_CLEAR ahead of the particle in the direction it is driven. The pull ends in its
+ *  mouth; without the rock rule an equally strong push pins particles in a thin layer on rock that faces a spout. */
 const FLD = { ax: 0, ay: 0, pulled: 0, d2: 0 };
 function fieldAt(x, y, nf, reach, acc) {
   const reach2 = reach * reach;
@@ -950,7 +959,9 @@ function fieldAt(x, y, nf, reach, acc) {
     if (P <= 0 || !side) continue;
     const ox = f.x + side * f.c * F_HALF, oy = f.y + side * f.s * F_HALF, ex = x - ox, ey = y - oy, d2 = ex * ex + ey * ey;
     if (d2 >= reach2 || d2 <= 1 || !lineClear(x, y, ox, oy)) continue;
-    const d = Math.sqrt(d2), fall = 1 - d / reach, a = (side * FIELD_ACC * acc * P * fall * fall) / d;
+    const d = Math.sqrt(d2), ux = (side * ex) / d, uy = (side * ey) / d;   // the direction the field drives it
+    if (sdfAt(x + ux * FIELD_CLEAR * 0.5, y + uy * FIELD_CLEAR * 0.5) <= 0 || sdfAt(x + ux * FIELD_CLEAR, y + uy * FIELD_CLEAR) <= 0) continue;
+    const fall = 1 - d / reach, a = (side * FIELD_ACC * acc * P * fall * fall) / d;
     ax += ex * a; ay += ey * a;   // along +e (away from the spout) on the blue side, along −e (toward the mouth) on the red
     if (side < 0 && fall * P > pulled) pulled = fall * P;
   }
