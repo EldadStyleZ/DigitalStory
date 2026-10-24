@@ -44,6 +44,11 @@ const NEEDLE_PX = 2;          // light gaps narrower than this even at their far
 const FALLOFF = 0.35;         // a beam is worth 1 at its lamp and 0.65 from `reach` on, so two beams always beat one
 const BAND = 0.85;            // the brightest band: light within this fraction of the strongest
 const BEAT = 1.25;            // a band this much stronger pulls committed moths away from theirs
+// A band too small for the moths roaming in it (or for one moth to travel, not hover) grows into the
+// brightest light around it, down to GROW_FLOOR of its peak, so a swarm never jams into a frozen ball
+const BAND_MIN_CELLS = 6;
+const CELLS_PER_MOTH = 0.9;
+const GROW_FLOOR = 0.6;
 const DARK_GRACE = 1.5;       // s a moth keeps flying through shadow before it is lost
 const TRAIL = 14;
 const MOTH_WS = 62;           // moth wingspan (px at scale 1)
@@ -712,13 +717,15 @@ function recomputeBeams() {
  * Each cell keeps one open sample point (clear of objects and lamp heads) and its exact L. Bright cells
  * are grouped into regions, grown from the brightest cell down: a region holds the connected cells
  * within BAND of its own peak. A region whose peak sits next to a brighter region is only that
- * region's slope; the others are bands. A moth commits to one band and roams inside it. */
+ * region's slope; the others are bands. A moth commits to one band and roams inside it. A band too
+ * small for its moths then grows into the brightest light around it (growBands). */
 const MAP = {
-  cols: 0, rows: 0, n: 0, cw: 1, ch: 1, max: 0, builtAt: -9,
-  L: new Float32Array(0), sx: new Float32Array(0), sy: new Float32Array(0), ok: new Uint8Array(0),
-  reg: new Int16Array(0), crowd: new Float32Array(0), w: new Float32Array(0), peak: [], isBand: [],
+  cols: 0, rows: 0, n: 0, cw: 1, ch: 1, max: 0, builtAt: -9, active: 0,
+  L: new Float32Array(0), sx: new Float32Array(0), sy: new Float32Array(0), ok: new Uint8Array(0), mark: new Uint8Array(0),
+  reg: new Int16Array(0), crowd: new Float32Array(0), w: new Float32Array(0),
+  peak: [], isBand: [], floor: [], cells: [],   // per region: brightest L, real band or slope, lowest L it holds, size
 };
-const mapOrder = [], mapStack = [];
+const mapOrder = [], mapStack = [], mapLoad = [];
 const byMapL = (a, b) => MAP.L[b] - MAP.L[a];
 const SPOT_TRIES = [0, 0, -0.3, 0, 0.3, 0, 0, -0.3, 0, 0.3, -0.3, -0.3, 0.3, -0.3, -0.3, 0.3, 0.3, 0.3];
 const spotClear = () => 18 * S.scale;   // a moth's body plus a little air
@@ -757,7 +764,7 @@ function buildMap() {
   if (n !== M.n) {
     M.n = n;
     for (const k of ['L', 'sx', 'sy', 'crowd', 'w']) M[k] = new Float32Array(n);
-    M.ok = new Uint8Array(n); M.reg = new Int16Array(n);
+    M.ok = new Uint8Array(n); M.mark = new Uint8Array(n); M.reg = new Int16Array(n);
   }
   M.cols = cols; M.rows = rows; M.cw = R.w / cols; M.ch = R.h / rows;
   for (let j = 0, c = 0; j < rows; j++) {
@@ -816,9 +823,76 @@ function buildMap() {
       }
     }
   }
+  growBands();
   M.builtAt = Kit.realTime;
   replanAll();
 }
+
+/** A band smaller than the moths that will roam in it need (CELLS_PER_MOTH each, BAND_MIN_CELLS at
+ *  least) takes in the cells around it ring by ring (brightest first within a ring), down to GROW_FLOOR
+ *  of its peak, so it stays centred on its brightest spot. It may take slopes, unclaimed cells and bands
+ *  the brightest one beats (their moths leave them), never a band that still holds moths, so no moth
+ *  changes band. A tiny triple overlap thus becomes the triple spot plus the two-beam light right around
+ *  it: the swarm crowds round the spot and keeps moving. */
+const mapRing = [];
+function growBands() {
+  const M = MAP, nr = M.peak.length, cols = M.cols, rows = M.rows;
+  M.floor.length = nr; M.cells.length = nr; mapLoad.length = nr;
+  for (let r = 0; r < nr; r++) { M.floor[r] = BAND * M.peak[r]; M.cells[r] = 0; mapLoad[r] = 0; }
+  for (let c = 0; c < M.n; c++) if (M.reg[c] >= 0) M.cells[M.reg[c]]++;
+  if (!nr) { M.active = 0; return; }
+  // the moths each band will hold: its committed ones; the rest (new, or leaving a beaten band) go to the brightest
+  const beaten = (r) => BEAT * M.peak[r] <= M.max;
+  let active = 0;
+  for (const m of S.moths) {
+    if (m.state !== 'seek' && m.state !== 'roam') continue;
+    active++;
+    let r = m.dest ? regionNear(m.dest.x, m.dest.y) : -1;
+    if (r < 0 || beaten(r)) r = 0;
+    mapLoad[r]++;
+  }
+  M.active = active;
+  const open = (q, r) => {
+    const o = M.reg[q];
+    return o !== r && M.ok[q] && M.L[q] > 0 && (o < 0 || !M.isBand[o] || beaten(o));
+  };
+  const front = mapStack;
+  for (let r = 0; r < nr; r++) {
+    const need = Math.ceil(Math.max(BAND_MIN_CELLS, CELLS_PER_MOTH * mapLoad[r]));
+    if (!M.isBand[r] || beaten(r) || M.cells[r] >= need) continue;
+    const lo = GROW_FLOOR * M.peak[r];
+    const pushAround = (c) => {
+      const ci = c % cols, cj = (c - ci) / cols;
+      for (let j = Math.max(0, cj - 1); j <= Math.min(rows - 1, cj + 1); j++) {
+        for (let i = Math.max(0, ci - 1); i <= Math.min(cols - 1, ci + 1); i++) {
+          const q = j * cols + i;
+          if (!M.mark[q] && M.L[q] >= lo && open(q, r)) { M.mark[q] = 1; front.push(q); }
+        }
+      }
+    };
+    front.length = 0;
+    for (let c = 0; c < M.n; c++) if (M.reg[c] === r) pushAround(c);
+    while (M.cells[r] < need && front.length) {
+      mapRing.length = 0;
+      for (const q of front) mapRing.push(q);
+      front.length = 0;
+      mapRing.sort(byMapL);
+      for (const q of mapRing) {
+        if (M.cells[r] >= need) break;
+        if (!open(q, r)) continue;
+        if (M.reg[q] >= 0) M.cells[M.reg[q]]--;
+        M.reg[q] = r; M.cells[r]++;
+        if (M.L[q] < M.floor[r]) M.floor[r] = M.L[q];
+        pushAround(q);   // the next ring
+      }
+    }
+    front.length = 0;
+    M.mark.fill(0);
+  }
+}
+
+/** The lowest light that still counts as inside band r (a grown band reaches below BAND of its peak). */
+const floorOf = (r) => (r >= 0 && r < MAP.floor.length ? Math.min(BAND * MAP.peak[r], MAP.floor[r] * 0.97) : 0);
 /** Bring the beams and the map up to date now (test API; the loop throttles its own rebuilds). */
 function syncMap() {
   if (S.dirty) recomputeBeams();
@@ -831,7 +905,7 @@ function makeMoth(x, y, look) {
     x, y, vx: 0, vy: 0, h: rand(0, TAU), wh: rand(0, TAU),
     state: 'wander', dest: null,   // dest: where it flies while the light draws it
     L: 0, n: 0,                    // light strength at its position, and how many lamps make it
-    region: -1, bandL: 0,          // the bright band it is committed to: light-map region and its peak
+    region: -1, bandL: 0, floorL: 0,   // the bright band it is committed to: light-map region, its peak, its lowest light
     size: rand(0.9, 1.1), look: look != null ? look : U.randi(0, MOTH_LOOKS.length - 1),
     p1: rand(0, TAU), p2: rand(0, TAU), p3: rand(0, TAU), flap: rand(0, TAU),
     darkT: 0, outT: 0, lostT: 0, dazeT: 0, spin: 1,
@@ -908,7 +982,7 @@ function loseLight(m) {
 
 function setDest(m, x, y, region, bandL) {
   if (m.dest) { m.dest.x = x; m.dest.y = y; } else m.dest = { x, y };
-  m.region = region; m.bandL = bandL;
+  m.region = region; m.bandL = bandL; m.floorL = region >= 0 ? floorOf(region) : BAND * bandL;
   m.nextT = rand(2, 4) / tw('roam');
   m.stuckT = 0; m.bestD = Infinity; m.holdT = 0.4;   // in a tiny band every spot is "arrived": hold each a moment
 }
@@ -916,7 +990,8 @@ function setDest(m, x, y, region, bandL) {
 /** Pick a destination from the light map. Across the room (inRegion false): a cell of the brightest
  *  band, nearer ones first. Inside the moth's own band (inRegion true): any cell of its region but the
  *  ones right next to it, so it keeps travelling all over the band. Cells that other moths head for or
- *  sit in count less, so a swarm spreads out. */
+ *  sit in count less, so a swarm spreads out; the cells a band grew by count less the dimmer they are,
+ *  so the swarm stays densest in the brightest light. */
 function pickDest(m, inRegion) {
   const M = MAP, n = M.n, s = S.scale;
   if (!(M.max > 0) || (inRegion && !(m.region >= 0 && m.region < M.peak.length))) return false;
@@ -930,10 +1005,12 @@ function pickDest(m, inRegion) {
   let total = 0;
   for (let c = 0; c < n; c++) {
     let w = 0;
-    if (M.ok[c] && (inRegion ? M.reg[c] === m.region : M.L[c] >= thr)) {
+    const r = M.reg[c], core = r >= 0 ? BAND * M.peak[r] : 0, grown = r >= 0 && M.L[c] < core;
+    if (M.ok[c] && (inRegion ? r === m.region : M.L[c] >= thr || (grown && M.peak[r] >= thr))) {
       const d = Math.hypot(M.sx[c] - m.x, M.sy[c] - m.y);
       const near = inRegion ? (d < 70 * s || c === cur ? 0.08 : 1) : 1 / (1 + d / (220 * s));
       w = near / (1 + 1.5 * M.crowd[c]);
+      if (grown) w *= Math.pow(M.L[c] / core, 3);
     }
     M.w[c] = w; total += w;
   }
@@ -948,7 +1025,7 @@ function pickDest(m, inRegion) {
   // a random open spot in that cell still in the band, a little inside its far edge and its beams' side
   // edges (so the path there stays in the light), else the cell's sample point
   const R = S.room, ci = pick % M.cols, cj = (pick - ci) / M.cols, clear = spotClear(), e = 14 * s;
-  const need = Math.min(M.L[pick], BAND * bandL * 1.03);
+  const core = BAND * bandL, need = Math.min(M.L[pick], (M.L[pick] >= core || reg < 0 ? core : floorOf(reg)) * 1.03);
   let x = M.sx[pick], y = M.sy[pick];
   for (let k = 0; k < 6; k++) {
     const px = R.x + (ci + Math.random()) * M.cw, py = R.y + (cj + Math.random()) * M.ch;
@@ -1005,10 +1082,10 @@ function replanAll() {
   for (const m of S.moths) {
     if (!m.dest) continue;
     const r = regionNear(m.dest.x, m.dest.y), destL = lightAt(m.dest.x, m.dest.y);
-    if (r >= 0) { m.region = r; m.bandL = M.peak[r]; } else m.region = -1;
+    if (r >= 0) { m.region = r; m.bandL = M.peak[r]; m.floorL = floorOf(r); } else m.region = -1;
     if (destL <= 0 && lightAt(m.x, m.y) <= 0) { if (!plan(m, false)) loseLight(m); }
     else if (destL <= 0 || r < 0 || M.max >= BEAT * m.bandL) plan(m, false);
-    else if (destL < BAND * m.bandL || !openSpot(m.dest.x, m.dest.y, spotClear())) plan(m, true);
+    else if (destL < m.floorL || !openSpot(m.dest.x, m.dest.y, spotClear())) plan(m, true);
   }
 }
 
@@ -1042,7 +1119,7 @@ function think(m, pr, dt) {
   // a short grace carries it across a thin shadow
   if (lit) { m.darkT = 0; m.lastLit = Kit.time; } else if ((m.darkT += dt) > DARK_GRACE) { loseLight(m); return; }
   if (!m.dest && !plan(m, false)) return;
-  const inBand = m.L >= BAND * m.bandL;
+  const inBand = m.L >= m.floorL;
   if (m.state === 'seek') { if (inBand) { m.state = 'roam'; m.outT = 0; } } else if (inBand) m.outT = 0;
   else if ((m.outT += dt) > 1.2) m.state = 'seek';   // drifted out of its band: hurry back in
   const d = Math.hypot(m.dest.x - m.x, m.dest.y - m.y);
@@ -1148,18 +1225,19 @@ function updateMoths(dt, t) {
   hash.cell = Math.max(24, sepR);
   hash.clear();
   for (const m of S.moths) hash.insert(m, m.x, m.y);
-  let lit = 0, level = 0, roamLevel = 0;
+  let lit = 0, level = 0, roamLevel = 0, active = 0;
   for (const m of S.moths) {
     const pr = sampleLight(m.x, m.y);
     feelLight(m, pr);
     think(m, pr, dt);
     steer.ax = 0; steer.ay = 0;
     const roaming = m.state === 'roam';
+    if (roaming || m.state === 'seek') active++;
     if (m.dest && (roaming || m.state === 'seek')) {
       let dx = m.dest.x - m.x, dy = m.dest.y - m.y;
       const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
       // a roaming moth flutters freely inside its band; one that slipped out heads straight back in
-      const free = roaming && m.L >= BAND * m.bandL;
+      const free = roaming && m.L >= m.floorL;
       // now and then a free moth throws a quick, curious loop: a curl that keeps its speed and still
       // drifts on toward its spot (steered hard enough to follow the turn, so it never stalls in place)
       if (free && m.loopT <= 0 && Math.random() < dt * 0.25 * restless) { m.loopT = rand(0.7, 0.95); m.loopA = 0; m.spin = Math.random() < 0.5 ? -1 : 1; }
@@ -1220,6 +1298,8 @@ function updateMoths(dt, t) {
     }
   }
   if (lit !== S.litCount) { S.litCount = lit; updateCounts(); }
+  // band sizes follow the swarm: rebuild the map once the number of active moths has moved on
+  if (Math.abs(active - MAP.active) > Math.max(2, 0.15 * MAP.active)) S.mapDirty = true;
   // the "Brightest" stat follows a level once it has held for a moment, so it does not flicker at band edges
   const lv = roamLevel || level;
   if (lv !== S.levelNext) { S.levelNext = lv; S.levelT = 0; } else S.levelT += dt;
@@ -2876,13 +2956,15 @@ window.__toy = {
   removeObstacle,
   beamPolygon: (l) => l.fx.poly.slice(),
   refresh: () => { for (const l of S.lamps) placeLamp(l); for (const o of S.obstacles) updateObstacle(o); recomputeBeams(); buildMap(); },
-  /** The light map's regions: [{peak, band (false: a slope of a brighter one), cells}] brightest first, plus the band threshold. */
+  /** The light map's regions, brightest first: [{peak, band (false: a slope of a brighter one), cells,
+   *  floor (the lowest light inside it: below BAND·peak when it grew to fit its moths)}], plus the band threshold. */
   bands: () => {
     syncMap();
-    const out = MAP.peak.map((peak, i) => ({ peak, band: MAP.isBand[i], cells: 0 }));
-    for (let c = 0; c < MAP.n; c++) if (MAP.reg[c] >= 0) out[MAP.reg[c]].cells++;
+    const out = MAP.peak.map((peak, i) => ({ peak, band: MAP.isBand[i], cells: MAP.cells[i], floor: floorOf(i) }));
     return { max: MAP.max, threshold: BAND * MAP.max, beat: BEAT, regions: out };
   },
+  /** Region index of the light-map cell at (x, y), -1 outside every region. */
+  regionAt: (x, y) => { syncMap(); return MAP.n ? MAP.reg[cellIndex(x, y)] : -1; },
   railPoint: (s) => Object.assign({}, railAt(s)),
   get railLength() { return S.railLen; },
 };
