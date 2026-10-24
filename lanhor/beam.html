@@ -768,11 +768,12 @@ function reflectAll(out, q0, prev, next, limit, K, made) {
       const x2 = P.sx + Math.cos(cb) * P.t[b], y2 = P.sy + Math.sin(cb) * P.t[b];
       a = b;
       if (Math.hypot(x2 - x1, y2 - y1) < 1) continue;
-      S.mirrorHits.push({ o, face, x1, y1, x2, y2, color: P.color, k: P.k, depth: P.depth, lamp: P.lamp });
+      const hit = { o, face, x1, y1, x2, y2, color: P.color, k: P.k, depth: P.depth, lamp: P.lamp, reflected: false };
+      S.mirrorHits.push(hit);
       if (P.depth >= limit || made >= MAX_REFLECTIONS) continue;
       const key = P.key + '>' + run;
       const C = prev.get(key) || makePiece(P.lamp, P.depth + 1, key);
-      if (reflectPiece(C, P, o, face, x1, y1, x2, y2)) { C.k = P.k * K; out.push(C); next.set(key, C); made++; }
+      if (reflectPiece(C, P, o, face, x1, y1, x2, y2)) { C.k = P.k * K; out.push(C); next.set(key, C); made++; hit.reflected = true; }
     }
   }
   return made;
@@ -2588,9 +2589,11 @@ function paintMirror(g, o) {
 }
 
 const LIGHT_HOT = Object.fromEntries(COLORS.map((c) => [c, U.mixHex(LIGHT[c], '#ffffff', 0.5)]));
-/** Where a beam meets a mirror (Sprites, baked in the floor): a bright stripe on the lit stretch and,
- *  for light that arrives directly or after one bounce, a faint flare in the beam's color. */
+/** Where a beam meets a mirror (Sprites, baked in the floor): a bright stripe on the lit stretch and, where
+ *  light that arrived directly or after one bounce leaves it again, a faint flare in the beam's color (none
+ *  past the bounce limit or the cap on reflections: no light leaves there). */
 const FLARE_DEPTH = 1;   // the bounces light may have made and still flare (and glint) where it meets a mirror
+const flares = (h) => h.reflected && h.depth <= FLARE_DEPTH;
 function paintMirrorHits(f) {
   const s = S.scale;
   f.save();
@@ -2603,7 +2606,7 @@ function paintMirrorHits(f) {
     f.globalAlpha = 0.8 * vis;
     f.strokeStyle = LIGHT_HOT[h.color];
     f.beginPath(); f.moveTo(h.x1, h.y1); f.lineTo(h.x2, h.y2); f.stroke();
-    if (h.depth > FLARE_DEPTH) continue;
+    if (!flares(h)) continue;
     const len = Math.hypot(h.x2 - h.x1, h.y2 - h.y1);
     f.globalAlpha = 0.4 * vis;
     drawGlowSized(f, LIGHT[h.color], (h.x1 + h.x2) / 2, (h.y1 + h.y2) / 2, Math.round(clamp(len * 0.8, 40 * s, 100 * s) / 8) * 8);
@@ -2611,7 +2614,7 @@ function paintMirrorHits(f) {
   f.restore();
 }
 
-/** Live mirror effects (Sprites): a soft sheen sliding along each mirror and a twinkling glint where a beam meets it. */
+/** Live mirror effects (Sprites): a soft sheen sliding along each mirror and a twinkling glint where a beam bounces off it. */
 function drawMirrorFx(ctx, t) {
   const s = S.scale;
   ctx.save();
@@ -2633,7 +2636,7 @@ function drawMirrorFx(ctx, t) {
   const g = Math.round((28 * s) / 4) * 4;
   for (const h of S.mirrorHits) {
     const vis = lampVis(h.lamp) * h.k;
-    if (vis < 0.02 || h.depth > FLARE_DEPTH) continue;
+    if (vis < 0.02 || !flares(h)) continue;
     ctx.globalAlpha = vis * (0.7 + 0.3 * Math.sin(t * 6.5 + h.o.id * 1.7));
     drawGlowSized(ctx, '#ffffff', (h.x1 + h.x2) / 2, (h.y1 + h.y2) / 2, g);
   }
@@ -3478,10 +3481,10 @@ window.__toy = {
   /** How many times the beams (with their reflections) and the light map have been rebuilt. */
   get counters() { return Object.assign({}, S.counts); },
   /** Where light meets a mirror face: [{mirror (obstacle index), x1, y1, x2, y2 (the lit stretch), color,
-   *  strength, depth (the bounces the light made before it got here)}]. */
+   *  strength, depth (the bounces the light made before it got here), reflected (a reflection leaves there)}]. */
   mirrorHits: () => {
     if (S.dirty) recomputeBeams();
-    return S.mirrorHits.map((h) => ({ mirror: S.obstacles.indexOf(h.o), x1: h.x1, y1: h.y1, x2: h.x2, y2: h.y2, color: h.color, strength: h.k, depth: h.depth }));
+    return S.mirrorHits.map((h) => ({ mirror: S.obstacles.indexOf(h.o), x1: h.x1, y1: h.y1, x2: h.x2, y2: h.y2, color: h.color, strength: h.k, depth: h.depth, reflected: h.reflected }));
   },
 };
 </script>
