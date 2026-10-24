@@ -1445,6 +1445,42 @@ function blitResting(ctx, f, sp, x, y) {
   }
   ctx.drawImage(c.cv, (ix - c.half) / d, (iy - c.half) / d, (2 * c.half) / d, (2 * c.half) / d);
 }
+/** Show fields: each resting funnel's pull and push bubbles are painted (rotated, cut to the board) into two small
+ *  canvases of its own and blitted without a transform. They are repainted only when the funnel, its power or the
+ *  layout changes: a room-sized gradient costs a software canvas several ms per funnel per frame. */
+const FIELD_LEVELS = 24;
+function drawFields(ctx, R) {
+  const d = Kit.dpr, sc = S.sc, reach = tw('reach') * F_LEN, bx0 = S.ox * d, by0 = S.oy * d, bx1 = (S.ox + WORLD_W * sc) * d, by1 = (S.oy + WORLD_H * sc) * d;
+  const board = (g) => { U.roundRect(g, S.ox, S.oy, WORLD_W * sc, WORLD_H * sc, BOARD_R * sc); g.clip(); };
+  for (const f of S.funnels) {
+    if (f.lifted || f.power <= 0) continue;
+    const P = Math.max(1, Math.round(f.glow * FIELD_LEVELS)) / FIELD_LEVELS;
+    if (f.pop < 1 || f.lift > 0.01) {   // landing or popping in: a few frames, painted directly
+      ctx.save(); board(ctx);
+      for (let which = 0; which < 2; which++) R.fields(ctx, f, P, which, (which ? reach * PUSH_REACH : reach) / 2);
+      ctx.restore();
+      continue;
+    }
+    const key = `${Kit.view}:${sc}:${S.ox}:${S.oy}:${d}:${reach}:${f.x}:${f.y}:${f.angle}:${P}`;
+    const c = f.fields || (f.fields = { key: '', parts: [0, 1].map(() => ({ cv: document.createElement('canvas'), x: 0, y: 0, on: false })) });
+    if (c.key !== key) {
+      c.key = key;
+      for (let which = 0; which < 2; which++) {
+        const part = c.parts[which], r = (which ? reach * PUSH_REACH : reach) / 2, off = which ? F_HALF + r : -F_HALF - r;
+        const cx = (S.ox + (f.x + f.c * off) * sc) * d, cy = (S.oy + (f.y + f.s * off) * sc) * d, rp = r * sc * d + 2;
+        const x0 = Math.floor(Math.max(cx - rp, bx0)), y0 = Math.floor(Math.max(cy - rp, by0)), x1 = Math.ceil(Math.min(cx + rp, bx1)), y1 = Math.ceil(Math.min(cy + rp, by1));
+        part.on = x1 > x0 && y1 > y0;
+        if (!part.on) continue;
+        part.x = x0; part.y = y0; part.cv.width = x1 - x0; part.cv.height = y1 - y0;
+        const g = part.cv.getContext('2d');
+        g.setTransform(d, 0, 0, d, -x0, -y0);
+        board(g);
+        R.fields(g, f, P, which, r);
+      }
+    }
+    for (const part of c.parts) if (part.on) ctx.drawImage(part.cv, part.x / d, part.y / d, part.cv.width / d, part.cv.height / d);
+  }
+}
 /** A funnel: glows, shadow while lifted, hover outline, body; chevrons on top while it works. */
 function drawFunnel(ctx, f, rt, R, alpha, extra) {
   const sp = funnelSprites(), sc = S.sc, x = S.ox + f.x * sc, y = S.oy + f.y * sc - f.lift * 5;
@@ -1542,17 +1578,15 @@ const SPRITES = {
       ctx.fill();
     }
   },
-  fields(ctx, f, reach, pushR) {
-    // soft bubbles in front of the mouth (pull) and behind the spout (push), strongest at the opening
+  fields(ctx, f, P, which, r) {
+    // a soft bubble in front of the mouth (pull, which 0) or behind the spout (push, which 1), strongest at the opening
     ctx.save();
     enterFunnel(ctx, f);
-    const P = f.glow;
-    for (const [x0, dir, r, col, a] of [[-F_HALF, -1, reach / 2, '255, 77, 109', 0.26], [F_HALF, 1, pushR / 2, '74, 163, 255', 0.28]]) {
-      const g = ctx.createRadialGradient(x0, 0, 0, x0 + dir * r, 0, r);
-      g.addColorStop(0, `rgba(${col}, ${a * P})`); g.addColorStop(0.4, `rgba(${col}, ${a * 0.4 * P})`); g.addColorStop(1, `rgba(${col}, 0)`);
-      ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(x0 + dir * r, 0, r, 0, TAU); ctx.fill();
-    }
+    const x0 = which ? F_HALF : -F_HALF, dir = which ? 1 : -1, col = which ? '74, 163, 255' : '255, 77, 109', a = which ? 0.28 : 0.26;
+    const g = ctx.createRadialGradient(x0, 0, 0, x0 + dir * r, 0, r);
+    g.addColorStop(0, `rgba(${col}, ${a * P})`); g.addColorStop(0.4, `rgba(${col}, ${a * 0.4 * P})`); g.addColorStop(1, `rgba(${col}, 0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x0 + dir * r, 0, r, 0, TAU); ctx.fill();
     ctx.restore();
   },
   fx(ctx) {
@@ -1610,14 +1644,12 @@ const SHAPES = {
       ctx.fill();
     }
   },
-  fields(ctx, f, reach, pushR) {
+  fields(ctx, f, P, which, r) {
     ctx.save();
     enterFunnel(ctx, f);
-    ctx.globalAlpha = 0.12 * Math.min(1, f.glow * 2);
-    ctx.fillStyle = SH.red;
-    ctx.beginPath(); ctx.arc(-F_HALF - reach / 2, 0, reach / 2, 0, TAU); ctx.fill();
-    ctx.fillStyle = SH.blue;
-    ctx.beginPath(); ctx.arc(F_HALF + pushR / 2, 0, pushR / 2, 0, TAU); ctx.fill();
+    ctx.globalAlpha = 0.12 * Math.min(1, P * 2);
+    ctx.fillStyle = which ? SH.blue : SH.red;
+    ctx.beginPath(); ctx.arc(which ? F_HALF + r : -F_HALF - r, 0, r, 0, TAU); ctx.fill();
     ctx.restore();
   },
   fx(ctx) {
@@ -1774,14 +1806,7 @@ function render(ctx, rdt) {
   const stamped = useStamp() && PB.bg;
   if (stamped) { PB.d32.set(PB.bg); stampParticles(); ctx.putImageData(PB.img, 0, 0); }
   else ctx.drawImage(layer, 0, 0, Kit.W, Kit.H);
-  if (tw('fields')) {
-    const reach = tw('reach') * F_LEN, pushR = reach * PUSH_REACH;
-    ctx.save();
-    U.roundRect(ctx, S.ox, S.oy, WORLD_W * S.sc, WORLD_H * S.sc, BOARD_R * S.sc);
-    ctx.clip();
-    for (const f of S.funnels) if (!f.lifted && f.power > 0) R.fields(ctx, f, reach, pushR);
-    ctx.restore();
-  }
+  if (tw('fields')) drawFields(ctx, R);
   // lifted funnels float above everything; with vector particles, resting ones lie under them
   for (const f of S.funnels) if (!f.lifted) drawFunnel(ctx, f, rt, R, 1, 1);
   if (!stamped) R.particles(ctx);
