@@ -5,7 +5,7 @@ Each toy tests a different pull. Built for the Digital Story course at Bezalel A
 
 | # | Sprites name | Shapes name | The pull |
 |---|---|---|---|
-| 01 | Moths & Lamps | Beam | Agents rush any light that reaches them; objects block or filter the light |
+| 01 | Moths & Lamps | Beam | Agents gather where the light is strongest (overlapping beams add up); objects block or filter the light |
 | 02 | School of Fish | Flow | A group you steer grows in green zones, shrinks in red zones, and is pushed by flows |
 | 03 | Ants & Sugar | Trail | Each agent walks to the closest attractor it can see, then returns to its base |
 
@@ -44,27 +44,30 @@ toys are then online at `https://eldadstylez.github.io/digitalstory/lanhor/`.
 
 ## 01 Moths & Lamps (Beam)
 
-Up to five lamps hang on the frame, in red, green or blue. A moth that a beam reaches flies to that lamp and
-circles it. Stones block light, and colored glass lets only its own color through. Beams mix where they overlap
-(red + green = yellow).
+Up to five lamps hang on the frame, in six colors: red, orange, yellow, green, blue and purple. Moths fly to the
+brightest light. Every beam adds up, so where two beams overlap the light is stronger than one beam alone (and three
+beat two). The swarm gathers in the brightest area and keeps roaming around inside it. Stones block light, colored
+glass lets only its own color through, and beams mix their colors where they overlap.
 
 | Input | Action |
 |---|---|
 | Click the frame, or L | Hang a lamp (up to five) |
-| 1 2 3 | Lamp color: red, green, blue (also recolors the selected lamp) |
+| 1–6 | Lamp color, from red to purple (also recolors the selected lamp) |
 | Drag | Slide a lamp along the frame, or move an object |
 | Drag the knob, or ← → | Aim the selected lamp |
 | Wheel | Aim a lamp or turn an object |
 | Shift + wheel, or ↑ ↓ | Make a beam wider or narrower |
 | Double-click, or O | Switch a lamp on or off |
 | Tab / Esc | Select the next lamp / deselect |
-| 4–8 | Add a block, wedge, stone, plank or glass |
+| 7 8 9 0 | Add a block, wedge, stone or plank |
+| G | Add glass in the current color |
 | Q E, arrows | Turn or nudge the selected object |
 | Right-click, or Delete | Remove a lamp or object |
 
-**One-minute demo:** wait for the moth to wander into the red beam and rush the lamp. Drag a stone into the
-beam so the moth loses the light and wanders off. Hang a green lamp on the opposite side and watch it change
-its mind. Raise *How many* in Tweaks to 30 for a swarm.
+**One-minute demo:** the red and blue beams already cross; watch the moth fly into the overlap and roam there.
+Raise *How many* in Tweaks to 30 for a swarm. Aim a third lamp into the same spot and the swarm packs into the
+three-beam patch; move one lamp away and they stream to the next brightest place. Drag a stone into the overlap to
+break it up. The *Brightest* counter shows how many beams the swarm is sitting in.
 
 ## 02 School of Fish (Flow)
 

@@ -945,13 +945,15 @@ function pickDest(m, inRegion) {
     if (r <= 0) break;
   }
   const reg = M.reg[pick], bandL = reg >= 0 ? M.peak[reg] : M.L[pick];
-  // a random open spot in that cell still in the band (a little inside its edge), else the cell's sample point
-  const R = S.room, ci = pick % M.cols, cj = (pick - ci) / M.cols, clear = spotClear();
+  // a random open spot in that cell still in the band, a little inside its far edge and its beams' side
+  // edges (so the path there stays in the light), else the cell's sample point
+  const R = S.room, ci = pick % M.cols, cj = (pick - ci) / M.cols, clear = spotClear(), e = 14 * s;
   const need = Math.min(M.L[pick], BAND * bandL * 1.03);
   let x = M.sx[pick], y = M.sy[pick];
   for (let k = 0; k < 6; k++) {
     const px = R.x + (ci + Math.random()) * M.cw, py = R.y + (cj + Math.random()) * M.ch;
-    if (openSpot(px, py, clear) && lightAt(px, py) >= need) { x = px; y = py; break; }
+    if (openSpot(px, py, clear) && lightAt(px, py) >= need &&
+      lightAt(px - e, py) >= need && lightAt(px + e, py) >= need && lightAt(px, py - e) >= need && lightAt(px, py + e) >= need) { x = px; y = py; break; }
   }
   setDest(m, x, y, reg, bandL);
   return true;
