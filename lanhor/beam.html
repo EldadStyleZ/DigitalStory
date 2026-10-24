@@ -114,7 +114,7 @@ const S = {
   pieceByKey: new Map(), mirrorHits: [],   // reflected pieces by their path of faces (kept while unchanged); where light meets a mirror
   color: 'red',
   selLamp: null, selObj: null,
-  hover: { lamp: null, obj: null, handle: false, frame: false },
+  hover: { lamp: null, obj: null, handle: false, turn: false, frame: false },   // handle: a lamp's aim knob; turn: a mirror's knob
   ghost: { x: 0, y: 0, nx: 0, ny: 1, angle: 0, on: false, id: 0, fx: { pulse: 0 } },   // doubles as a lamp for drawing
   drag: null,
   dirty: true,
@@ -376,7 +376,7 @@ function addObject(type, at) {
   Kit.sfx('pop', { pitch: isMirror(o) ? 1.3 : rand(0.9, 1.1) });
   if (isMirror(o) && !S.mirrorToastShown) {
     S.mirrorToastShown = true;
-    Kit.toast('A mirror bounces the light. Turn it with the wheel.', { tone: 'info', ms: 2600 });
+    Kit.toast('A mirror bounces the light. Turn it by its knob or the wheel.', { tone: 'info', ms: 2600 });
   }
   S.dirty = true;
   return o;
@@ -393,6 +393,17 @@ function mirrorFace(o, j, out = faceOut) {
   out.ax = a.x; out.ay = a.y; out.bx = b.x; out.by = b.y; out.nx = nx; out.ny = ny;
   return out;
 }
+
+/** The turn knob of a selected mirror: on its axis just past one end (the +end, unless only the other end's
+ *  knob stays in the room). `end` (±1) pins the end, so a knob being dragged never jumps to the other one. */
+const knobOut = { x: 0, y: 0, end: 1 };
+function mirrorKnob(o, end, out = knobOut) {
+  const d = 1.6 * o.r + clamp(26 * S.scale, 22, 40), c = Math.cos(o.rot), s = Math.sin(o.rot);
+  if (!end) end = inRoom(o.bx + c * d, o.by + s * d, 12) || !inRoom(o.bx - c * d, o.by - s * d, 12) ? 1 : -1;
+  out.x = o.bx + c * d * end; out.y = o.by + s * d * end; out.end = end;
+  return out;
+}
+const knobHitR = () => Math.max(14, 13 * S.scale);
 
 /** Pointer over an object; a mirror is thin, so it also counts within a few pixels of it. */
 function overObject(o, x, y) {
@@ -1681,20 +1692,23 @@ function updateMotes(dt, t) {
 
 // ================================================================== input
 function updateHover(x, y) {
-  const h = S.hover, s = S.scale;
-  h.handle = false; h.lamp = null; h.obj = null; h.frame = false;
-  const sl = S.selLamp;
+  const h = S.hover;
+  h.handle = false; h.turn = false; h.lamp = null; h.obj = null; h.frame = false;
+  const sl = S.selLamp, so = S.selObj;
   if (sl) {
     const L = handleLen();
     const hx = sl.ox + Math.cos(sl.angle) * L, hy = sl.oy + Math.sin(sl.angle) * L;
-    if (U.dist(x, y, hx, hy) < Math.max(14, 13 * s)) h.handle = true;
+    if (U.dist(x, y, hx, hy) < knobHitR()) h.handle = true;
+  } else if (so && isMirror(so)) {
+    const k = mirrorKnob(so, S.drag && S.drag.kind === 'turn' ? S.drag.end : 0);
+    if (U.dist(x, y, k.x, k.y) < knobHitR()) h.turn = true;
   }
-  if (!h.handle) {
+  if (!h.handle && !h.turn) {
     const hitR = Math.max(18, S.band * 0.75);
     let bd = hitR;
     for (const l of S.lamps) { const d = U.dist(x, y, l.x, l.y); if (d < bd) { bd = d; h.lamp = l; } }
   }
-  if (!h.handle && !h.lamp) {
+  if (!h.handle && !h.turn && !h.lamp) {
     for (let i = S.obstacles.length - 1; i >= 0; i--) {
       if (overObject(S.obstacles[i], x, y)) { h.obj = S.obstacles[i]; break; }
     }
@@ -1708,7 +1722,7 @@ function updateHover(x, y) {
   S.ghost.on = h.frame;
   let cur = 'default';
   if (S.drag) cur = 'grabbing';
-  else if (h.handle || h.lamp || h.obj) cur = 'grab';
+  else if (h.handle || h.turn || h.lamp || h.obj) cur = 'grab';
   else if (h.frame) cur = S.lamps.length >= MAX_LAMPS ? 'not-allowed' : 'copy';
   if (cur !== S.cursor) { S.cursor = cur; Kit.canvas.style.cursor = cur; }
 }
@@ -1755,6 +1769,9 @@ function pointerDown(p) {
   if (p.button !== 0) return;
   if (h.handle) {
     S.drag = { kind: 'aim', lamp: S.selLamp };
+  } else if (h.turn) {
+    S.drag = { kind: 'turn', obj: S.selObj, end: mirrorKnob(S.selObj).end };
+    Kit.sfx('click', { pitch: 1.1 });
   } else if (h.lamp) {
     selectLamp(h.lamp);
     S.drag = { kind: 'lamp', lamp: h.lamp, sx: p.x, sy: p.y, moved: false };
@@ -1780,6 +1797,13 @@ function pointerMove(p) {
     if (d.kind === 'aim') {
       const l = d.lamp;
       setAim(l, angleDiff(Math.atan2(l.ny, l.nx), Math.atan2(p.y - l.oy, p.x - l.ox)));
+    } else if (d.kind === 'turn') {
+      // the grabbed end follows the pointer round the mirror's centre (whole degrees with Shift)
+      const o = d.obj;
+      let a = Math.atan2(p.y - o.by, p.x - o.bx) + (d.end < 0 ? Math.PI : 0);
+      if (p.shift) a = Math.round(a / DEG) * DEG;
+      const da = angleDiff(o.rot, a);
+      if (Math.abs(da) > 1e-5) rotateObstacle(o, da);
     } else if (d.kind === 'lamp') {
       if (!d.moved && U.dist(p.x, p.y, d.sx, d.sy) < 4) return;
       d.moved = true;
@@ -3109,19 +3133,35 @@ function drawOverlays(ctx, t) {
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.globalAlpha = 1;
-    const hot = S.hover.handle || (S.drag && S.drag.kind === 'aim');
-    const kr = (hot ? 11 : 9) * s;
-    if (hot) { ctx.fillStyle = abs ? 'rgba(255,255,255,0.25)' : 'rgba(255,209,102,0.3)'; ctx.beginPath(); ctx.arc(hx, hy, kr * 1.8, 0, TAU); ctx.fill(); }
-    ctx.fillStyle = ui;
-    ctx.strokeStyle = abs ? SH.bg : '#2a1d00';
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(hx, hy, kr, 0, TAU); ctx.fill(); ctx.stroke();
-    // little rotate arrows on the knob
-    ctx.strokeStyle = abs ? SH.bg : '#2a1d00'; ctx.lineWidth = 1.6;
-    ctx.beginPath(); ctx.arc(hx, hy, kr * 0.5, l.angle + 0.5, l.angle + 2.6); ctx.stroke();
-    ctx.beginPath(); ctx.arc(hx, hy, kr * 0.5, l.angle + 3.6, l.angle + 5.7); ctx.stroke();
+    drawKnob(ctx, hx, hy, l.angle, S.hover.handle || (S.drag && S.drag.kind === 'aim'));
     ctx.restore();
   }
+  // selected mirror: its turn knob just past one end, joined to it by a thin guide on its axis
+  if (so && isMirror(so)) {
+    const k = mirrorKnob(so, S.drag && S.drag.kind === 'turn' ? S.drag.end : 0), tip = 1.6 * so.r;
+    const ux = Math.cos(so.rot) * k.end, uy = Math.sin(so.rot) * k.end;
+    ctx.save();
+    ctx.globalAlpha = 0.55; ctx.setLineDash([4, 5]); ctx.lineWidth = 1.5;
+    ctx.strokeStyle = abs ? SH.white : 'rgba(255,255,255,0.85)';
+    ctx.beginPath(); ctx.moveTo(so.bx + ux * (tip + 4 * s), so.by + uy * (tip + 4 * s)); ctx.lineTo(k.x, k.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+    drawKnob(ctx, k.x, k.y, so.rot, S.hover.turn || (S.drag && S.drag.kind === 'turn'));
+    ctx.restore();
+  }
+}
+
+/** A round knob with two little rotate arrows (a lamp's aim, a mirror's turn); `hot` while hovered or dragged. */
+function drawKnob(ctx, x, y, ang, hot) {
+  const abs = Kit.isAbstract, kr = (hot ? 11 : 9) * S.scale, ink = abs ? SH.bg : '#2a1d00';
+  if (hot) { ctx.fillStyle = abs ? 'rgba(255,255,255,0.25)' : 'rgba(255,209,102,0.3)'; ctx.beginPath(); ctx.arc(x, y, kr * 1.8, 0, TAU); ctx.fill(); }
+  ctx.fillStyle = abs ? SH.white : ACCENT;
+  ctx.strokeStyle = ink;
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(x, y, kr, 0, TAU); ctx.fill(); ctx.stroke();
+  ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.arc(x, y, kr * 0.5, ang + 0.5, ang + 2.6); ctx.stroke();
+  ctx.beginPath(); ctx.arc(x, y, kr * 0.5, ang + 3.6, ang + 5.7); ctx.stroke();
 }
 
 function render(ctx, rdt) {
@@ -3192,7 +3232,7 @@ function showLevel() {
 
 function refreshHint() {
   if (S.selLamp) Kit.setHint('Drag the knob or press ← → to aim. ↑ ↓ width, 1–6 color, O on or off.');
-  else if (S.selObj && isMirror(S.selObj)) Kit.setHint('Turn the mirror with the wheel or Q E, hold Shift for 1° steps. Drag to move it.');
+  else if (S.selObj && isMirror(S.selObj)) Kit.setHint('Turn the mirror by its knob, the wheel or Q E; Shift for 1° steps.');
   else if (S.selObj) Kit.setHint('Drag to move it. Wheel or Q E rotates, Shift for 1° steps. Delete removes it.');
   else Kit.setHint(null);
 }
@@ -3203,7 +3243,7 @@ function buildDefaultScene() {
   const R = S.room, s = S.scale;
   S.lamps = []; S.obstacles = []; S.moths = [];
   S.selLamp = null; S.selObj = null; S.drag = null;
-  S.hover.lamp = null; S.hover.obj = null; S.hover.handle = false;
+  S.hover.lamp = null; S.hover.obj = null; S.hover.handle = false; S.hover.turn = false;
   S.level = -1;
   partN = 0;
   for (const [kind, cx, cy, size, rot, glass] of DEFAULT_OBJECTS) {
@@ -3249,8 +3289,8 @@ const GLASS_ICON = {
   sprite: svgIcon('<rect x="5" y="4" width="14" height="16" rx="1.5" fill="currentColor" fill-opacity="0.3"/><path d="M9 8.5l-1.6 2.8M13 8.5l-4.2 7.2"/>'),
   abstract: svgIcon('<rect x="5" y="5" width="14" height="14" fill="currentColor" fill-opacity="0.35"/>'),
 };
-// a ray bouncing off a mirror pane (a mechanic, so the same in both views)
-const MIRROR_ICON = svgIcon('<rect x="16.6" y="3" width="3.4" height="18" rx="1" fill="currentColor" fill-opacity="0.35"/><path d="M3 5.5l13 6.5L3 18.5M7 18.7L3 18.5l2.15-3.37" stroke-width="1.7"/>');
+// the textbook mirror symbol (a line hatched on its back) with a ray bouncing off it: a mechanic, so the same in both views
+const MIRROR_ICON = svgIcon('<path d="M3 16.5h18"/><path d="M6.5 16.5l-2 3.5M10.5 16.5l-2 3.5M14.5 16.5l-2 3.5M18.5 16.5l-2 3.5" stroke-width="1.4"/><path d="M4.5 4L12 14l7.5-10M16 4.3l3.5-.3.3 3.4" stroke-width="1.8"/>');
 
 // Toy-local styles (kit.css stays shared), more specific than the kit's own rules: the color bar (six
 // round swatches in one pill), a slightly tighter toolbar, and a help card whose "How to play" column
@@ -3311,7 +3351,7 @@ function setup() {
   });
   S.ui.mirrorBtn = Kit.ui.button({
     parent: gObj, icon: MIRROR_ICON, iconOnly: true, key: '−',
-    tip: 'Add a mirror: it bounces the light (the wheel turns it, with Shift in 1° steps)',
+    tip: 'Add a mirror: it bounces the light (turn it by its knob or the wheel)',
     onClick: () => addObject('mirror'),
   });
   setColor(S.color, false);
@@ -3343,7 +3383,7 @@ Kit.init({
     { keys: ['Click frame', 'L'], label: { sprite: 'Hang a lamp (up to five)', abstract: 'Add a light (up to five)' } },
     { keys: ['1–6'], label: { sprite: 'Lamp color, from red to purple', abstract: 'Light color, from red to purple' } },
     { keys: ['Drag'], label: { sprite: 'Slide a lamp or move an object', abstract: 'Slide a light or move an object' } },
-    { keys: ['Knob', '← →'], label: { sprite: 'Aim the selected lamp', abstract: 'Aim the selected light' } },
+    { keys: ['Knob', '← →'], label: { sprite: 'Aim a lamp, or turn a mirror by its knob', abstract: 'Aim a light, or turn a mirror by its knob' } },
     { keys: ['Wheel'], label: { sprite: 'Aim a lamp or turn an object', abstract: 'Aim a light or turn an object' } },
     { keys: ['Shift+wheel'], label: 'Beam width (or ↑ ↓); turns an object 1°' },
     { keys: ['Double-click'], label: { sprite: 'Switch a lamp on or off (or press O)', abstract: 'Switch a light on or off (or press O)' } },
@@ -3382,7 +3422,7 @@ Kit.init({
   pointerDown,
   pointerMove,
   pointerUp,
-  pointerLeave: () => { S.hover.lamp = null; S.hover.obj = null; S.hover.handle = false; S.hover.frame = false; S.ghost.on = false; },
+  pointerLeave: () => { S.hover.lamp = null; S.hover.obj = null; S.hover.handle = false; S.hover.turn = false; S.hover.frame = false; S.ghost.on = false; },
   wheel,
   dblclick,
   keydown,
@@ -3433,6 +3473,8 @@ window.__toy = {
     return S.pieces.map((p) => ({ lamp: p.lamp, depth: p.depth, poly: p.poly.slice(), color: p.color, strength: p.k, source: { x: p.sx, y: p.sy }, mirror: S.obstacles.indexOf(p.mirror) }));
   },
   reflectRay,
+  /** The selected mirror's turn knob {x, y, end (±1: the end it sits past)}, or null when no mirror is selected. */
+  mirrorKnob: () => (S.selObj && isMirror(S.selObj) ? Object.assign({}, mirrorKnob(S.selObj, S.drag && S.drag.kind === 'turn' ? S.drag.end : 0)) : null),
   /** How many times the beams (with their reflections) and the light map have been rebuilt. */
   get counters() { return Object.assign({}, S.counts); },
   /** Where light meets a mirror face: [{mirror (obstacle index), x1, y1, x2, y2 (the lit stretch), color,
