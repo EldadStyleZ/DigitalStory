@@ -522,9 +522,7 @@ html, body {
   inset: 0;
   display: flex;
   padding: 24px max(16px, env(safe-area-inset-left, 0px));
-  background: rgba(5, 6, 14, 0.62);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
+  background: rgba(8, 7, 20, 0.80); /* plain dim: a full-screen blur costs ~40 fps on machines without GPU compositing */
   pointer-events: auto;
   animation: kit-fade .25s ease both;
   overflow-y: auto;
