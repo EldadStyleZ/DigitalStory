@@ -1123,6 +1123,14 @@
       const old = layers[v]; layers[v] = layerPrev; layerPrev = old; layerKey[v] = ''; fadeT = FADE;
     } else fadeT = 0;
     ensureLayer(v);
+    schedulePrebuild();
+  }
+  /** While in Shapes, keep the Sprites picture ready for the reveal: repaint it once the map and window
+   *  settle (ants are mostly home right after a new map, so the one-off cost goes unnoticed). */
+  let prebuildTimer = 0;
+  function schedulePrebuild() {
+    clearTimeout(prebuildTimer);
+    if (Kit.isAbstract) prebuildTimer = setTimeout(() => { if (Kit.isAbstract) ensureLayer('sprite'); }, 1200);
   }
   function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
   /** Bring the static canvas of `view` (and, for Sprites, the cube and ant sprites) up to date. */
