@@ -997,14 +997,16 @@ function regionNear(x, y) {
 }
 
 /** After the map changes: follow a band that moved, leave one that went dark, and stream to a band
- *  that clearly beats the committed one (BEAT). An equal band elsewhere never steals a moth. */
+ *  that clearly beats the committed one (BEAT). An equal band elsewhere never steals a moth. A moth
+ *  left in the dark with its destination re-plans too: the shadow grace in think() decides whether it
+ *  reaches the light in time (a swung beam keeps its swarm); with no light anywhere it is lost at once. */
 function replanAll() {
   const M = MAP;
   for (const m of S.moths) {
     if (!m.dest) continue;
     const r = regionNear(m.dest.x, m.dest.y), destL = lightAt(m.dest.x, m.dest.y);
     if (r >= 0) { m.region = r; m.bandL = M.peak[r]; } else m.region = -1;
-    if (destL <= 0 && lightAt(m.x, m.y) <= 0) loseLight(m);
+    if (destL <= 0 && lightAt(m.x, m.y) <= 0) { if (!plan(m, false)) loseLight(m); }
     else if (destL <= 0 || r < 0 || M.max >= BEAT * m.bandL) plan(m, false);
     else if (destL < BAND * m.bandL || !openSpot(m.dest.x, m.dest.y, spotClear())) plan(m, true);
   }
