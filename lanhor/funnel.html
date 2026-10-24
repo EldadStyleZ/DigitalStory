@@ -90,18 +90,18 @@ body.view-abstract .fn-pill.is-sel { border-color: #ffffff; }
   transition: opacity .15s, background .15s;
 }
 .fn-mk:hover { background: rgba(255, 255, 255, 0.1); }
-.fn-track { position: relative; width: 70px; height: 20px; flex: none; cursor: ew-resize; }
-.fn-ramp { position: absolute; left: 1px; top: 50%; width: 68px; height: 13px; margin-top: -6.5px; }
+.fn-track { position: relative; width: 74px; height: 20px; flex: none; cursor: ew-resize; }
+.fn-ramp { position: absolute; left: 3px; top: 50%; width: 68px; height: 13px; margin-top: -6.5px; }
 .fn-ramp svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
 .fn-ramp-base { fill: rgba(236, 230, 255, 0.24); }
 .fn-ramp-fill { fill: url(#fn-grad); clip-path: inset(0 calc((1 - var(--p)) * 100%) 0 0); }
 body.view-abstract .fn-ramp-base { fill: #5a5a66; }
 body.view-abstract .fn-ramp-fill { fill: url(#fn-grad-sh); }
 .fn-thumb {
-  position: absolute; top: 50%; left: calc(var(--p) * (100% - 32px)); width: 32px; height: 17px; margin-top: -8.5px;
+  position: absolute; top: 50%; left: calc(var(--p) * (100% - 38px)); width: 38px; height: 18px; margin-top: -9px;
   border-radius: 9px; background: #f6f3ff; color: #1a0f2e;
   display: grid; place-items: center;
-  font: 500 10.5px/1 var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
+  font: 500 12.5px/1 var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55), 0 0 0 1.5px var(--tc);
   pointer-events: none; white-space: nowrap;
 }
@@ -967,7 +967,7 @@ function updateFx(rdt) {
 
 // ================================================================== power slider on each funnel (screen-aligned DOM)
 let pillLayer = null;
-const PILL_W = 110, PILL_H = 24, THUMB_W = 32;
+const PILL_W = 114, PILL_H = 24, THUMB_W = 38;   // the value text stays ≥ 10.5 px at the smallest scale
 const pillScale = () => clamp(S.sc * 1.15, 0.84, 1.15);
 // the power ramp: thin at the weak end, thick and rounded at the strong end
 const RAMP = '<path d="M1 5.3 L61.5 0 A6.5 6.5 0 0 1 61.5 13 L1 7.7 A1.2 1.2 0 0 1 1 5.3 Z"/>';
