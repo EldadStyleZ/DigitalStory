@@ -1140,7 +1140,9 @@ function pushOutOfObstacles(m, rad) {
 const steer = { ax: 0, ay: 0 };
 function updateMoths(dt, t) {
   const s = S.scale, spd = tw('speed'), pull = tw('pull'), restless = tw('roam');
-  const wanderV = 45 * s * spd, seekV = 170 * s * spd * Math.sqrt(pull), roamV = 110 * s * spd * (0.65 + 0.35 * restless), rad = 12 * s;
+  // roam is set at ~78 % of seek: turning from spot to spot costs about a fifth of it, so a roaming
+  // moth's mean speed lands at ~60–70 % of its seek speed
+  const wanderV = 45 * s * spd, seekV = 170 * s * spd * Math.sqrt(pull), roamV = 132 * s * spd * (0.65 + 0.35 * restless), rad = 12 * s;
   const R = S.room, rcx = R.x + R.w / 2, rcy = R.y + R.h / 2;
   sepR = 30 * s;
   hash.cell = Math.max(24, sepR);
@@ -1158,17 +1160,19 @@ function updateMoths(dt, t) {
       const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
       // a roaming moth flutters freely inside its band; one that slipped out heads straight back in
       const free = roaming && m.L >= BAND * m.bandL;
-      // now and then a free moth throws a quick, curious loop
-      if (free && m.loopT <= 0 && Math.random() < dt * 0.25 * restless) { m.loopT = rand(0.45, 0.7); m.loopA = 0; m.spin = Math.random() < 0.5 ? -1 : 1; }
-      if (m.loopT > 0) {
-        m.loopT -= dt; m.loopA += m.spin * dt * 11;
-        const c = Math.cos(m.loopA), sn = Math.sin(m.loopA), rx = dx * c - dy * sn;
-        dy = dx * sn + dy * c; dx = rx;
+      // now and then a free moth throws a quick, curious loop: a curl that keeps its speed and still
+      // drifts on toward its spot (steered hard enough to follow the turn, so it never stalls in place)
+      if (free && m.loopT <= 0 && Math.random() < dt * 0.25 * restless) { m.loopT = rand(0.7, 0.95); m.loopA = 0; m.spin = Math.random() < 0.5 ? -1 : 1; }
+      const looping = m.loopT > 0;
+      if (looping) {
+        m.loopT -= dt; m.loopA += m.spin * dt * 8;
+        const c = Math.cos(m.loopA), sn = Math.sin(m.loopA), rx = dx * c - dy * sn + dx * 0.6;
+        dy = dx * sn + dy * c + dy * 0.6; dx = rx;
       }
       const wob = (Math.sin(t * 9.3 + m.p1) * 0.6 + Math.sin(t * 23.7 + m.p2) * 0.4) * (free ? 0.9 : roaming ? 0.4 : 0.75 * clamp(d / (170 * s), 0.25, 1));
       const v = (roaming ? roamV : seekV * clamp(d / (70 * s), 0.55, 1)) * (0.88 + 0.24 * Math.sin(t * 3.1 + m.p3));
       const tx = dx * v - dy * wob * v, ty = dy * v + dx * wob * v;
-      const k = free ? 3.2 : roaming ? 5.5 : 4.5 * pull;
+      const k = looping ? 12 : free ? 3.2 : roaming ? 5.5 : 4.5 * pull;
       steer.ax += (tx - m.vx) * k; steer.ay += (ty - m.vy) * k;
       avoidObstacles(m, 55 * s, (roaming ? 520 : 700) * s, steer);
       if (Math.random() < dt * (free ? 1.6 : roaming ? 0 : 1.2)) { const j = rand(-1, 1) * (free ? 85 : 70) * s; m.vx += -dy * j; m.vy += dx * j; }
