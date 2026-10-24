@@ -1077,6 +1077,17 @@ function moveMoth(m, dt, rad) {
   // pushed out of one object into another, or against the wall: settle, else step back
   for (let k = 0; k < 2 && insideObstacle(m.x, m.y); k++) { pushOutOfObstacles(m, rad); keepInRoom(m, rad); }
   if (insideObstacle(m.x, m.y) && !insideObstacle(px, py)) { m.x = px; m.y = py; m.vx *= -0.4; m.vy *= -0.4; }
+  if (insideObstacle(m.x, m.y)) escapeObjects(m, rad);
+}
+
+/** Last resort for a moth caught where objects overlap (one dragged onto another over it): hop to the nearest open spot. */
+function escapeObjects(m, rad) {
+  for (let d = rad; d < 20 * rad; d += rad) {
+    for (let k = 0; k < 16; k++) {
+      const a = (k / 16) * TAU, x = m.x + Math.cos(a) * d, y = m.y + Math.sin(a) * d;
+      if (inRoom(x, y, rad) && !insideObstacle(x, y)) { m.x = x; m.y = y; return; }
+    }
+  }
 }
 
 function pushOutOfObstacles(m, rad) {
