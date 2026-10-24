@@ -888,9 +888,11 @@ function funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, wasIn, fromMo
   let lx = dx * c + dy * s;
   const ly0 = -dx * s + dy * c, sg = ly0 < 0 ? -1 : 1;
   let ay = ly0 * sg, lvx = vx * c + vy * s, avy = (-vx * s + vy * c) * sg;
-  // the previous position decides which side of a wall the particle belongs to: no passing through
+  // the previous position decides which side of a wall the particle belongs to: no passing through. In front of the
+  // mouth or the spout counts as the inner side (hwAt holds the lip height there), so a particle about to enter that
+  // grazes a lip's inner face stays in front of the opening instead of being put out beside the funnel
   const qx = px - f.x, qy = py - f.y, plx = qx * c + qy * s, ply = Math.abs(-qx * s + qy * c);
-  const before = plx >= -F_HALF && plx <= F_HALF && ply < hwAt(plx);
+  const before = ply < hwAt(plx);
   let best = 1e9, bi = 0, bt = 0;
   for (let k = 0; k < 5; k++) {
     let t = ((lx - SAX[k]) * SDX[k] + (ay - SAY[k]) * SDY[k]) * SIL[k];
