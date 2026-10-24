@@ -28,11 +28,13 @@ const BASE = { red: '#ff3b30', green: '#34c759', blue: '#0a84ff' };   // swatche
 const LIGHT = { red: '#ff3a1e', green: '#36e64a', blue: '#2466ff' };  // sprite light: purer primaries mix cleanly
 const NAME = { red: 'Red', green: 'Green', blue: 'Blue' };
 const SH = { bg: '#0d0d10', dark: '#1c1c22', band: '#2c2c34', obj: '#5a5a66', mid: '#9a9aa6', white: '#ffffff' };
+const SHAPE_INK = new Set([BASE.red, BASE.green, BASE.blue, SH.white]);   // particle colors Shapes keeps; others turn gray
 const ACCENT = '#ffd166';
 const AIM_LIMIT = 80 * DEG;
 const WIDTH_MIN = 8 * DEG, WIDTH_MAX = 80 * DEG;
 const RAY_STEP = 1.5 * DEG;
 const EPS_ANG = 1e-4;
+const NEEDLE_PX = 2;          // light gaps narrower than this even at their far end are closed
 const TRAIL = 14;
 const MOTH_WS = 62;           // moth wingspan (px at scale 1)
 const DEFAULTS = { count: 1, speed: 1, pull: 1, reach: 500, width: 28, edges: false, dust: true };
@@ -55,7 +57,7 @@ const DEFAULT_OBJECTS = [
   ['circle', 0.41, 0.2, 0.065, 0, null],
   ['rect', 0.6, 0.22, 0.058, 24, 'blue'],      // in the blue beam: blue shines through
   ['triangle', 0.73, 0.33, 0.078, 12, null],
-  ['bar', 0.76, 0.6, 0.075, 78, null],
+  ['bar', 0.76, 0.62, 0.075, 78, null],        // its shadow overlaps the green pane's: no hairline gap
   ['square', 0.6, 0.74, 0.058, -14, 'green'],  // in the red beam: casts a red shadow
   ['square', 0.43, 0.8, 0.064, 16, null],
   ['triangle', 0.3, 0.635, 0.07, -24, 'red'],  // in the red beam: red shines through
@@ -101,7 +103,7 @@ const S = {
 const hash = new Kit.SpatialHash(48);
 const railOut = { x: 0, y: 0, nx: 0, ny: 1 };
 const keyHold = new Map();
-const angBuf = [];
+const angBuf = [], tBuf = [];
 let polyBuf = [];
 const byNumber = (a, b) => a - b;
 const reachPx = () => tw('reach') * S.scale;
@@ -530,6 +532,31 @@ function castRay(ox, oy, dx, dy, color) {
   return t;
 }
 
+/** Where two shadow edges almost line up (or a ray grazes the vertex between two edges), a run of
+ *  rays slips through a gap thinner than a couple of pixels even at its far end, which draws a stray
+ *  hairline across the room. Such a gap is closed: each of its rays stops where its nearer flanking
+ *  neighbour does. Wider gaps stay open as real thin rays of light. */
+function closeNeedles(ang, t) {
+  const n = t.length, M = 8;   // a gap counts once its rays reach M px past both flanking hits
+  for (let i = 1; i < n - 1; i++) {
+    const left = t[i - 1];
+    if (t[i] <= left + M) continue;
+    let low = t[i], high = t[i];   // nearest and furthest hit inside the run so far
+    for (let j = i; j + 1 < n && (ang[j + 1] - ang[i - 1]) * left < NEEDLE_PX; j++) {
+      const right = t[j + 1];
+      if (right + M < low) {
+        if ((ang[j + 1] - ang[i - 1]) * high < NEEDLE_PX) {
+          for (let k = i; k <= j; k++) t[k] = k - i < j - k ? left : right;
+          i = j;
+        }
+        break;
+      }
+      low = Math.min(low, right); high = Math.max(high, right);
+      if (low <= left + M) break;
+    }
+  }
+}
+
 function samePoly(a, b) {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
@@ -551,13 +578,18 @@ function computeBeam(l) {
   const c = S.roomCorners;
   for (let i = 0; i < 8; i += 2) addVert(c[i], c[i + 1]);
   angBuf.sort(byNumber);
+  tBuf.length = 0;
+  for (let i = 0; i < angBuf.length; i++) {
+    const a = a0 + angBuf[i];
+    tBuf.push(castRay(ox, oy, Math.cos(a), Math.sin(a), l.color));
+  }
+  closeNeedles(angBuf, tBuf);
   poly.length = 0;
   poly.push(ox, oy);
   let far = 0;
   for (let i = 0; i < angBuf.length; i++) {
-    const a = a0 + angBuf[i], dx = Math.cos(a), dy = Math.sin(a);
-    const t = castRay(ox, oy, dx, dy, l.color);
-    poly.push(ox + dx * t, oy + dy * t);
+    const a = a0 + angBuf[i], t = tBuf[i];
+    poly.push(ox + Math.cos(a) * t, oy + Math.sin(a) * t);
     if (t > far) far = t;
   }
   // an unchanged beam keeps its path, so the sprite floor can leave it baked
@@ -1055,6 +1087,7 @@ function pointerDown(p) {
   } else if (h.lamp) {
     selectLamp(h.lamp);
     S.drag = { kind: 'lamp', lamp: h.lamp, sx: p.x, sy: p.y, moved: false };
+    Kit.sfx('click', { pitch: 1.2 });
   } else if (h.obj) {
     const o = h.obj;
     selectObj(o);
@@ -1070,6 +1103,8 @@ function pointerDown(p) {
 
 function pointerMove(p) {
   const d = S.drag;
+  // the button came up where the canvas never heard it (focus lost mid-drag): drop the drag
+  if (d && !(p.buttons & 1)) { pointerUp(p); return; }
   if (d) {
     if (d.kind === 'aim') {
       const l = d.lamp;
@@ -2135,13 +2170,13 @@ function drawLampShapes(ctx, l, alpha, color, on) {
 function drawParticlesShapes(ctx) {
   ctx.save();
   for (let i = 0; i < partN; i++) {
-    const p = PARTS[i], k = p.life / p.max;
+    const p = PARTS[i], k = p.life / p.max, col = SHAPE_INK.has(p.color) ? p.color : SH.mid;
     ctx.globalAlpha = p.kind === 2 ? k * 0.4 : k;
     if (p.kind === 1) {
-      ctx.strokeStyle = p.color; ctx.lineWidth = 2;
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(p.x, p.y, p.size * U.easeOutCubic(1 - k) + 2, 0, TAU); ctx.stroke();
     } else {
-      ctx.fillStyle = p.kind === 2 ? SH.mid : p.color;
+      ctx.fillStyle = p.kind === 2 ? SH.mid : col;
       ctx.beginPath(); ctx.arc(p.x, p.y, p.kind === 2 ? p.size * 0.6 : p.size * 0.8, 0, TAU); ctx.fill();
     }
   }
@@ -2344,6 +2379,7 @@ function buildDefaultScene() {
   const R = S.room;
   S.lamps = []; S.obstacles = []; S.moths = [];
   S.selLamp = null; S.selObj = null; S.drag = null;
+  S.hover.lamp = null; S.hover.obj = null; S.hover.handle = false;
   partN = 0;
   for (const [kind, cx, cy, size, rot, glass] of DEFAULT_OBJECTS) {
     const o = makeObstacle(kind, cx, cy, size, rot * DEG, glass);
@@ -2376,10 +2412,16 @@ function buildDefaultScene() {
   setCreatureCount(tw('count'));
   updateCounts();
   refreshHint();
+  if (Kit.mouse.inside) updateHover(Kit.mouse.x, Kit.mouse.y);
 }
 
 // ================================================================== UI wiring
-const GLASS_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="4" width="14" height="16" rx="1.5" fill="currentColor" fill-opacity="0.3"/><path d="M9 8.5l-1.6 2.8M13 8.5l-4.2 7.2"/></svg>';
+const svgIcon = (body) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
+// a tinted pane with glints; Shapes gets a plain tinted square
+const GLASS_ICON = {
+  sprite: svgIcon('<rect x="5" y="4" width="14" height="16" rx="1.5" fill="currentColor" fill-opacity="0.3"/><path d="M9 8.5l-1.6 2.8M13 8.5l-4.2 7.2"/>'),
+  abstract: svgIcon('<rect x="5" y="5" width="14" height="14" fill="currentColor" fill-opacity="0.35"/>'),
+};
 
 function setup() {
   S.ui.swatch = {};
@@ -2406,7 +2448,7 @@ function setup() {
     Kit.ui.button({ parent: gObj, icon: k, iconOnly: true, key: String(4 + i), tip: objTips[k], onClick: () => addObject(k) });
   });
   S.ui.glassBtn = Kit.ui.button({
-    parent: gObj, icon: GLASS_ICON, iconOnly: true, key: '8',
+    parent: gObj, icon: Kit.t(GLASS_ICON), iconOnly: true, key: '8',
     tip: { sprite: 'Add colored glass: only its own color shines through', abstract: 'Add a colored object: only its own color passes' },
     onClick: () => addObject('glass'),
   });
@@ -2416,6 +2458,8 @@ function setup() {
 function viewChanged() {
   buildBackground();
   updateCounts();
+  const icon = S.ui.glassBtn && S.ui.glassBtn.querySelector('svg');
+  if (icon) icon.outerHTML = Kit.t(GLASS_ICON);
 }
 
 Kit.init({
@@ -2429,20 +2473,22 @@ Kit.init({
     abstract: 'Click the frame to add a light. Drag objects to cast shadows.',
   },
   about: {
-    sprite: 'On a summer night every moth heads for the lamp whose light reaches it. Hang colored lamps on the frame, then slide stones, blocks and glass around to cast shadows and steer the swarm.',
-    abstract: 'Agents move toward any light that reaches them. Add colored lights on the frame, then move the objects to stop the light and steer the agents. Colored objects let only their own color through.',
+    sprite: 'On a summer night every moth flies to the lamp whose light reaches it. Hang colored lamps on the frame, then move stones and glass to steer the swarm.',
+    abstract: 'Agents move toward any light that reaches them. Add colored lights on the frame, then move objects to steer the agents; colored ones pass only their own color.',
   },
+  // one line per row (key chips fit the help card's key column), so the card fits a 640 px tall screen
   controls: [
     { keys: ['Click frame', 'L'], label: { sprite: 'Hang a lamp (up to five)', abstract: 'Add a light (up to five)' } },
     { keys: ['1', '2', '3'], label: { sprite: 'Lamp color: red, green, blue', abstract: 'Light color: red, green, blue' } },
-    { keys: ['Drag'], label: { sprite: 'Slide a lamp along the frame or move a stone', abstract: 'Slide a light along the frame or move an object' } },
-    { keys: ['Knob', 'Wheel', '← →'], label: { sprite: 'Aim the selected lamp', abstract: 'Aim the selected light' } },
-    { keys: ['Shift+wheel', '↑ ↓'], label: 'Make the beam wider or narrower' },
-    { keys: ['O', 'Double-click'], label: { sprite: 'Switch a lamp on or off', abstract: 'Switch a light on or off' } },
+    { keys: ['Drag'], label: { sprite: 'Slide a lamp or move an object', abstract: 'Slide a light or move an object' } },
+    { keys: ['Knob', '← →'], label: { sprite: 'Aim the selected lamp', abstract: 'Aim the selected light' } },
+    { keys: ['Wheel'], label: { sprite: 'Aim a lamp or turn an object', abstract: 'Aim a light or turn an object' } },
+    { keys: ['Shift+wheel'], label: 'Make a beam wider or narrower (or ↑ ↓)' },
+    { keys: ['Double-click'], label: { sprite: 'Switch a lamp on or off (or press O)', abstract: 'Switch a light on or off (or press O)' } },
     { keys: ['Tab', 'Esc'], label: { sprite: 'Select the next lamp, or deselect', abstract: 'Select the next light, or deselect' } },
-    { keys: ['4–8'], label: { sprite: 'Add a block, wedge, stone, plank or glass', abstract: 'Add a square, triangle, circle, bar or colored object' } },
-    { keys: ['Wheel', 'Q E', 'Arrows'], label: 'Rotate or nudge the selected object' },
-    { keys: ['Delete', 'Right-click'], label: 'Remove what is selected or clicked' },
+    { keys: ['4–8'], label: { sprite: 'Add a block, wedge, stone, plank or glass', abstract: 'Add an object; 8 adds a colored one' } },
+    { keys: ['Q E', 'Arrows'], label: 'Turn or nudge the selected object' },
+    { keys: ['Right-click'], label: { sprite: 'Remove a lamp or object (or press Delete)', abstract: 'Remove a light or object (or press Delete)' } },
   ],
   stats: [
     { id: 'lamps', label: { sprite: 'Lamps', abstract: 'Lights' }, value: '0/5' },

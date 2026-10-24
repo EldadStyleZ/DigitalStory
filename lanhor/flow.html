@@ -26,9 +26,9 @@
         '###...##...##########.........########.......###',
         '##..............................#####..........#',
         '#...........########...........................#',
-        '#..S...GGGG.########...........................#',
-        '#......GGGG.########......##....#####..........#',
-        '##.....GGGG.########......###...######........##',
+        '#..S...GGGGG########...........................#',
+        '#......GGGGG########......##....#####..........#',
+        '##.....GGGGG########......###...######........##',
         '###.......###########..........#######........##',
         '#####^################.........######..........#',
         '#####^#################XX############>>>>>>>>>>#',
@@ -56,7 +56,7 @@
         '###############.........................########',
         '##############.............##.#########.########',
         '##############.............#..#########.########',
-        '###.......####................#########.########',
+        '###..GGGG.####................#########.########',
         '##...GGGG..###...>>>>>>>vv....#########.########',
         '#....GGGG..###...>>>>>>>vv....#########.########',
         '#....GGGG..###...^^#####vv....########........##',
@@ -106,9 +106,10 @@
     { body: '#ffe24f', mid: '#f6c12c', edge: '#fffbd2', fin: '#ffad24', stripe: '#2569ad', line: 'rgba(112,72,0,0.6)' },
   ];
   // particle colour codes -> per-view colours
-  const PC_GOOD = 0, PC_GOLD = 1, PC_MINT = 2, PC_BAD = 3, PC_BUBBLE = 4;
-  const PCOL_SPRITE = ['#9dffc4', '#ffe27a', '#b8ffd9', '#ff6b7a', '#d6f3ff'];
-  const PCOL_SHAPE = [SHAPE.green, SHAPE.white, SHAPE.green, SHAPE.red, SHAPE.white];
+  const PC_GOOD = 0, PC_GOLD = 1, PC_MINT = 2, PC_LOSS = 3, PC_BUBBLE = 4;
+  // the loss ring is light: it happens on red, where a red ring would vanish
+  const PCOL_SPRITE = ['#9dffc4', '#ffe27a', '#b8ffd9', '#ffd9e1', '#d6f3ff'];
+  const PCOL_SHAPE = [SHAPE.green, SHAPE.white, SHAPE.green, SHAPE.white, SHAPE.white];
   const PK_SPARK = 0, PK_RING = 1, PK_BUBBLE = 2;
 
   // ================================================================== world / level
@@ -282,16 +283,17 @@
       if (far && rnd() < 0.05) critters.push({ x: c + 0.3 + rnd() * 0.4, y: r + 0.3 + rnd() * 0.4, type: rnd() < 0.5 ? 0 : 1, a: rnd() * TAU, s: 0.28 + rnd() * 0.1 });
     }
     for (const z of zones) {
+      const zr = U.mulberry32(500 + levelIx * 131 + z.id * 17);   // own stream: map edits elsewhere keep this zone's look
       for (const t of z.tiles) {
         const c = t % COLS, r = (t / COLS) | 0;
         if (z.kind === 'green') {
           for (let k = 0; k < 2; k++) {   // tufts of blades fanning from one root
-            const x = c + 0.15 + rnd() * 0.7, y = r + 0.15 + rnd() * 0.7, lean = -Math.PI / 2 + (rnd() - 0.5) * 0.9, ph = rnd() * TAU;
-            for (let j = 0; j < 4; j++) blades.push({ x, y, a: lean + (j - 1.5) * 0.38, len: 0.3 + rnd() * 0.28, ph: ph + j * 0.4, shade: j % 2 });
+            const x = c + 0.15 + zr() * 0.7, y = r + 0.15 + zr() * 0.7, lean = -Math.PI / 2 + (zr() - 0.5) * 0.9, ph = zr() * TAU;
+            for (let j = 0; j < 4; j++) blades.push({ x, y, a: lean + (j - 1.5) * 0.38, len: 0.3 + zr() * 0.28, ph: ph + j * 0.4, shade: j % 2 });
           }
-          if (rnd() < 0.85) plankton.push({ z: z.id, hx: c + rnd(), hy: r + rnd(), r: 0.08 + rnd() * 0.3, sp: 0.4 + rnd() * 0.9, ph: rnd() * TAU });
-        } else if (rnd() < 0.5) {
-          urchins.push({ z: z.id, x: c + 0.25 + rnd() * 0.5, y: r + 0.25 + rnd() * 0.5, s: 0.75 + rnd() * 0.4, ph: rnd() * TAU, kind: rnd() < 0.68 ? 0 : 1 });
+          if (zr() < 0.85) plankton.push({ z: z.id, hx: c + zr(), hy: r + zr(), r: 0.08 + zr() * 0.3, sp: 0.4 + zr() * 0.9, ph: zr() * TAU });
+        } else if ((c + r) % 2 === 0 || zr() < 0.25) {   // evenly spread: spiky, yet the fish stay readable on top
+          urchins.push({ z: z.id, x: c + 0.25 + zr() * 0.5, y: r + 0.25 + zr() * 0.5, s: 0.75 + zr() * 0.4, ph: zr() * TAU, kind: zr() < 0.65 ? 0 : 1 });
         }
       }
     }
@@ -385,7 +387,7 @@
     S.fish.pop();
     if (!effects) return;
     S.ghosts.push({ x: f.x, y: f.y, vx: f.vx * 0.25, vy: f.vy * 0.25, ang: f.ang, v: f.v, ph: f.ph, sz: f.sz, t: 0, spin: U.rand(-4, 4) });
-    emit(PK_RING, f.x, f.y, 0, 0, 0.55, 0.65, PC_BAD);
+    emit(PK_RING, f.x, f.y, 0, 0, 0.6, 0.8, PC_LOSS);
     for (let k = 0; k < 6; k++) emit(PK_BUBBLE, f.x + U.rand(-0.15, 0.15), f.y + U.rand(-0.15, 0.15), U.rand(-0.5, 0.5), U.rand(-1.3, -0.5), U.rand(0.6, 1.1), U.rand(0.04, 0.09), PC_BUBBLE);
   }
 
@@ -585,7 +587,7 @@
         A.vx += (ix * vmax - A.vx) * k; A.vy += (iy * vmax - A.vy) * k;
         cornerAssist(A, ix, iy, vmax, dt);
       } else {
-        const k = Math.exp(-2.4 * dt);
+        const k = Math.exp(-4 * dt);   // coast about one tile, so a released school can stop inside a zone
         A.vx *= k; A.vy *= k;
       }
       leash(A);
@@ -757,7 +759,8 @@
         } else {
           z.away += dt;
           z.full = false;
-          z.progress = Math.max(0, z.progress - dt * 0.6);
+          // a short grace keeps the ring when the school overshoots or a fish mills across the edge
+          if (z.away > 1.2) z.progress = Math.max(0, z.progress - dt * 0.6);
           if (z.away > 2.5) z.streak = 0;
         }
       } else {
@@ -1623,7 +1626,9 @@
       const core = r * (0.22 + 0.3 * p) * (plain ? 1 : 1 + 0.12 * Math.sin(t * 5));
       ctx.globalAlpha = plain ? 0.35 + 0.65 * p : 0.4 + 0.5 * p;
       ctx.fillStyle = plain ? SHAPE.white : '#eafff1';
-      ctx.beginPath(); ctx.arc(x, y, core, 0, TAU); ctx.fill();
+      // Shapes: a square core, so the spawn spot never reads as the anchor ring (a circle with a dot)
+      if (plain) ctx.fillRect(x - core, y - core, core * 2, core * 2);
+      else { ctx.beginPath(); ctx.arc(x, y, core, 0, TAU); ctx.fill(); }
     }
     ctx.globalAlpha = 1;
   }
