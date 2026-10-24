@@ -2365,21 +2365,29 @@ function drawAgentsShapes(ctx) {
     }
   }
   ctx.stroke();
-  // a ring in the color of each lamp lighting it (up to three), so an agent in an overlap wears more rings
-  ctx.lineWidth = 2.5 * s;
-  for (let c = 0; c < NC; c++) {
-    ctx.strokeStyle = BASE[COLORS[c]];
+  // a ring in the color of each lamp lighting it (up to three), so an agent in an overlap wears more
+  // rings; a dark outline keeps a ring readable on a light of its own color
+  const ringPath = (c) => {
     ctx.beginPath();
     for (const m of S.moths) {
       if (m.glow < 0.3) continue;
       const rings = m.fx.rings;
       for (let k = 0; k < 3; k++) {
-        if (rings[k] !== c) continue;
+        if (rings[k] < 0 || (c >= 0 && rings[k] !== c)) continue;
         const rr = r + (4.5 + 4.5 * k) * s;
         ctx.moveTo(m.x + rr, m.y);
         ctx.arc(m.x, m.y, rr, 0, TAU);
       }
     }
+  };
+  ringPath(-1);
+  ctx.strokeStyle = SH.bg;
+  ctx.lineWidth = 4.5 * s;
+  ctx.stroke();
+  ctx.lineWidth = 2.5 * s;
+  for (let c = 0; c < NC; c++) {
+    ringPath(c);
+    ctx.strokeStyle = BASE[COLORS[c]];
     ctx.stroke();
   }
   // direction ticks, then bodies; a dark outline keeps them readable on white overlaps
