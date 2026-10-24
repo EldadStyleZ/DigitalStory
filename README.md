@@ -27,8 +27,8 @@ For the guessing round, open a toy straight into Shapes with `?view=shapes`, for
 
 ## Share a link
 
-Turn on GitHub Pages for this repository (Settings → Pages → Deploy from a branch → `main`, folder `/`). The
-toys are then online at `https://eldadstylez.github.io/digitalstory/lanhor/`.
+The toys are online at **https://eldadstylez.github.io/DigitalStory/lanhor/** (GitHub Pages, deployed from `main`).
+The address is case-sensitive: `DigitalStory` needs its capitals.
 
 ## Keys that work everywhere
 
