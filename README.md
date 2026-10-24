@@ -62,14 +62,14 @@ mix their colors where they overlap.
 | Tab / Esc | Select the next lamp / deselect |
 | 7 8 9 0 | Add a block, wedge, stone or plank |
 | G | Add glass in the current color |
-| − | Add a mirror (Shift + wheel or Shift + Q E turns it 1° at a time) |
+| − | Add a mirror. Turn it by dragging its knob, with the wheel or Q E (hold Shift for 1° steps) |
 | Q E, arrows | Turn or nudge the selected object |
 | Right-click, or Delete | Remove a lamp or object |
 
 **One-minute demo:** the red and blue beams already cross; watch the moth fly into the overlap and roam there.
 Raise *How many* in Tweaks to 30 for a swarm. Aim a third lamp into the same spot and the swarm packs into the
 three-beam patch; move one lamp away and they stream to the next brightest place. Drag a stone into the overlap to
-break it up. Then add a mirror (−) and turn it so the reflection crosses the direct beam: the reflection adds up like
+break it up. Then add a mirror (−), select it and drag its knob so the reflection crosses the direct beam: the reflection adds up like
 a second lamp and the swarm moves to the new hot spot. The *Brightest* counter shows how many beams the swarm is
 sitting in.
 
