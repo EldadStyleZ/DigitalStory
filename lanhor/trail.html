@@ -52,7 +52,7 @@
   let simTime = 0, totalBites = 0, nextCubeId = 1;
   let fxTime = 0;                     // real-time clock for feedback, so it plays even while paused
   let tool = 'sugar';
-  const seenOnce = { wall: false, eaten: false, flagHit: false, flagFull: false };
+  const seenOnce = { wall: false, eaten: false, flagHit: false, flagFull: false, unseen: false };
   let ui = {};
 
   // ================================================================ map generation
@@ -320,7 +320,7 @@
   }
 
   class Cube {
-    constructor(tx, ty) { this.id = nextCubeId++; this.tx = tx; this.ty = ty; this.bites = 0; this.born = fxTime; this.hit = 0; this.dead = false; this.r = Math.random(); }
+    constructor(tx, ty, user) { this.id = nextCubeId++; this.tx = tx; this.ty = ty; this.bites = 0; this.born = fxTime; this.hit = 0; this.dead = false; this.r = Math.random(); this.user = user; }
     get x() { return OX + this.tx * T; }
     get y() { return OY + this.ty * T; }
   }
@@ -382,6 +382,7 @@
     grid = m.grid; kind = m.kind; cols = m.cols; rows = m.rows; plazas = m.plazas;
     cubes.length = 0;
     flags.length = 0;
+    drag.mode = null; drag.flag = null; // a drag in progress belonged to the old map
     placeBases(tw('nests'));
     clearFx();
     if (!opts.quiet) {
@@ -456,10 +457,37 @@
     for (const p of parts) p.on = false;
   }
 
-  /** Example scene: four cubes leading from the first nest toward the nearest plaza, plus a flag on the way. */
+  /** Example scene: four cubes leading from a nest toward a plaza, plus a flag on the way. Every nest spot is
+   *  planned; the red colony (base 0) moves to the spot with the longest clear run, so the opening march
+   *  lasts as long as the maze allows and the demo always starts with the same colony. */
   function placeExample() {
     if (!bases.length || !plazas.length) return;
-    const b = bases[0], f = fields[0];
+    const v2 = tw('vision') ** 2;
+    const seenByOther = (i, [x, y]) => bases.some((o, k) => k !== i && (o.tx - x) ** 2 + (o.ty - y) ** 2 <= v2 && los(o.tx, o.ty, x, y));
+    let best = null, bi = 0;
+    for (let i = 0; i < bases.length; i++) {
+      const p = planExample(bases[i], fields[i]);
+      // four stops first, then the longest run; a stop another colony can see costs 8 tiles (two streams
+      // would eat the chain from both ends)
+      p.score = p.stops.length * 1000 + p.len - (p.stops.some((s) => seenByOther(i, s)) ? 8 : 0);
+      if (!best || p.score > best.score) { best = p; bi = i; }
+    }
+    if (!best.stops.length) return;
+    if (bi) {
+      const a = bases[0], b = bases[bi];
+      [a.tx, a.ty, b.tx, b.ty] = [b.tx, b.ty, a.tx, a.ty];
+      [fields[0], fields[bi]] = [fields[bi], fields[0]];
+      spawnAll();
+    }
+    const stops = best.stops.map(([x, y]) => addCube(x, y));
+    if (stops.length >= 2) {
+      const c0 = stops[stops.length - 2], c1 = stops[stops.length - 1];
+      addFlag((c0.tx + c1.tx) / 2, (c0.ty + c1.ty) / 2);
+    }
+  }
+  /** Up to four cube spots from base b (way-home field f) toward a plaza: { stops: [[tx, ty]…], len }. */
+  function planExample(b, f) {
+    const plan = { stops: [], len: 0 };
     const openNear = (p) => {
       let best = -1, bd = 1e9;
       for (let y = p.y0; y <= p.y1; y++) for (let x = p.x0; x <= p.x1; x++) {
@@ -474,11 +502,11 @@
     for (const p of plazas) {
       const t = openNear(p);
       if (t < 0) continue;
-      // the nearest plaza with room for four spaced cubes, else the farthest one
-      const d = f.dist[t], score = d >= 16 ? d : 1000 - d;
+      // the nearest plaza with room for four long hops, else the farthest one: a longer first march
+      const d = f.dist[t], score = d >= 22 ? d : 1000 - d;
       if (score < gs) { gs = score; goal = t; }
     }
-    if (goal < 0) return;
+    if (goal < 0) return plan;
     // the string-pulled way home (goal → nest), reversed and sampled every 0.25 tiles; its legs keep
     // a wide line of sight, so cubes on it see each other and stay off the hedge corners
     const tc = (t) => [(t % cols) + 0.5, ((t / cols) | 0) + 0.5];
@@ -504,8 +532,7 @@
       }
       return out;
     };
-    const hop = (i, j) => Math.hypot(at(j)[0] - at(i)[0], at(j)[1] - at(i)[1]);
-    const stops = [];
+    const hop = (p, q) => Math.hypot(at(q)[0] - at(p)[0], at(q)[1] - at(p)[1]);
     for (let k = 0, idx = -1; k < 4; k++) {
       const cand = seen(idx);
       if (!cand.length) break;
@@ -516,15 +543,12 @@
           if (score >= best) { best = score; pick = j; }
         }
       }
-      const c = addCube(pts[pick][0], pts[pick][1]);
-      if (!c) break;
-      stops.push(c);
+      if (!fitPoint(pts[pick][0], pts[pick][1], CUBE_MARGIN)) break;
+      plan.len += hop(idx, pick);
+      plan.stops.push(pts[pick]);
       idx = pick;
     }
-    if (stops.length >= 2) {
-      const c0 = stops[stops.length - 2], c1 = stops[stops.length - 1];
-      addFlag((c0.tx + c1.tx) / 2, (c0.ty + c1.ty) / 2);
-    }
+    return plan;
   }
 
   // ================================================================ simulation
@@ -830,7 +854,7 @@
     if (opts.user) {
       for (const c of cubes) if (U.dist2(c.tx, c.ty, p.x, p.y) < 0.64) { c.hit = 1; return null; }
     }
-    const c = new Cube(p.x, p.y);
+    const c = new Cube(p.x, p.y, !!opts.user);
     cubes.push(c);
     if (opts.user) {
       burst(P_SPARK, c.tx, c.ty - 0.2, 5, 3.2, 0.5, 0.22, '#fff7d6');
@@ -868,7 +892,7 @@
     for (const a of ants) if (a.target === c) retarget(a);
   }
   function clearCubes(user) {
-    if (!cubes.length) return;
+    if (!cubes.length) { if (user) Kit.sfx('buzz', { gap: 200, vol: 0.6 }); return; }
     for (const c of cubes.slice()) killCube(c, 'clear');
     if (user) {
       Kit.sfx('whoosh', { pitch: 0.9 });
@@ -938,14 +962,28 @@
     if (allowFlag) { const f = flagNear(tx, ty); if (f) { removeFlag(f); return true; } }
     return false;
   }
+  /** First time a click or drag drops only cubes that no ant can see, say why nothing moves. */
+  function hintIfUnseen(fromId) {
+    if (seenOnce.unseen) return;
+    let made = 0;
+    for (const c of cubes) {
+      if (c.id < fromId) continue;
+      made++;
+      for (const a of ants) if (canSee(a, c)) return;
+    }
+    if (!made) return;
+    seenOnce.unseen = true;
+    Kit.toast(word('No ant can see that sugar yet. Try closer to a nest.', 'No agent can see that attractor yet. Try closer to a base.'), { tone: 'info', ms: 2600 });
+  }
   function removeLastCube() {
     const c = cubes[cubes.length - 1];
-    if (c) killCube(c, 'user');
+    if (c) killCube(c, 'user'); else Kit.sfx('buzz', { gap: 200, vol: 0.6 });
   }
 
   // ================================================================ input
-  // paint drag: px/py last pointer point, lx/ly last cube, qx/qy last open point still in sight of it
-  const drag = { mode: null, px: 0, py: 0, lx: 0, ly: 0, has: false, qx: 0, qy: 0, qok: false, flag: null };
+  // paint drag: px/py last pointer point, lx/ly last cube, qx/qy last open point still in sight of it,
+  // from: first cube id of this gesture
+  const drag = { mode: null, px: 0, py: 0, lx: 0, ly: 0, has: false, qx: 0, qy: 0, qok: false, flag: null, from: 0 };
   const kb = { on: false, tx: 0, ty: 0, mx: 0, my: 0 };
   const toTile = (p) => [(p.x - OX) / T, (p.y - OY) / T];
 
@@ -983,7 +1021,7 @@
       actAt(tx, ty);
       return;
     }
-    drag.mode = 'paint'; drag.px = tx; drag.py = ty; drag.has = false; drag.qok = false;
+    drag.mode = 'paint'; drag.px = tx; drag.py = ty; drag.has = false; drag.qok = false; drag.from = nextCubeId;
     const c = actAt(tx, ty);
     if (c) { drag.lx = c.tx; drag.ly = c.ty; drag.has = true; drag.qx = c.tx; drag.qy = c.ty; drag.qok = true; }
     else {
@@ -1002,7 +1040,10 @@
       if (q) { drag.flag.tx = q.x; drag.flag.ty = q.y; }
     }
   }
-  function pointerUp() { drag.mode = null; drag.flag = null; }
+  function pointerUp() {
+    if (drag.mode === 'paint') hintIfUnseen(drag.from);
+    drag.mode = null; drag.flag = null;
+  }
 
   function setTool(t) {
     if (t === tool) return;
@@ -1041,8 +1082,9 @@
         return true;
       }
       case 'Enter': case 'NumpadEnter': {
-        const [tx, ty] = cursorTile();
+        const [tx, ty] = cursorTile(), from = nextCubeId;
         actAt(tx, ty);
+        hintIfUnseen(from);
         return true;
       }
       case 'Delete': case 'Backspace': {
@@ -1062,7 +1104,10 @@
   }
 
   // ================================================================ layout and static layers
-  let layer = null, layerPrev = null, fadeT = 0;
+  // One cached static canvas per view, rebuilt only when the map, window or nests change: the Sprites
+  // ground costs a few hundred ms to raster, so V (and the Shapes → Sprites reveal) must not repaint it.
+  const layers = { sprite: null, abstract: null }, layerKey = { sprite: '', abstract: '' };
+  let layerPrev = null, fadeT = 0, spriteKey = '';
   const FADE = 0.45;
   let cubeSpr = [], cubeBad = null;
 
@@ -1072,18 +1117,30 @@
     T = Math.max(8, Math.floor(Math.min(pr.w / cols, pr.h / rows)));
     OX = Math.round(pr.x + (pr.w - cols * T) / 2);
     OY = Math.round(pr.y + (pr.h - rows * T) / 2);
-    if (opts.crossfade && layer) { const t = layerPrev; layerPrev = layer; layer = t; fadeT = FADE; } else fadeT = 0;
-    buildLayers();
+    const v = Kit.view;
+    if (opts.crossfade && layers[v]) {
+      // keep the old map's picture to fade out; paint the new one into the spare canvas
+      const old = layers[v]; layers[v] = layerPrev; layerPrev = old; layerKey[v] = ''; fadeT = FADE;
+    } else fadeT = 0;
+    ensureLayer(v);
   }
   function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
-  function buildLayers() {
+  /** Bring the static canvas of `view` (and, for Sprites, the cube and ant sprites) up to date. */
+  function ensureLayer(view) {
     const dpr = Kit.dpr, W = Kit.W, H = Kit.H;
-    if (!layer) layer = makeCanvas(1, 1);
-    if (!layerPrev) layerPrev = makeCanvas(1, 1);
-    layer.width = Math.round(W * dpr); layer.height = Math.round(H * dpr);
-    const g = layer.getContext('2d');
+    if (view === 'sprite') {
+      const sk = [T, dpr, bases.length].join();
+      if (sk !== spriteKey) { spriteKey = sk; buildCubeSprites(); buildAntSprites(); }
+    }
+    // nest mounds are painted per tile, so only the set of nest tiles matters
+    const key = [seed, T, OX, OY, W, H, dpr, bases.map((b) => b.tile).sort((a, b) => a - b).join('.')].join();
+    if (layerKey[view] === key) return;
+    layerKey[view] = key;
+    const c = layers[view] || (layers[view] = makeCanvas(1, 1));
+    c.width = Math.round(W * dpr); c.height = Math.round(H * dpr);
+    const g = c.getContext('2d');
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    if (Kit.isAbstract) paintShapesLayer(g, W, H); else { paintSpriteLayer(g, W, H); buildCubeSprites(); buildAntSprites(); }
+    if (view === 'abstract') paintShapesLayer(g, W, H); else paintSpriteLayer(g, W, H);
   }
 
   // ---------------------------------------------------------------- sprite ground
@@ -1225,7 +1282,7 @@
       const mg = g.createRadialGradient(x - T * 0.3, y - T * 0.4, T * 0.2, x, y, r);
       mg.addColorStop(0, '#e2b47c'); mg.addColorStop(0.6, '#c99460'); mg.addColorStop(1, '#a8743f');
       g.fillStyle = mg; g.beginPath(); g.ellipse(x, y, r, r * 0.92, 0, 0, TAU); g.fill();
-      const nr = U.mulberry32(seed + b.index * 101);
+      const nr = U.mulberry32(seed + b.tile * 101);
       g.beginPath();
       for (let i = 0; i < 90; i++) { const a = nr() * TAU, d = Math.sqrt(nr()) * T * 1.3, s = 1 + nr() * T * 0.07; g.rect(x + Math.cos(a) * d, y + Math.sin(a) * d * 0.92, s, s); }
       g.fillStyle = 'rgba(244,212,166,0.75)'; g.fill();
@@ -1539,7 +1596,7 @@
     if (tw('trail')) drawTrail(ctx);
     drawNestsSprite(ctx);
     drawCubesSprite(ctx);
-    if (tw('sight')) drawSight(ctx, 'rgba(255,255,255,0.32)');
+    drawTargetLines(ctx);
     drawAntsSprite(ctx);
     drawFlagsSprite(ctx);
     drawParticlesSprite(ctx);
@@ -1575,7 +1632,7 @@
       ctx.strokeStyle = SHAPE.wall; ctx.beginPath(); ctx.arc(x, y, rr, 0, TAU); ctx.stroke();
       if (c.bites > 0) { ctx.strokeStyle = SHAPE.light; ctx.beginPath(); ctx.arc(x, y, rr, -Math.PI / 2, -Math.PI / 2 + (c.bites / max) * TAU); ctx.stroke(); }
     }
-    if (tw('sight')) drawSight(ctx, 'rgba(255,255,255,0.3)');
+    drawTargetLines(ctx);
     // agents
     const r0 = T * 0.27;
     ctx.lineWidth = Math.max(1, T * 0.07); ctx.strokeStyle = SHAPE.floor;
@@ -1620,7 +1677,10 @@
   }
 
   // ================================================================ rendering — shared overlays
-  const hover = { on: false, tx: 0, ty: 0, inMap: false, wall: false, cube: null, flag: null, base: null };
+  // obj/since: what the pointer rests on and since when, so labels wait like tooltips instead of
+  // popping up under every click
+  const hover = { on: false, tx: 0, ty: 0, inMap: false, wall: false, cube: null, flag: null, base: null, obj: null, since: 0 };
+  const LABEL_DELAY = 0.45;
   let lastCursor = '';
   function setCursor(c) { if (c !== lastCursor) { lastCursor = c; Kit.canvas.style.cursor = c; } }
   function computeHover() {
@@ -1632,6 +1692,8 @@
     hover.cube = hover.inMap ? cubeNear(hover.tx, hover.ty, 0.75) : null;
     hover.flag = hover.inMap && !hover.cube ? flagNear(hover.tx, hover.ty) : null;
     hover.base = hover.inMap ? baseNear(hover.tx, hover.ty) : null;
+    const obj = hover.cube || hover.flag || hover.base;
+    if (obj !== hover.obj) { hover.obj = obj; hover.since = fxTime; }
     if (!mouseOn) return;
     if (drag.mode === 'flag') setCursor('grabbing');
     else if (!hover.inMap) setCursor('default');
@@ -1640,45 +1702,74 @@
     else setCursor('crosshair');
   }
 
-  function drawSight(ctx, color) {
-    ctx.beginPath();
-    for (const a of ants) {
-      if (a.state !== 'seek' || !a.target || a.hidden) continue;
-      ctx.moveTo(OX + a.tx * T, OY + a.ty * T); ctx.lineTo(OX + a.target.tx * T, OY + a.target.ty * T);
+  const NOTICE = 1.4;                 // seconds a freshly dropped cube shows which ants noticed it
+  const SIGHT_SPR = COLONY.map((c) => U.rgba(U.mixHex(c, '#ffffff', 0.4), 0.65));
+  const SIGHT_ABS = COLONY.map((c) => U.rgba(c, 0.6));
+  /** Lines from seeking ants to their targets in colony colours: all of them with sight lines on, else a
+   *  short fading flash toward each cube the player just dropped, so every click shows who saw it. */
+  function drawTargetLines(ctx) {
+    const colors = Kit.isAbstract ? SIGHT_ABS : SIGHT_SPR;
+    ctx.lineWidth = Math.max(1.5, T * 0.06);
+    if (tw('sight')) { strokeTargetLines(ctx, null, colors); return; }
+    for (const c of cubes) {
+      const age = fxTime - c.born;
+      if (!c.user || age >= NOTICE) continue;
+      ctx.globalAlpha = 1 - age / NOTICE;
+      strokeTargetLines(ctx, c, colors);
     }
-    ctx.strokeStyle = color; ctx.lineWidth = Math.max(1, T * 0.05); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  function strokeTargetLines(ctx, only, colors) {
+    for (let k = 0; k < bases.length; k++) {
+      const b = bases[k];
+      let n = 0;
+      ctx.beginPath();
+      for (let i = 0; i < ants.length; i++) {
+        const a = ants[i], c = a.target;
+        if (a.base !== b || a.state !== 'seek' || !c || a.hidden || (only && c !== only)) continue;
+        ctx.moveTo(OX + a.tx * T, OY + a.ty * T); ctx.lineTo(OX + c.tx * T, OY + c.ty * T);
+        n++;
+      }
+      if (n) { ctx.strokeStyle = colors[k]; ctx.stroke(); }
+    }
   }
 
-  function label(ctx, x, y, text) {
+  function label(ctx, x, y, text, alpha) {
     const fs = Math.round(U.clamp(T * 0.58, 12, 15));
     ctx.font = `500 ${fs}px Rubik, system-ui, sans-serif`;
     const w = ctx.measureText(text).width + fs * 1.2, h = fs * 1.9;
     const lx = U.clamp(x - w / 2, 8, Kit.W - w - 8), ly = U.clamp(y - h, 8, Kit.H - h - 8);
+    ctx.globalAlpha = alpha;
     ctx.fillStyle = 'rgba(14,12,30,0.9)';
     U.roundRect(ctx, lx, ly, w, h, 9); ctx.fill();
     ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 1; ctx.stroke();
     ctx.fillStyle = '#f1effb'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
     ctx.fillText(text, lx + fs * 0.6, ly + h / 2 + 0.5);
+    ctx.globalAlpha = 1;
   }
 
   function drawOverlay(ctx) {
     const abs = Kit.isAbstract;
+    // labels fade in after a short rest, never while dragging, and not over a cube that was just dropped
+    const ready = Math.max(hover.since + LABEL_DELAY, hover.cube ? hover.cube.born + 1 : 0);
+    const la = drag.mode ? 0 : U.clamp((fxTime - ready) / 0.15, 0, 1);
+    const removeText = kb.on ? 'Delete to remove' : 'Right-click to remove';
     if (hover.cube) {
       const x = OX + hover.cube.tx * T, y = OY + hover.cube.ty * T;
       ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(x, y, T * 0.78, 0, TAU); ctx.stroke();
-      label(ctx, x, y - T * 0.95, 'Right-click to remove');
-    } else if (hover.flag && tool !== 'flag') {
+      if (la > 0) label(ctx, x, y - T * 0.95, removeText, la);
+    } else if (hover.flag && tool !== 'flag' && la > 0) {
       const x = OX + hover.flag.tx * T, y = OY + hover.flag.ty * T;
-      label(ctx, x, y + T * 2.6, 'Right-click to remove');
+      label(ctx, x, y + T * 2.6, removeText, la);
     }
-    if (hover.base && !hover.cube) {
+    if (hover.base && !hover.cube && la > 0) {
       const b = hover.base;
       let home = 0;
       for (const a of ants) if (a.base === b && a.state === 'home') home++;
       const name = COLONY_NAME[b.index];
       const text = abs ? `${name} base · ${home} agents home · ${b.stored} returned` : `${name} nest · ${home} ants home · ${b.stored} crumbs`;
-      label(ctx, OX + b.tx * T, OY + (b.ty - 1.6) * T, text);
+      label(ctx, OX + b.tx * T, OY + (b.ty - 1.6) * T, text, la);
     }
     // ghost of the next placement
     if (hover.inMap && !hover.cube && !(tool === 'flag' && hover.flag) && !drag.mode) {
@@ -1726,6 +1817,7 @@
   }
 
   function render(ctx, rdt) {
+    const layer = layers[Kit.view];
     if (!grid || !layer) { ctx.fillStyle = '#120f26'; ctx.fillRect(0, 0, Kit.W, Kit.H); return; }
     ctx.drawImage(layer, 0, 0, Kit.W, Kit.H);
     if (fadeT > 0) {
@@ -1774,15 +1866,14 @@
   }
 
   function viewChanged(v) {
-    // toasts and an open tooltip still carry the old view's words; drop them so Shapes never shows "sugar"
-    for (const n of [...Kit.dom.toasts.children]) n.remove();
-    Kit.dom.tip.classList.remove('is-on');
+    // Kit.setView drops old-view toasts and hides the tooltip, but the hidden tooltip keeps its old-view
+    // text in the page; blank it so Shapes carries no Sprites words anywhere
     Kit.dom.tip.textContent = '';
     if (ui.bSugar) {
       setIcon(ui.bSugar, v === 'abstract' ? Kit.icons.square : ICON_CUBE);
       setIcon(ui.bFlag, v === 'abstract' ? ICON_DIAMOND : Kit.icons.flag);
     }
-    if (grid) buildLayers();
+    if (grid) { fadeT = 0; ensureLayer(v); }
   }
 
   function resize() {
@@ -1791,6 +1882,7 @@
       let s = null;
       try { const q = new URLSearchParams(location.search).get('seed'); if (q && /^\d+$/.test(q)) s = parseInt(q, 10); } catch (e) { /* ignore */ }
       newMap(s, { quiet: true });
+      ensureLayer(Kit.isAbstract ? 'sprite' : 'abstract'); // paint the other look now, while loading
     } else layout();
   }
 
