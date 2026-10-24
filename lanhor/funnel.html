@@ -36,9 +36,9 @@ const PROF_X = [-75, -45, -15, 15, 45, 75];
 const PROF_H = [45, 31, 22.5, 17.5, 14.5, 14.5];    // inner spout opening = 2 × (14.5 − 4) = 21 units
 const F_BOUND = Math.hypot(F_HALF, PROF_H[0]) + F_WALL + R_MAX + 2;
 const PILL_AT = -14;                                 // the slider sits on the wide part of the body
-// forces in world units / s² at 1× speed and 100 % power (pull and push share one power)
-const PULL_ACC = 2300, CARRY_ACC = 1700, PUSH_ACC = 1700, KICK = 300;
-const PUSH_REACH = 0.6;                              // push zone radius as a fraction of the pull reach
+// forces in world units / s² at 1× speed and 100 % power. Pull and push are mirror images with one power: the same
+// FIELD_ACC, reach (the Reach tweak), falloff and line-of-sight rule. KICK: the spout's ejection boost (world units / s)
+const FIELD_ACC = 2300, CARRY_ACC = 1700, KICK = 300;
 const RELAX_UP = 4, RELAX_DOWN = 1.15;               // back to cruising speed (1/s): quick after bounces, slow after a kick
 const WANDER = 1.5;                                  // random-walk heading noise (rad / √s)
 const VMAX = 1500;
@@ -928,20 +928,48 @@ function funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, wasIn, fromMo
   return code;
 }
 
+/** The resting funnels, which are the ones that act, into FA; returns how many. */
+function workingFunnels() {
+  let nf = 0;
+  for (const f of S.funnels) if (!f.lifted) FA[nf++] = f;
+  return nf;
+}
+/** The fields of the first nf funnels of FA on a particle at (x, y) outside every funnel, into FLD: acceleration ax, ay
+ *  (world units / s²), pulled (how hard it is pulled, for the red tint) and d2 (squared distance to the nearest funnel).
+ *  Pull and push mirror each other. In the red half-space in front of the mouth a particle is drawn toward the mouth
+ *  center; in the blue half-space behind the spout it is driven away from the spout center. Both use the same power,
+ *  reach, falloff (1 − d / reach)² and line-of-sight test. */
+const FLD = { ax: 0, ay: 0, pulled: 0, d2: 0 };
+function fieldAt(x, y, nf, reach, acc) {
+  const reach2 = reach * reach;
+  let ax = 0, ay = 0, pulled = 0, dmin2 = 1e18;
+  for (let q = 0; q < nf; q++) {
+    const f = FA[q], dx = x - f.x, dy = y - f.y, lx = dx * f.c + dy * f.s;
+    dmin2 = Math.min(dmin2, dx * dx + dy * dy);
+    const P = f.power, side = lx < -F_HALF ? -1 : lx > F_HALF ? 1 : 0;   // −1 red (mouth) side, +1 blue (spout) side
+    if (P <= 0 || !side) continue;
+    const ox = f.x + side * f.c * F_HALF, oy = f.y + side * f.s * F_HALF, ex = x - ox, ey = y - oy, d2 = ex * ex + ey * ey;
+    if (d2 >= reach2 || d2 <= 1 || !lineClear(x, y, ox, oy)) continue;
+    const d = Math.sqrt(d2), fall = 1 - d / reach, a = (side * FIELD_ACC * acc * P * fall * fall) / d;
+    ax += ex * a; ay += ey * a;   // along +e (away from the spout) on the blue side, along −e (toward the mouth) on the red
+    if (side < 0 && fall * P > pulled) pulled = fall * P;
+  }
+  FLD.ax = ax; FLD.ay = ay; FLD.pulled = pulled; FLD.d2 = dmin2;
+}
+
 /** One simulation step for every particle: random walk, funnel fields, sub-stepped motion and bounces. */
 function simulate(dt) {
   if (dt <= 0) return;
-  const sp = S.speed, cruise = BASE_SPEED * sp, acc = sp * sp, r = tw('size'), bounce = tw('bounce');
-  const reach = tw('reach') * F_LEN, reach2 = reach * reach, pushR = reach * PUSH_REACH, pushR2 = pushR * pushR;
+  const sp = S.speed, cruise = BASE_SPEED * sp, acc = sp * sp, r = tw('size'), bounce = tw('bounce'), reach = tw('reach') * F_LEN;
   const relaxUp = 1 - Math.exp(-RELAX_UP * dt), relaxDown = 1 - Math.exp(-RELAX_DOWN * dt), wander = WANDER * Math.sqrt(dt) * 2.449, vmax = VMAX * sp, maxStep = r + 2.5;
   const carryV = CARRY_ACC * acc * dt, B2 = F_BOUND * F_BOUND;
-  let nf = 0;
-  for (const f of S.funnels) { f.inside = 0; if (!f.lifted) FA[nf++] = f; }
+  for (const f of S.funnels) f.inside = 0;
+  const nf = workingFunnels();
   let exits = 0;
   for (let i = 0; i < N; i++) {
     let x = PX[i], y = PY[i], vx = VX[i], vy = VY[i];
     const x0 = x, y0 = y;
-    let slot = INF[i], tIn = INT[i], ax = 0, ay = 0, pulled = 0, near = slot >= 0, u = 0, dmin2 = 1e18;
+    let slot = INF[i], tIn = INT[i], ax = 0, ay = 0, pulled = 0, near = slot >= 0, u = 0;
     if (slot < 0) {
       // gas-like random walk at cruising speed
       let v = Math.hypot(vx, vy);
@@ -951,29 +979,13 @@ function simulate(dt) {
       vy = vx * st + vy * ct; vx = rx;
       const k = (v + (cruise - v) * (v < cruise ? relaxUp : relaxDown)) / v;
       vx *= k; vy *= k;
+      // pull and push (a funnel's walls shield what is inside it from the other funnels' fields)
+      fieldAt(x, y, nf, reach, acc);
+      ax = FLD.ax; ay = FLD.ay; pulled = FLD.pulled;
+      // funnel walls are checked for every particle that can reach a funnel this step, counting the field it gets now
+      const rch = F_BOUND + (Math.hypot(vx, vy) + Math.hypot(ax, ay) * dt + 500) * dt;
+      near = FLD.d2 < rch * rch;
     }
-    for (let q = 0; q < nf; q++) {
-      const f = FA[q], dx = x - f.x, dy = y - f.y, lx = dx * f.c + dy * f.s;
-      dmin2 = Math.min(dmin2, dx * dx + dy * dy);
-      const P = f.power;
-      if (P <= 0 || slot >= 0) continue;   // a funnel's walls shield what is inside it from the other funnels' fields
-      if (lx < -F_HALF) {          // red side: pull toward the mouth
-        const mx = f.x - f.c * F_HALF, my = f.y - f.s * F_HALF, ex = mx - x, ey = my - y, d2 = ex * ex + ey * ey;
-        if (d2 < reach2 && d2 > 1 && lineClear(x, y, mx, my)) {
-          const d = Math.sqrt(d2), fall = 1 - d / reach, a = (PULL_ACC * acc * P * fall * fall) / d;
-          ax += ex * a; ay += ey * a;
-          if (fall * P > pulled) pulled = fall * P;
-        }
-      } else if (lx > F_HALF) {    // blue side: push away from the spout
-        const mx = f.x + f.c * F_HALF, my = f.y + f.s * F_HALF, ex = x - mx, ey = y - my, d2 = ex * ex + ey * ey;
-        if (d2 < pushR2 && d2 > 1 && lineClear(x, y, mx, my)) {
-          const d = Math.sqrt(d2), fall = 1 - d / pushR, a = (PUSH_ACC * acc * P * fall * fall) / d;
-          ax += ex * a; ay += ey * a;
-        }
-      }
-    }
-    // funnel walls are checked for every particle that can reach a funnel this step, counting the pull it gets now
-    if (!near) { const rch = F_BOUND + (Math.hypot(vx, vy) + Math.hypot(ax, ay) * dt + 500) * dt; near = dmin2 < rch * rch; }
     // sub-steps no longer than about one radius, so nothing tunnels through a wall
     const vEst = Math.hypot(vx, vy) + Math.hypot(ax, ay) * dt + (near ? carryV + 600 * dt : 0);
     const n = Math.min(120, Math.ceil((vEst * dt) / maxStep) || 1), h = dt / n;
@@ -989,7 +1001,7 @@ function simulate(dt) {
           const code = funnelContact(f, x, y, vx, vy, px, py, r, bounce, h, tIn, slot === f.slot, ENTRY[i] === 1);
           x = C.x; y = C.y; vx = C.vx; vy = C.vy;
           if (code === 1) { inSlot = f.slot; u = C.u; }
-          else if (code === 2) {   // out of the spout: the blue kick
+          else if (code === 2) {   // out of the spout: the blue kick, scaled by the same power as the fields
             const kv = KICK * sp * f.power;
             vx += f.c * kv; vy += f.s * kv;
             COOL[i] = 1; WARM[i] = 0;
@@ -1563,7 +1575,7 @@ const fieldsLayer = document.createElement('canvas');
 const fieldShown = (f) => !f.lifted && f.power > 0;
 const boardClip = (g) => { U.roundRect(g, S.ox, S.oy, WORLD_W * S.sc, WORLD_H * S.sc, BOARD_R * S.sc); g.clip(); };
 const fieldLevel = (f) => Math.max(1, Math.round(f.glow * FIELD_LEVELS)) / FIELD_LEVELS;
-const fieldRadius = (which) => (which ? tw('reach') * F_LEN * PUSH_REACH : tw('reach') * F_LEN) / 2;
+const fieldRadius = () => (tw('reach') * F_LEN) / 2;   // pull and push bubbles are the same size: their reach is the same
 /** Bring a funnel's bubble canvases up to date; null while it pops in or lands (then it is painted directly). */
 function fieldCache(f, R) {
   if (f.pop < 1 || f.lift > 0.01) return null;
@@ -1574,7 +1586,7 @@ function fieldCache(f, R) {
   c.key = key; c.since = Kit.realTime;
   const bx0 = S.ox * d, by0 = S.oy * d, bx1 = (S.ox + WORLD_W * sc) * d, by1 = (S.oy + WORLD_H * sc) * d;
   for (let which = 0; which < 2; which++) {
-    const part = c.parts[which], r = fieldRadius(which), off = which ? F_HALF + r : -F_HALF - r;
+    const part = c.parts[which], r = fieldRadius(), off = which ? F_HALF + r : -F_HALF - r;
     const cx = (S.ox + (f.x + f.c * off) * sc) * d, cy = (S.oy + (f.y + f.s * off) * sc) * d, rp = r * sc * d + 2;
     const x0 = Math.floor(Math.max(cx - rp, bx0)), y0 = Math.floor(Math.max(cy - rp, by0)), x1 = Math.ceil(Math.min(cx + rp, bx1)), y1 = Math.ceil(Math.min(cy + rp, by1));
     part.on = x1 > x0 && y1 > y0;
@@ -1613,7 +1625,7 @@ function drawFields(ctx, R, bakedIn) {
     const c = fieldCache(f, R);
     if (!c) {   // popping in or landing: a few frames, painted directly
       ctx.save(); boardClip(ctx);
-      for (let which = 0; which < 2; which++) R.fields(ctx, f, fieldLevel(f), which, fieldRadius(which));
+      for (let which = 0; which < 2; which++) R.fields(ctx, f, fieldLevel(f), which, fieldRadius());
       ctx.restore();
       continue;
     }
@@ -2052,7 +2064,7 @@ Kit.init({
     { type: 'range', id: 'size', label: 'Particle size', min: 2, max: R_MAX, step: 0.5, value: DEFAULTS.size, format: (v) => v.toFixed(1) },
     { type: 'range', id: 'bounce', label: 'Wall bounciness', min: 0.5, max: 1, step: 0.05, value: DEFAULTS.bounce, format: (v) => Math.round(v * 100) + ' %' },
     { type: 'section', label: 'Funnels' },
-    { type: 'range', id: 'reach', label: 'Pull reach', min: 1, max: 4, step: 0.25, value: DEFAULTS.reach, format: (v) => v.toFixed(2) + '× length', note: 'How far in front of the red mouth the pull is felt. The push reaches 60 % as far.' },
+    { type: 'range', id: 'reach', label: 'Reach', min: 1, max: 4, step: 0.25, value: DEFAULTS.reach, format: (v) => v.toFixed(2) + '× length', note: 'How far the pull reaches in front of the red mouth, and the push behind the blue spout. Both are always the same.' },
     { type: 'toggle', id: 'fields', label: 'Show fields', value: DEFAULTS.fields, note: 'Draws the pull and push zones faintly.' },
     { type: 'button', label: 'Clear funnels', onClick: clearFunnels },
     { type: 'section', label: 'Map' },
@@ -2084,6 +2096,8 @@ window.__toy = {
     insideOf: (i) => (INF[i] >= 0 ? S.slots[INF[i]] : null),
     tint: (i) => ({ warm: WARM[i], cool: COOL[i] }),
     get radius() { return tw('size'); },
+    // probes: put particle i at (x, y) with velocity (vx, vy), outside every funnel and untinted
+    place: (i, x, y, vx = 0, vy = 0) => { PX[i] = x; PY[i] = y; VX[i] = vx; VY[i] = vy; WARM[i] = 0; COOL[i] = 0; INT[i] = 0; INF[i] = -1; ENTRY[i] = 0; },
   },
   get funnels() { return S.funnels; },
   toScreen: (wx, wy) => ({ x: S.ox + wx * S.sc, y: S.oy + wy * S.sc }),
@@ -2105,6 +2119,10 @@ window.__toy = {
   get ghost() { return S.ghost; },                        // the red ghost of a refused placement, while it shows
   select: (f) => select(f),
   get scale() { return S.sc; },
+  get reach() { return tw('reach') * F_LEN; },             // pull and push reach (world units)
+  // the pull + push acceleration (world units / s², current speed) the simulation gives a particle at (wx, wy) outside
+  // every funnel: the same function the simulation calls
+  field: (wx, wy) => { fieldAt(wx, wy, workingFunnels(), tw('reach') * F_LEN, S.speed * S.speed); return { ax: FLD.ax, ay: FLD.ay }; },
   world: { w: WORLD_W, h: WORLD_H, funnelLength: F_LEN },
   get map() { return { chambers: MAP.chambers.length, tunnels: MAP.tunnels.filter((t) => !t.fix).map((t) => ({ narrow: t.narrow, width: t.w })), fixes: MAP.tunnels.filter((t) => t.fix).length }; },
   wallViolations: () => { let n = 0; for (let i = 0; i < N; i++) if (sdfAt(PX[i], PY[i]) <= 0) n++; return n; },
