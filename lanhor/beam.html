@@ -722,8 +722,9 @@ function recomputeBeams() {
  * small for its moths then grows into the brightest light around it (growBands). */
 const MAP = {
   cols: 0, rows: 0, n: 0, cw: 1, ch: 1, max: 0, builtAt: -9, active: 0,
-  L: new Float32Array(0), sx: new Float32Array(0), sy: new Float32Array(0), ok: new Uint8Array(0), mark: new Uint8Array(0), ring: new Uint8Array(0),
+  L: new Float32Array(0), sx: new Float32Array(0), sy: new Float32Array(0), ok: new Uint8Array(0),
   reg: new Int16Array(0), crowd: new Float32Array(0), w: new Float32Array(0),
+  mark: new Uint8Array(0), ring: new Uint8Array(0),   // growBands scratch; ring: how far out a grown cell lies
   peak: [], isBand: [], floor: [], cells: [],   // per region: brightest L, real band or slope, lowest L it holds, size
 };
 const mapOrder = [], mapStack = [], mapLoad = [];
@@ -830,9 +831,10 @@ function buildMap() {
   replanAll();
 }
 
-/** Two bands whose cells touch and whose peaks are within BAND of each other are one bright patch with
- *  two crests (e.g. a triple overlap split by a beam edge): the dimmer one joins the brighter, so neither
- *  is left too small to roam in. Bands apart from each other stay apart (no flip-flop between them). */
+/** Two bands whose cells touch and neither of which beats the other (BEAT) are one bright patch with
+ *  two crests (e.g. a triple overlap split by a beam edge, or its tip by the lamps): the dimmer one joins
+ *  the brighter, so neither is left too small to roam in. Bands apart from each other stay apart (no
+ *  flip-flop between them). */
 function mergeTouchingBands() {
   const M = MAP, cols = M.cols, rows = M.rows;
   for (let c = 0; c < M.n; c++) {
@@ -842,7 +844,7 @@ function mergeTouchingBands() {
     for (let j = Math.max(0, cj - 1); j <= Math.min(rows - 1, cj + 1); j++) {
       for (let i = Math.max(0, ci - 1); i <= Math.min(cols - 1, ci + 1); i++) {
         const b = M.reg[j * cols + i];
-        if (b <= a || !M.isBand[b] || M.peak[b] < BAND * M.peak[a]) continue;
+        if (b <= a || !M.isBand[b] || BEAT * M.peak[b] <= M.peak[a]) continue;
         for (let q = 0; q < M.n; q++) if (M.reg[q] === b) M.reg[q] = a;
         M.isBand[b] = false;
       }
@@ -852,10 +854,10 @@ function mergeTouchingBands() {
 
 /** A band smaller than the moths that will roam in it need (CELLS_PER_MOTH each, BAND_MIN_CELLS at
  *  least) takes in the cells around it ring by ring (brightest first within a ring), down to GROW_FLOOR
- *  of its peak and at most GROW_RINGS out, so it stays centred on its brightest spot. It may take slopes, unclaimed cells, bands
- *  the brightest one beats (their moths leave them) and bands no moth is in, never a band that still
- *  holds moths, so no moth changes band. A tiny triple overlap thus becomes the triple spot plus the two-beam light right around
- *  it: the swarm crowds round the spot and keeps moving. */
+ *  of its peak and at most GROW_RINGS out, so it stays centred on its brightest spot. It may take
+ *  slopes, unclaimed cells, bands the brightest one beats (their moths leave them) and bands no moth is
+ *  in, never a band that still holds moths, so no moth changes band. A tiny triple overlap thus becomes
+ *  the triple spot plus the two-beam light right around it: the swarm crowds round it and keeps moving. */
 const mapRing = [];
 function growBands() {
   const M = MAP, nr = M.peak.length, cols = M.cols, rows = M.rows;
@@ -924,10 +926,12 @@ function growBands() {
 }
 
 /** The band a moth is committed to, found again after a rebuild: a band with (about) the peak it
- *  committed to, the one nearest its destination, so two equal bands stay apart; -1 once it is gone. */
+ *  committed to, right by its destination (so two equal bands stay apart, and a band that changed its
+ *  strength is not mistaken for another one across the room); -1 once it is gone. */
 function ownBand(m) {
   const M = MAP, x = m.dest ? m.dest.x : m.x, y = m.dest ? m.dest.y : m.y;
-  let best = -1, bd = Infinity;
+  const lim = (GROW_RINGS + 1) * Math.max(M.cw, M.ch);
+  let best = -1, bd = lim * lim;
   if (!(m.bandL > 0)) return -1;
   for (let c = 0; c < M.n; c++) {
     const r = M.reg[c];
@@ -1040,10 +1044,11 @@ function setDest(m, x, y, region, bandL) {
 
 /** Pick a destination from the light map. Across the room (inRegion false): a cell of the brightest
  *  band, nearer ones first. Inside the moth's own band (inRegion true): any cell of its region but the
- *  ones right next to it, so it keeps travelling all over the band. Cells that other moths head for or
+ *  ones right next to it, so it keeps travelling all over the band (nearFirst: nearer ones first, for a
+ *  moth whose spot just went dark). Cells that other moths head for or
  *  sit in count less, so a swarm spreads out; the cells a band grew by count less the further out they
  *  are, so the swarm stays densest round its brightest spot. */
-function pickDest(m, inRegion) {
+function pickDest(m, inRegion, nearFirst) {
   const M = MAP, n = M.n, s = S.scale;
   if (!(M.max > 0) || (inRegion && !(m.region >= 0 && m.region < M.peak.length))) return false;
   M.crowd.fill(0);
@@ -1059,7 +1064,7 @@ function pickDest(m, inRegion) {
     const r = M.reg[c], grown = M.ring[c] > 0;   // grown: a cell the band took in to fit its moths
     if (M.ok[c] && (inRegion ? r === m.region : M.L[c] >= thr || (grown && M.peak[r] >= thr))) {
       const d = Math.hypot(M.sx[c] - m.x, M.sy[c] - m.y);
-      const near = inRegion ? (d < 70 * s || c === cur ? 0.08 : 1) : 1 / (1 + d / (220 * s));
+      const near = inRegion && !nearFirst ? (d < 70 * s || c === cur ? 0.08 : 1) : 1 / (1 + d / (220 * s));
       w = near / (1 + 1.5 * M.crowd[c]);
       if (grown) w *= Math.pow(0.6, M.ring[c]);
     }
@@ -1077,13 +1082,17 @@ function pickDest(m, inRegion) {
   // edges (so the path there stays in the light), else the cell's sample point
   const R = S.room, ci = pick % M.cols, cj = (pick - ci) / M.cols, clear = spotClear(), e = 14 * s;
   const core = BAND * bandL, need = Math.min(M.L[pick], (M.L[pick] >= core || reg < 0 ? core : floorOf(reg)) * 1.03);
-  let x = M.sx[pick], y = M.sy[pick];
-  // in a sliver of light thinner than the margin, any bright enough spot will do: moths sharing one
-  // fallback point would pile up on it
-  for (let k = 0; k < 12; k++) {
+  let x = M.sx[pick], y = M.sy[pick], found = false;
+  for (let k = 0; k < 6 && !found; k++) {
     const px = R.x + (ci + Math.random()) * M.cw, py = R.y + (cj + Math.random()) * M.ch;
-    if (openSpot(px, py, clear) && lightAt(px, py) >= need && (k >= 6 ||
-      (lightAt(px - e, py) >= need && lightAt(px + e, py) >= need && lightAt(px, py - e) >= need && lightAt(px, py + e) >= need))) { x = px; y = py; break; }
+    if (openSpot(px, py, clear) && lightAt(px, py) >= need &&
+      lightAt(px - e, py) >= need && lightAt(px + e, py) >= need && lightAt(px, py - e) >= need && lightAt(px, py + e) >= need) { x = px; y = py; found = true; }
+  }
+  // a sliver of light thinner than that margin: a spot a few pixels off the sample point, so moths
+  // sent to the same sliver do not pile up on one point
+  for (let k = 0; k < 4 && !found; k++) {
+    const px = M.sx[pick] + rand(-8, 8) * s, py = M.sy[pick] + rand(-8, 8) * s;
+    if (cellIndex(px, py) === pick && openSpot(px, py, clear) && lightAt(px, py) >= need) { x = px; y = py; found = true; }
   }
   setDest(m, x, y, reg, bandL);
   return true;
@@ -1100,11 +1109,12 @@ function pickNear(m) {
   return false;
 }
 
-/** A new destination inside the moth's own band, or across the room in the brightest band. */
-function plan(m, inRegion) {
+/** A new destination inside the moth's own band, or across the room in the brightest band. nearFirst:
+ *  its spot just went dark or left the band, so it hurries to the nearest part of the band. */
+function plan(m, inRegion, nearFirst) {
   const prev = m.region;
-  const ok = (inRegion && pickDest(m, true)) || pickDest(m, false) || pickNear(m);
-  if (ok && !inRegion && m.region !== prev) m.state = 'seek';
+  const ok = (inRegion && pickDest(m, true, nearFirst)) || pickDest(m, false) || pickNear(m);
+  if (ok && (nearFirst || (!inRegion && m.region !== prev))) m.state = 'seek';   // hurry (back) to the light
   return ok;
 }
 
@@ -1137,12 +1147,14 @@ function replanAll() {
     if (!m.dest) continue;
     let r = regionNear(m.dest.x, m.dest.y);
     const destL = lightAt(m.dest.x, m.dest.y);
-    // its spot is no longer in its band (a grown band shrank back): it stays with its band
-    if (r < 0 || M.peak[r] < 0.98 * m.bandL) { const o = ownBand(m); if (o >= 0) r = o; }
+    // its spot is no longer in its band (the beam swung, a grown band shrank back): it stays with its band
+    let outside = false;
+    if (r < 0 || M.peak[r] < 0.98 * m.bandL) { const o = ownBand(m); if (o >= 0) { r = o; outside = true; } }
     if (r >= 0) { m.region = r; m.bandL = M.peak[r]; m.floorL = floorOf(r); } else m.region = -1;
     const dark = destL <= 0 && lightAt(m.x, m.y) <= 0;
     let ok = true;
     if (r < 0 || M.max >= BEAT * m.bandL) ok = plan(m, false);   // its band is gone or clearly beaten
+    else if (destL <= 0 || outside) ok = plan(m, true, true);   // its spot went dark or out of the band: the nearest part of it
     else if (destL < m.floorL || !openSpot(m.dest.x, m.dest.y, spotClear())) ok = plan(m, true);
     if (!ok && dark) loseLight(m);   // no light anywhere
   }
