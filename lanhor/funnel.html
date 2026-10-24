@@ -189,6 +189,9 @@ function sdGroup(px, py, g) {
   return d;
 }
 const chamberField = (px, py, ch) => sdGroup(px, py, ch);
+// smooth-union widths that keep every join round: tunnel into tunnel (no thorn of rock where two meet at a slant),
+// and a finger into the wall it grows from (a fillet on both sides, even where it leaves the wall at an angle)
+const TUNNEL_MELT = 52, FINGER_FILLET = 30;
 const BORDER = rbox(WORLD_W / 2, WORLD_H / 2, WORLD_W / 2 - 22, WORLD_H / 2 - 22, 80, 0);
 
 /** "Carved" field: negative inside the free space. */
@@ -198,16 +201,22 @@ function carved(px, py) {
     if (Math.hypot(px - ch.bx, py - ch.by) - ch.br - ch.k * 0.25 > f) continue;
     f = Math.min(f, chamberField(px, py, ch));
   }
+  // tunnels flare into the chambers; among themselves (g) they melt far more generously, so two that meet at a slant
+  // leave a round knob of rock between them instead of a thorn
+  let g = 1e9;
   for (const t of MAP.tunnels) {
-    if (Math.hypot(px - t.bx, py - t.by) - t.br > f + 30) continue;
+    if (Math.hypot(px - t.bx, py - t.by) - t.br > f + TUNNEL_MELT + 2) continue;
     let d = 1e9;
     for (const s of t.parts) d = Math.min(d, sdShape(px, py, s));
     f = smin(f, d, t.narrow ? 26 : 34);
+    g = g > 1e8 ? d : smin(g, d, TUNNEL_MELT);
   }
+  f = Math.min(f, g);
   f = smax(f, sdShape(px, py, BORDER), 24);
   for (const o of MAP.obstacles) {
-    if (Math.hypot(px - o.bx, py - o.by) - o.br > -f + 16) continue;
-    f = smax(f, -sdGroup(px, py, o), 14);
+    const k = o.fillet || 14;
+    if (Math.hypot(px - o.bx, py - o.by) - o.br > -f + k + 2) continue;
+    f = smax(f, -sdGroup(px, py, o), k);
   }
   return f;
 }
@@ -288,6 +297,29 @@ function ensureConnected() {
   labelComponents(PASS);
   for (let s = 0; s < GW * GH; s++) if (LABEL[s] === 1 && SDF[s] > R_MAX + 6) MAP.free[MAP.freeN++] = s;
   MAP.comps = components();
+}
+
+/** A tunnel grazing a chamber can leave a thin lens of rock with pointed ends. Every rock island shallower than SLIVER
+ *  (each designed obstacle is at least 9 units deep) is melted by a short free capsule laid from one end to the other. */
+const SLIVER = 5;
+function meltSlivers() {
+  for (let s = 0; s < GW * GH; s++) SDF[s] = -SDF[s];   // label the rock instead of the free space
+  const n = labelComponents(0).length, depth = new Float32Array(n);
+  for (let s = 0; s < GW * GH; s++) if (LABEL[s]) depth[LABEL[s] - 1] = Math.max(depth[LABEL[s] - 1], SDF[s]);
+  for (let s = 0; s < GW * GH; s++) SDF[s] = -SDF[s];
+  const far = (l, x, y) => {   // the cell of island l farthest from (x, y)
+    let best = 0, bd = -1;
+    for (let s = 0; s < GW * GH; s++) if (LABEL[s] === l) { const d = Math.hypot((s % GW) * GRID - x, Math.floor(s / GW) * GRID - y); if (d > bd) { bd = d; best = s; } }
+    return [(best % GW) * GRID, Math.floor(best / GW) * GRID];
+  };
+  let melted = 0;
+  for (let l = 1; l <= n; l++) {
+    if (depth[l - 1] >= SLIVER) continue;
+    const s0 = LABEL.indexOf(l), a = far(l, (s0 % GW) * GRID, Math.floor(s0 / GW) * GRID), b = far(l, a[0], a[1]);
+    addTunnel(-1, -1, [a, b], 2 * depth[l - 1] + 10, true, true);
+    melted++;
+  }
+  if (melted) computeField();
 }
 
 function addTunnel(a, b, pts, w, narrow, fix) {
@@ -399,12 +431,13 @@ function generate(seed) {
         const tx = ex - ux * l, ty = ey - uy * l;
         if (d < 120 || !clearOf(tx, ty, r, 70) || !clearOf(ex, ey, r, 50)) continue;
         const p = capsule(ex + ux * 24, ey + uy * 24, tx, ty, r);
-        MAP.obstacles.push({ parts: [p], k: 1, bx: p.bx, by: p.by, br: p.br });
+        MAP.obstacles.push({ parts: [p], k: 1, fillet: FINGER_FILLET, bx: p.bx, by: p.by, br: p.br });
         break;
       }
     }
   }
   computeField();
+  meltSlivers();
   ensureConnected();
   S.seed = seed;
 }
