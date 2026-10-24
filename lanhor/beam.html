@@ -635,8 +635,9 @@ function beamGlow(x, y, l) {
 }
 
 /** Light at a point: L sums every lamp that lights it, whatever its color, so overlaps are stronger.
- *  Also reports how many lamps light it, their colors as a bit mask and the strongest of them. */
-const probe = { L: 0, n: 0, mask: 0, lamp: null };
+ *  Also reports how many lamps light it, their colors as a bit mask, the colors of the first three
+ *  (rings) and the strongest lamp. */
+const probe = { L: 0, n: 0, mask: 0, lamp: null, rings: new Int8Array(3) };
 function sampleLight(x, y, out = probe) {
   out.L = 0; out.n = 0; out.mask = 0; out.lamp = null;
   let top = 0;
@@ -644,6 +645,7 @@ function sampleLight(x, y, out = probe) {
     const d = litDist(x, y, l);
     if (d < 0) continue;
     const f = strengthAt(d);
+    if (out.n < 3) out.rings[out.n] = CI[l.color];
     out.L += f; out.n++; out.mask |= 1 << CI[l.color];
     if (f > top) { top = f; out.lamp = l; }
   }
@@ -827,7 +829,7 @@ function makeMoth(x, y, look) {
     nextT: 0, stuckT: 0, bestD: Infinity, loopT: 0, loopA: 0,
     glow: 0, glowMask: 0, boost: 0, crowd: 0, squash: 0, lastLit: -9, cueAt: -9,
   };
-  Object.defineProperty(m, 'fx', { value: { trail: new Float32Array(TRAIL * 2), tn: 0, th: 0 }, enumerable: false });
+  Object.defineProperty(m, 'fx', { value: { trail: new Float32Array(TRAIL * 2), tn: 0, th: 0, rings: new Int8Array([-1, -1, -1]) }, enumerable: false });
   return m;
 }
 
@@ -903,9 +905,9 @@ function setDest(m, x, y, region, bandL) {
 }
 
 /** Pick a destination from the light map. Across the room (inRegion false): a cell of the brightest
- *  band, nearer ones first. Inside the moth's own band (inRegion true): a cell of its region, rather
- *  one a little way off so it keeps travelling. Cells that other moths head for or sit in count less,
- *  so a swarm spreads out over the band. */
+ *  band, nearer ones first. Inside the moth's own band (inRegion true): any cell of its region but the
+ *  ones right next to it, so it keeps travelling all over the band. Cells that other moths head for or
+ *  sit in count less, so a swarm spreads out. */
 function pickDest(m, inRegion) {
   const M = MAP, n = M.n, s = S.scale;
   if (!(M.max > 0) || (inRegion && !(m.region >= 0 && m.region < M.peak.length))) return false;
@@ -921,7 +923,7 @@ function pickDest(m, inRegion) {
     let w = 0;
     if (M.ok[c] && (inRegion ? M.reg[c] === m.region : M.L[c] >= thr)) {
       const d = Math.hypot(M.sx[c] - m.x, M.sy[c] - m.y);
-      const near = inRegion ? (d < 70 * s || c === cur ? 0.08 : 1 / (1 + d / (500 * s))) : 1 / (1 + d / (220 * s));
+      const near = inRegion ? (d < 70 * s || c === cur ? 0.08 : 1) : 1 / (1 + d / (220 * s));
       w = near / (1 + 1.5 * M.crowd[c]);
     }
     M.w[c] = w; total += w;
@@ -1008,7 +1010,11 @@ function feelLight(m, pr) {
     }
   }
   m.L = pr.L; m.n = pr.n;
-  if (pr.mask) m.glowMask = pr.mask;
+  if (pr.n) {   // while it crosses a shadow it keeps the colors of its last light
+    m.glowMask = pr.mask;
+    const r = m.fx.rings;
+    for (let k = 0; k < 3; k++) r[k] = k < pr.n ? pr.rings[k] : -1;
+  }
 }
 
 /** One moth's decisions for this step. */
@@ -1136,20 +1142,22 @@ function updateMoths(dt, t) {
     if (m.dest && (roaming || m.state === 'seek')) {
       let dx = m.dest.x - m.x, dy = m.dest.y - m.y;
       const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
-      // now and then a roaming moth throws a quick, curious loop
-      if (roaming && m.loopT <= 0 && Math.random() < dt * 0.25 * restless) { m.loopT = rand(0.45, 0.7); m.loopA = 0; m.spin = Math.random() < 0.5 ? -1 : 1; }
+      // a roaming moth flutters freely inside its band; one that slipped out heads straight back in
+      const free = roaming && m.L >= BAND * m.bandL;
+      // now and then a free moth throws a quick, curious loop
+      if (free && m.loopT <= 0 && Math.random() < dt * 0.25 * restless) { m.loopT = rand(0.45, 0.7); m.loopA = 0; m.spin = Math.random() < 0.5 ? -1 : 1; }
       if (m.loopT > 0) {
         m.loopT -= dt; m.loopA += m.spin * dt * 11;
         const c = Math.cos(m.loopA), sn = Math.sin(m.loopA), rx = dx * c - dy * sn;
         dy = dx * sn + dy * c; dx = rx;
       }
-      const wob = (Math.sin(t * 9.3 + m.p1) * 0.6 + Math.sin(t * 23.7 + m.p2) * 0.4) * (roaming ? 0.9 : 0.75 * clamp(d / (170 * s), 0.25, 1));
+      const wob = (Math.sin(t * 9.3 + m.p1) * 0.6 + Math.sin(t * 23.7 + m.p2) * 0.4) * (free ? 0.9 : roaming ? 0.4 : 0.75 * clamp(d / (170 * s), 0.25, 1));
       const v = (roaming ? roamV : seekV * clamp(d / (70 * s), 0.55, 1)) * (0.88 + 0.24 * Math.sin(t * 3.1 + m.p3));
       const tx = dx * v - dy * wob * v, ty = dy * v + dx * wob * v;
-      const k = roaming ? 3.2 : 4.5 * pull;
+      const k = free ? 3.2 : roaming ? 5.5 : 4.5 * pull;
       steer.ax += (tx - m.vx) * k; steer.ay += (ty - m.vy) * k;
       avoidObstacles(m, 55 * s, (roaming ? 520 : 700) * s, steer);
-      if (Math.random() < dt * (roaming ? 1.6 : 1.2)) { const j = rand(-1, 1) * (roaming ? 85 : 70) * s; m.vx += -dy * j; m.vy += dx * j; }
+      if (Math.random() < dt * (free ? 1.6 : roaming ? 0 : 1.2)) { const j = rand(-1, 1) * (free ? 85 : 70) * s; m.vx += -dy * j; m.vy += dx * j; }
     } else if (m.state === 'lost') {
       m.lostT -= dt;
       const damp = Math.exp(-dt * 2.6);
@@ -1464,7 +1472,6 @@ const MIX = Array.from({ length: 1 << NC }, (_, mask) => {
   return '#' + sum.map((v) => Math.min(255, v).toString(16).padStart(2, '0')).join('');
 });
 const maskSeen = new Uint8Array(1 << NC), maskList = [];   // scratch: the light mixes on screen this frame
-const bitCount = (v) => { let k = 0; for (; v; v &= v - 1) k++; return k; };
 const GLOW = 64, GLOW_COLS = 16, GLOW_ROWS = 6;   // room for every mix plus the swatch and particle colors
 const glowAtlas = document.createElement('canvas');
 glowAtlas.width = GLOW * GLOW_COLS; glowAtlas.height = GLOW * GLOW_ROWS;
@@ -2185,8 +2192,9 @@ function drawMothsSprite(ctx) {
   // smaller and dimmer, so they add up to a glow rather than a white blot that hides the moths.
   for (const m of moths) {
     if (m.glow < 0.03 || !m.glowMask) continue;
+    const size = MOTH_WS * s * (1.2 + 0.5 * clamp((4 - m.crowd) / 3, 0, 1));
     ctx.globalAlpha = Math.min(1, 0.55 * (1 + 0.4 * m.boost)) * m.glow / (1 + 0.25 * m.crowd);
-    drawGlowSized(ctx, MIX[m.glowMask], m.x, m.y, MOTH_WS * s * (m.crowd > 2 ? 1.2 : 1.7));
+    drawGlowSized(ctx, MIX[m.glowMask], m.x, m.y, Math.round(size / 4) * 4);   // 4 px steps keep the glow cache small
   }
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
@@ -2357,18 +2365,20 @@ function drawAgentsShapes(ctx) {
     }
   }
   ctx.stroke();
-  // one ring per color lighting it (up to three), so an agent in an overlap wears more rings
+  // a ring in the color of each lamp lighting it (up to three), so an agent in an overlap wears more rings
   ctx.lineWidth = 2.5 * s;
   for (let c = 0; c < NC; c++) {
     ctx.strokeStyle = BASE[COLORS[c]];
     ctx.beginPath();
     for (const m of S.moths) {
-      if (m.glow < 0.3 || !(m.glowMask & (1 << c))) continue;
-      const k = bitCount(m.glowMask & ((1 << c) - 1));
-      if (k > 2) continue;
-      const rr = r + (4.5 + 4.5 * k) * s;
-      ctx.moveTo(m.x + rr, m.y);
-      ctx.arc(m.x, m.y, rr, 0, TAU);
+      if (m.glow < 0.3) continue;
+      const rings = m.fx.rings;
+      for (let k = 0; k < 3; k++) {
+        if (rings[k] !== c) continue;
+        const rr = r + (4.5 + 4.5 * k) * s;
+        ctx.moveTo(m.x + rr, m.y);
+        ctx.arc(m.x, m.y, rr, 0, TAU);
+      }
     }
     ctx.stroke();
   }
