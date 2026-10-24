@@ -2181,17 +2181,12 @@ function drawMothsSprite(ctx) {
       ctx.stroke();
     }
   }
-  // halo in the mix of the lamps lighting it; in an overlap a wider bloom joins it. Halos of a
-  // dense swarm are dimmed so they add up to a glow, not a white blot that hides the moths.
+  // halo in the mix of the lamps lighting it, brighter in an overlap. In a dense swarm halos are
+  // smaller and dimmer, so they add up to a glow rather than a white blot that hides the moths.
   for (const m of moths) {
     if (m.glow < 0.03 || !m.glowMask) continue;
-    const col = MIX[m.glowMask], k = m.glow / (1 + 0.3 * m.crowd);
-    ctx.globalAlpha = 0.55 * k;
-    drawGlowSized(ctx, col, m.x, m.y, MOTH_WS * s * 1.7);
-    if (m.boost > 0.02) {
-      ctx.globalAlpha = Math.min(1, 0.32 * m.boost) * k;
-      drawGlowSized(ctx, col, m.x, m.y, MOTH_WS * s * 2.7);
-    }
+    ctx.globalAlpha = Math.min(1, 0.55 * (1 + 0.4 * m.boost)) * m.glow / (1 + 0.25 * m.crowd);
+    drawGlowSized(ctx, MIX[m.glowMask], m.x, m.y, MOTH_WS * s * (m.crowd > 2 ? 1.2 : 1.7));
   }
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
