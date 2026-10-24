@@ -78,11 +78,11 @@ const DEFAULT_OBJECTS = [
   ['circle', 0.42, 0.13, 0.06, 0, null],
   ['rect', 0.555, 0.25, 0.058, 20, 'blue'],    // in the blue beam: blue shines through
   ['triangle', 0.75, 0.3, 0.078, 12, null],
-  // in the red beam past the overlap: bounces part of it up into the dark top right (clear of the
-  // overlap); its top end tucks into the green pane's shadow, so no hairline of light slips past it
-  ['mirror', 0.86, 0.8, 0.075, 134, null],
+  ['bar', 0.82, 0.66, 0.075, 78, null],
   ['square', 0.67, 0.6, 0.058, -14, 'green'],  // in the red beam past the overlap: casts a red shadow
-  ['square', 0.42, 0.87, 0.064, 16, null],
+  // in the blue beam below the overlap: bounces it left along the floor into the dark corner, clear of
+  // the overlap and of the red beam (with the blue lamp off the red beam is a plain single beam again)
+  ['mirror', 0.33, 0.9, 0.075, 156, null],
   ['triangle', 0.21, 0.67, 0.07, -24, 'red'],  // in the red beam: red shines through
   ['circle', 0.12, 0.17, 0.045, 0, null],
 ];
