@@ -830,9 +830,9 @@ function buildMap() {
 
 /** A band smaller than the moths that will roam in it need (CELLS_PER_MOTH each, BAND_MIN_CELLS at
  *  least) takes in the cells around it ring by ring (brightest first within a ring), down to GROW_FLOOR
- *  of its peak, so it stays centred on its brightest spot. It may take slopes, unclaimed cells and bands
- *  the brightest one beats (their moths leave them), never a band that still holds moths, so no moth
- *  changes band. A tiny triple overlap thus becomes the triple spot plus the two-beam light right around
+ *  of its peak, so it stays centred on its brightest spot. It may take slopes, unclaimed cells, bands
+ *  the brightest one beats (their moths leave them) and bands no moth is in, never a band that still
+ *  holds moths, so no moth changes band. A tiny triple overlap thus becomes the triple spot plus the two-beam light right around
  *  it: the swarm crowds round the spot and keeps moving. */
 const mapRing = [];
 function growBands() {
@@ -855,7 +855,7 @@ function growBands() {
   M.active = active;
   const open = (q, r) => {
     const o = M.reg[q];
-    return o !== r && M.ok[q] && M.L[q] > 0 && (o < 0 || !M.isBand[o] || beaten(o));
+    return o !== r && M.ok[q] && M.L[q] > 0 && (o < 0 || !M.isBand[o] || beaten(o) || !mapLoad[o]);
   };
   const front = mapStack;
   for (let r = 0; r < nr; r++) {
@@ -893,7 +893,11 @@ function growBands() {
 }
 
 /** The lowest light that still counts as inside band r (a grown band reaches below BAND of its peak). */
-const floorOf = (r) => (r >= 0 && r < MAP.floor.length ? Math.min(BAND * MAP.peak[r], MAP.floor[r] * 0.97) : 0);
+const floorOf = (r) => {
+  if (!(r >= 0 && r < MAP.floor.length)) return 0;
+  const core = BAND * MAP.peak[r];
+  return MAP.floor[r] < core ? MAP.floor[r] * 0.97 : core;   // a little slack below a grown band's dimmest cell sample
+};
 /** Bring the beams and the map up to date now (test API; the loop throttles its own rebuilds). */
 function syncMap() {
   if (S.dirty) recomputeBeams();
