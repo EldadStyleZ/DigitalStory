@@ -714,11 +714,16 @@ function polyBounds(p) {
 
 /** Every beam piece: each lamp's direct beam, then (breadth first, so every lamp gets its first bounces
  *  before anyone's third) the reflections off each lit stretch of a mirror face, up to the bounce limit
- *  and MAX_REFLECTIONS in all. Also lists where light meets a mirror (S.mirrorHits, for the glints). */
+ *  and MAX_REFLECTIONS in all. Lamps that are on get the whole budget first; lamps switched off (whose
+ *  light still fades out) only what is left, so switching one off never takes bounces from the others.
+ *  Also lists where light meets a mirror (S.mirrorHits, for the glints). */
 function buildPieces() {
   const out = S.pieces, prev = S.pieceByKey, next = new Map();
   out.length = 0; S.mirrorHits.length = 0;
-  for (const on of [true, false]) {   // lamps that are on claim the reflection budget first
+  const limit = Math.round(tw('bounces')), K = tw('mirrorK');
+  let made = 0;
+  for (const on of [true, false]) {
+    const q0 = out.length;
     for (const l of S.lamps) {
       if (l.on !== on || !l.fx.path) continue;
       const P = l.fx.piece, fx = l.fx;
@@ -727,10 +732,15 @@ function buildPieces() {
       polyBounds(P);
       out.push(P);
     }
+    made = reflectAll(out, q0, prev, next, limit, K, made);
   }
-  const limit = Math.round(tw('bounces')), K = tw('mirrorK');
-  let made = 0;
-  for (let q = 0; q < out.length; q++) {
+  S.pieceByKey = next;
+}
+
+/** Breadth-first reflections of the pieces out[q0…] (and of their own reflections), adding at most
+ *  MAX_REFLECTIONS − made pieces; returns the new count. */
+function reflectAll(out, q0, prev, next, limit, K, made) {
+  for (let q = q0; q < out.length; q++) {
     const P = out[q], n = P.t.length, h0 = S.mirrorHits.length;
     // runs of neighbouring rays that end on the same mirror face: each is a lit stretch of that face
     for (let a = 0; a < n; a++) {
@@ -747,14 +757,14 @@ function buildPieces() {
       const x2 = P.sx + Math.cos(cb) * P.t[b], y2 = P.sy + Math.sin(cb) * P.t[b];
       a = b;
       if (Math.hypot(x2 - x1, y2 - y1) < 1) continue;
-      S.mirrorHits.push({ o, face, x1, y1, x2, y2, color: P.color, k: P.k, lamp: P.lamp });
+      S.mirrorHits.push({ o, face, x1, y1, x2, y2, color: P.color, k: P.k, depth: P.depth, lamp: P.lamp });
       if (P.depth >= limit || made >= MAX_REFLECTIONS) continue;
       const key = P.key + '>' + run;
       const C = prev.get(key) || makePiece(P.lamp, P.depth + 1, key);
       if (reflectPiece(C, P, o, face, x1, y1, x2, y2)) { C.k = P.k * K; out.push(C); next.set(key, C); made++; }
     }
   }
-  S.pieceByKey = next;
+  return made;
 }
 
 /** Reflection of parent piece P off the stretch (x1, y1)–(x2, y2) of mirror o's face: rays from P's
@@ -2556,7 +2566,7 @@ function paintMirror(g, o) {
 const LIGHT_HOT = Object.fromEntries(COLORS.map((c) => [c, U.mixHex(LIGHT[c], '#ffffff', 0.5)]));
 /** Where a beam meets a mirror (Sprites, baked in the floor): a bright stripe on the lit stretch and,
  *  for light that arrives directly or after one bounce, a faint flare in the beam's color. */
-const FLARE_K = 0.7;
+const FLARE_DEPTH = 1;   // the bounces light may have made and still flare (and glint) where it meets a mirror
 function paintMirrorHits(f) {
   const s = S.scale;
   f.save();
@@ -2569,7 +2579,7 @@ function paintMirrorHits(f) {
     f.globalAlpha = 0.8 * vis;
     f.strokeStyle = LIGHT_HOT[h.color];
     f.beginPath(); f.moveTo(h.x1, h.y1); f.lineTo(h.x2, h.y2); f.stroke();
-    if (h.k < FLARE_K) continue;
+    if (h.depth > FLARE_DEPTH) continue;
     const len = Math.hypot(h.x2 - h.x1, h.y2 - h.y1);
     f.globalAlpha = 0.4 * vis;
     drawGlowSized(f, LIGHT[h.color], (h.x1 + h.x2) / 2, (h.y1 + h.y2) / 2, Math.round(clamp(len * 0.8, 40 * s, 100 * s) / 8) * 8);
@@ -2599,7 +2609,7 @@ function drawMirrorFx(ctx, t) {
   const g = Math.round((28 * s) / 4) * 4;
   for (const h of S.mirrorHits) {
     const vis = lampVis(h.lamp) * h.k;
-    if (vis < 0.02 || h.k < FLARE_K) continue;
+    if (vis < 0.02 || h.depth > FLARE_DEPTH) continue;
     ctx.globalAlpha = vis * (0.7 + 0.3 * Math.sin(t * 6.5 + h.o.id * 1.7));
     drawGlowSized(ctx, '#ffffff', (h.x1 + h.x2) / 2, (h.y1 + h.y2) / 2, g);
   }
@@ -3301,7 +3311,7 @@ function setup() {
   });
   S.ui.mirrorBtn = Kit.ui.button({
     parent: gObj, icon: MIRROR_ICON, iconOnly: true, key: '−',
-    tip: 'Add a mirror: it bounces the light (Shift turns it in 1° steps)',
+    tip: 'Add a mirror: it bounces the light (the wheel turns it, with Shift in 1° steps)',
     onClick: () => addObject('mirror'),
   });
   setColor(S.color, false);
@@ -3425,10 +3435,11 @@ window.__toy = {
   reflectRay,
   /** How many times the beams (with their reflections) and the light map have been rebuilt. */
   get counters() { return Object.assign({}, S.counts); },
-  /** Where light meets a mirror face: [{mirror (obstacle index), x1, y1, x2, y2 (the lit stretch), color, strength}]. */
+  /** Where light meets a mirror face: [{mirror (obstacle index), x1, y1, x2, y2 (the lit stretch), color,
+   *  strength, depth (the bounces the light made before it got here)}]. */
   mirrorHits: () => {
     if (S.dirty) recomputeBeams();
-    return S.mirrorHits.map((h) => ({ mirror: S.obstacles.indexOf(h.o), x1: h.x1, y1: h.y1, x2: h.x2, y2: h.y2, color: h.color, strength: h.k }));
+    return S.mirrorHits.map((h) => ({ mirror: S.obstacles.indexOf(h.o), x1: h.x1, y1: h.y1, x2: h.x2, y2: h.y2, color: h.color, strength: h.k, depth: h.depth }));
   },
 };
 </script>
