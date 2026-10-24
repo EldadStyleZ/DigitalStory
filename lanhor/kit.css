@@ -520,8 +520,7 @@ html, body {
 .kit-help {
   position: absolute;
   inset: 0;
-  display: grid;
-  place-items: center;
+  display: flex;
   padding: 24px max(16px, env(safe-area-inset-left, 0px));
   background: rgba(5, 6, 14, 0.62);
   backdrop-filter: blur(6px);
@@ -532,6 +531,7 @@ html, body {
 }
 @keyframes kit-fade { from { opacity: 0; } to { opacity: 1; } }
 .kit-help-card {
+  margin: auto; /* centers, but scrolls instead of clipping when taller than the screen */
   width: min(760px, 100%);
   padding: 28px 30px 24px;
   border-radius: 24px;
