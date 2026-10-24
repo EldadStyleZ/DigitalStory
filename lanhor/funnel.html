@@ -44,7 +44,9 @@ const WANDER = 1.5;                                  // random-walk heading nois
 const VMAX = 1500;
 const STUCK_T = 1.3;                                 // after this long inside, a nudge guarantees the exit
 const ROT_MAX = 2.4, ROT_K = 7.5;                    // A / D: top spin (rad/s) and ease stiffness
-const TURN_REACH = 80, TURN_SLACK = 5, TURN_K = 16;  // a turning funnel slides up to this far from its spot to clear the rock
+// turning: a funnel slides up to TURN_REACH from its spot to clear the rock; while it eases it may come TURN_SLACK closer
+// than at rest (the gap between its wall and the rock stays wider than a particle, so nothing is squeezed into a wall)
+const TURN_REACH = 80, TURN_SLACK = 2.5, TURN_K = 16;
 const MOVE_MAX = 300, MOVE_K = 10;                   // arrow keys: top speed (world/s) and ease stiffness
 const GLIDE_K = 13;
 const CLICK_PX = 5, CLICK_MS = 350;
@@ -511,10 +513,7 @@ function findSpot(f, x, y, a, maxR = 900) {
   }
   return null;
 }
-/** Turning: where funnel f has to sit at angle a to keep clear of the rock. It is pushed out of the walls from a start
- *  pose (translation only, like a stick turned in a box), so the spot moves smoothly with the angle and, started from
- *  home, is home again whenever the funnel fits there. Null when there is no such spot within TURN_REACH of home. */
-const TS = { x: 0, y: 0, moved: 0 };
+const TS = { x: 0, y: 0, moved: 0 };   // the pose turnSpot is solving for
 /** Push the pose (TS.x, TS.y) at angle (c, s) so that sample (lx, ly) keeps `need` units from the rock. */
 function pushOut(c, s, lx, ly, need) {
   const px = TS.x + c * lx - s * ly, py = TS.y + s * lx + c * ly, p = need - sdfAt(px, py);
@@ -523,6 +522,9 @@ function pushOut(c, s, lx, ly, need) {
   if (gl < 1e-6) return;
   TS.x += (gx / gl) * p; TS.y += (gy / gl) * p; TS.moved = Math.max(TS.moved, p);
 }
+/** Turning: where funnel f has to sit at angle a to keep clear of the rock. It is pushed out of the walls from a start
+ *  pose (translation only, like a stick turned in a box), so the spot moves smoothly with the angle and, started from
+ *  home, is home again whenever the funnel fits there. Null when there is no such spot within TURN_REACH of home. */
 function turnSpot(f, a, x0, y0) {
   const c = Math.cos(a), s = Math.sin(a), wl = F_WALL + clearance() + 0.75;
   TS.x = x0; TS.y = y0;
