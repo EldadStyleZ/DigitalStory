@@ -44,6 +44,7 @@ const WANDER = 1.5;                                  // random-walk heading nois
 const VMAX = 1500;
 const STUCK_T = 1.3;                                 // after this long inside, a nudge guarantees the exit
 const ROT_MAX = 2.4, ROT_K = 7.5;                    // A / D: top spin (rad/s) and ease stiffness
+const TURN_REACH = 80, TURN_SLACK = 5, TURN_K = 16;  // a turning funnel slides up to this far from its spot to clear the rock
 const MOVE_MAX = 300, MOVE_K = 10;                   // arrow keys: top speed (world/s) and ease stiffness
 const GLIDE_K = 13;
 const CLICK_PX = 5, CLICK_MS = 350;
@@ -68,15 +69,17 @@ const CSS = `
   transform: translate(-50%, -50%) scale(var(--k));
   display: flex; align-items: center; gap: 3px;
   height: 24px; padding: 0 5px; border-radius: 12px; box-sizing: border-box;
-  background: rgba(15, 11, 32, 0.66);
-  border: 1px solid rgba(236, 230, 255, 0.16);
-  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  /* light at rest, so the stream inside the cone shows through; solid when pointed at or dragged */
+  background: rgba(15, 11, 32, 0.42);
+  border: 1px solid rgba(236, 230, 255, 0.14);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.06);
   pointer-events: auto; touch-action: none; cursor: pointer;
   transition: background .15s, border-color .15s, box-shadow .15s, opacity .25s, scale .25s;
   animation: fn-in .38s cubic-bezier(.3, 1.5, .5, 1) both;
 }
-.fn-pill.is-hot { background: rgba(28, 22, 56, 0.86); border-color: rgba(236, 230, 255, 0.34); }
-.fn-pill.is-sel { box-shadow: 0 3px 12px rgba(0, 0, 0, 0.42), 0 0 0 2px rgba(180, 140, 255, 0.38); }
+.fn-pill.is-hot, .fn-pill.is-drag { background: rgba(28, 22, 56, 0.88); border-color: rgba(236, 230, 255, 0.34); box-shadow: 0 3px 12px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.07); }
+.fn-pill.is-sel { box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28), 0 0 0 2px rgba(180, 140, 255, 0.38); }
+.fn-pill.is-sel.is-hot, .fn-pill.is-sel.is-drag { box-shadow: 0 3px 12px rgba(0, 0, 0, 0.42), 0 0 0 2px rgba(180, 140, 255, 0.5); }
 .fn-pill.is-drag { border-color: color-mix(in srgb, var(--tc) 70%, white); }
 .fn-pill.is-lift { opacity: 0.55; }
 .fn-pill.is-out { opacity: 0; scale: 0.5; pointer-events: none; }
@@ -87,6 +90,7 @@ body.view-abstract .fn-pill.is-sel { border-color: #ffffff; }
 .fn-mk {
   width: 11px; height: 18px; display: grid; place-items: center; flex: none;
   font: 600 14px/1 var(--font-ui); color: #f1effb; border-radius: 6px;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
   transition: opacity .15s, background .15s;
 }
 .fn-mk:hover { background: rgba(255, 255, 255, 0.1); }
@@ -96,6 +100,7 @@ body.view-abstract .fn-pill.is-sel { border-color: #ffffff; }
 .fn-ramp-base { fill: rgba(236, 230, 255, 0.24); }
 .fn-ramp-fill { fill: url(#fn-grad); clip-path: inset(0 calc((1 - var(--p)) * 100%) 0 0); }
 body.view-abstract .fn-ramp-base { fill: #5a5a66; }
+body.view-abstract .fn-mk { text-shadow: none; }
 body.view-abstract .fn-ramp-fill { fill: url(#fn-grad-sh); }
 .fn-thumb {
   position: absolute; top: 50%; left: calc(var(--p) * (100% - 38px)); width: 38px; height: 18px; margin-top: -9px;
@@ -475,11 +480,11 @@ function touches(ax, ay, ac, as, bx, by, bc, bs, gap) {
   }
   return false;
 }
-/** True when a funnel at (x, y, a) keeps clear of the walls and of the other resting funnels. */
-function fits(f, x, y, a) {
+/** True when a funnel at (x, y, a) keeps clear of the walls and of the other resting funnels (slack: allowed shortfall). */
+function fits(f, x, y, a, slack = 0) {
   if (!(x > 0 && y > 0 && x < WORLD_W && y < WORLD_H)) return false;
-  const c = Math.cos(a), s = Math.sin(a), cl = clearance(), wl = F_WALL + cl;
-  for (let k = 0; k <= 10; k++) if (sdfAt(x + c * AX_X[k], y + s * AX_X[k]) < AX_R[k] * 0.9) return false;   // nothing inside the cone
+  const c = Math.cos(a), s = Math.sin(a), cl = clearance() - slack, wl = F_WALL + cl, ax = slack * 0.6;
+  for (let k = 0; k <= 10; k++) if (sdfAt(x + c * AX_X[k], y + s * AX_X[k]) < AX_R[k] * 0.9 - ax) return false;   // nothing inside the cone
   for (let k = 0; k < WS_X.length; k++) {
     const lx = WS_X[k], ly = WS_Y[k];
     if (sdfAt(x + c * lx - s * ly, y + s * lx + c * ly) < wl || sdfAt(x + c * lx + s * ly, y + s * lx - c * ly) < wl) return false;
@@ -505,6 +510,60 @@ function findSpot(f, x, y, a, maxR = 900) {
     }
   }
   return null;
+}
+/** Turning: where funnel f has to sit at angle a to keep clear of the rock. It is pushed out of the walls from a start
+ *  pose (translation only, like a stick turned in a box), so the spot moves smoothly with the angle and, started from
+ *  home, is home again whenever the funnel fits there. Null when there is no such spot within TURN_REACH of home. */
+const TS = { x: 0, y: 0, moved: 0 };
+/** Push the pose (TS.x, TS.y) at angle (c, s) so that sample (lx, ly) keeps `need` units from the rock. */
+function pushOut(c, s, lx, ly, need) {
+  const px = TS.x + c * lx - s * ly, py = TS.y + s * lx + c * ly, p = need - sdfAt(px, py);
+  if (p <= 0.02) return;
+  const gx = sdfAt(px + 1.5, py) - sdfAt(px - 1.5, py), gy = sdfAt(px, py + 1.5) - sdfAt(px, py - 1.5), gl = Math.hypot(gx, gy);
+  if (gl < 1e-6) return;
+  TS.x += (gx / gl) * p; TS.y += (gy / gl) * p; TS.moved = Math.max(TS.moved, p);
+}
+function turnSpot(f, a, x0, y0) {
+  const c = Math.cos(a), s = Math.sin(a), wl = F_WALL + clearance() + 0.75;
+  TS.x = x0; TS.y = y0;
+  // sweeps of projections onto every clearance constraint in turn (they converge where the funnel can fit)
+  for (let sweep = 0; sweep < 24; sweep++) {
+    TS.moved = 0;
+    for (let k = 0; k <= 10; k++) pushOut(c, s, AX_X[k], 0, AX_R[k] * 0.9 + 0.75);
+    for (let k = 0; k < WS_X.length; k++) { pushOut(c, s, WS_X[k], WS_Y[k], wl); pushOut(c, s, WS_X[k], -WS_Y[k], wl); }
+    if (Math.hypot(TS.x - f.hx, TS.y - f.hy) > TURN_REACH) return null;
+    if (TS.moved === 0) break;
+  }
+  if (!fits(f, TS.x, TS.y, a)) return null;
+  SPOT.x = TS.x; SPOT.y = TS.y;
+  return SPOT;
+}
+/** One frame of turning: the funnel rides exactly on its turn spot, so it keeps working while it clears the rock.
+ *  Where that spot jumps (or the turn starts away from it) the difference goes into an offset that eases out,
+ *  critically damped, so the motion stays smooth. With no spot nearby the funnel hovers, inert, and settles once it
+ *  stops. Returns true while an offset is still easing out. */
+function turnStep(f, rdt) {
+  if (f.gliding) { f.gliding = false; f.evx = f.vx; f.evy = f.vy; }   // a glide in progress hands its speed on
+  // from home when possible (it comes back there), else on from where it was a frame ago
+  const T = turnSpot(f, f.angle, f.hx, f.hy) || (f.turnT ? turnSpot(f, f.angle, f.tpx, f.tpy) : null);
+  if (!T) {
+    f.turnT = false; f.ex = f.ey = f.evx = f.evy = 0;
+    f.lifted = !fits(f, f.x, f.y, f.angle);
+    if (f.lifted) f.user = true;
+    return false;
+  }
+  const tx = T.x, ty = T.y;
+  if (!f.turnT) { f.ex = f.x - tx; f.ey = f.y - ty; }
+  else if (Math.hypot(tx - f.tpx, ty - f.tpy) > 1.5 + 120 * rdt) { f.ex += f.tpx - tx; f.ey += f.tpy - ty; }   // a jump, not a slide
+  f.turnT = true; f.tpx = tx; f.tpy = ty;
+  cdStep(f.ex, f.evx, 0, TURN_K, rdt); f.ex = CD.p; f.evx = CD.v;
+  cdStep(f.ey, f.evy, 0, TURN_K, rdt); f.ey = CD.p; f.evy = CD.v;
+  const easing = Math.abs(f.ex) + Math.abs(f.ey) > 0.02 || Math.abs(f.evx) + Math.abs(f.evy) > 0.5;
+  if (!easing) f.ex = f.ey = f.evx = f.evy = 0;
+  f.x = tx + f.ex; f.y = ty + f.ey;
+  f.lifted = !fits(f, f.x, f.y, f.angle, TURN_SLACK);
+  if (f.lifted) f.user = true;
+  return easing;
 }
 /** Local hit test (body plus a small margin). */
 function onFunnel(f, wx, wy, pad) {
@@ -539,6 +598,7 @@ function makeFunnel(x, y, angle, power) {
     w: 0, wd: 0,                          // spin: angular velocity and its rate
     mvx: 0, mvy: 0, mvax: 0, mvay: 0,     // arrow-key motion: velocity and its rate
     vx: 0, vy: 0, tx: x, ty: y,           // glide
+    hx: x, hy: y, ex: 0, ey: 0, evx: 0, evy: 0, easing: false, turnT: false, tpx: 0, tpy: 0,   // turning: home, eased offset, last turn spot
     lifted: true, gliding: false, hand: false, user: false,
     pop: 0, lift: 1, hot: 0, glow: 0, flash: 0, inside: 0, through: 0, el: null, ui: null,
   };
@@ -551,6 +611,7 @@ function makeFunnel(x, y, angle, power) {
 function settle(f) {
   const spot = findSpot(f, f.x, f.y, f.angle);
   if (!spot) { destroyFunnel(f, { noUndo: true, silent: true }); Kit.toast('No room for that funnel', { tone: 'bad' }); return false; }
+  f.hx = spot.x; f.hy = spot.y;
   if (Math.hypot(spot.x - f.x, spot.y - f.y) < 0.5) land(f);
   else { f.tx = spot.x; f.ty = spot.y; f.gliding = true; f.lifted = true; }
   return true;
@@ -699,13 +760,11 @@ function updateFunnels(rdt) {
       f.x = clamp(f.x + dx, 20, WORLD_W - 20); f.y = clamp(f.y + dy, 20, WORLD_H - 20);
       f.hand = true; f.lifted = true; f.gliding = false;
     } else if (f.hand && !dragged) { f.hand = false; f.user = true; if (!settle(f)) continue; }
-    if (!f.hand && !dragged) {
-      if (spinning) {
-        // stays down while it fits; hovers over walls while it turns, and lands once it stops
-        f.gliding = false;
-        f.lifted = !fits(f, f.x, f.y, f.angle);
-        if (f.lifted) f.user = true;
-      } else if (f.lifted && !f.gliding && !settle(f)) continue;
+    if (f.hand || dragged) { f.easing = false; f.turnT = false; f.ex = f.ey = f.evx = f.evy = 0; }
+    else {
+      // turning: it slides just clear of the rock and keeps working; it only hovers where there is no room nearby
+      if (spinning || f.easing) f.easing = turnStep(f, rdt);
+      else { f.turnT = false; if (f.lifted && !f.gliding && !settle(f)) continue; }
       if (f.gliding) {
         cdStep(f.x, f.vx, f.tx, GLIDE_K, rdt); f.x = CD.p; f.vx = CD.v;
         cdStep(f.y, f.vy, f.ty, GLIDE_K, rdt); f.y = CD.p; f.vy = CD.v;
@@ -1056,8 +1115,11 @@ function positionPills() {
   for (const f of S.funnels) {
     const ui = f.ui;
     let x = S.ox + (f.x + f.c * PILL_AT) * S.sc, y = S.oy + (f.y + f.s * PILL_AT) * S.sc - f.lift * 5;
-    x = Math.round(clamp(x, pr.x + hw, pr.x + pr.w - hw));
-    y = Math.round(clamp(y, pr.y + hh, pr.y + pr.h - hh));
+    x = clamp(x, pr.x + hw, pr.x + pr.w - hw);
+    y = clamp(y, pr.y + hh, pr.y + pr.h - hh);
+    // whole pixels at rest (crisp text); sub-pixel while it moves or turns, so it glides instead of stepping
+    if (!f.lifted && !f.easing && f.w === 0 && f.wd === 0 && f.lift < 0.01) { x = Math.round(x); y = Math.round(y); }
+    else { x = Math.round(x * 64) / 64; y = Math.round(y * 64) / 64; }
     if (x !== ui.x || y !== ui.y) { f.el.style.transform = `translate(${x}px,${y}px)`; ui.x = x; ui.y = y; }
     if (k !== ui.k) { ui.pill.style.setProperty('--k', k); ui.k = k; }
     const cls = (f === S.sel ? ' is-sel' : '') + (f.hot > 0.5 || S.pillHover === f ? ' is-hot' : '')
@@ -1077,7 +1139,7 @@ function select(f) {
 const hovered = () => S.pillHover || (S.drag ? S.drag.f : S.hover);
 const rotTarget = () => hovered() || S.sel;
 function refreshHint() {
-  Kit.setHint(S.sel ? 'Hold A or D to turn it · W S power · arrows move it · Delete removes it' : null);
+  Kit.setHint(S.sel ? 'Hold A or D to turn it · W or S sets its power · arrows move it · Delete removes it' : null);
 }
 function cycle(dir) {
   const n = S.funnels.length;
@@ -1419,7 +1481,7 @@ function funnelSprites() {
   const abs = Kit.isAbstract, R = abs ? SHAPES : SPRITES, px = 1 / S.sc;   // px: one CSS pixel in world units
   const body = (paint) => paintSprite(2 * SP_BX, 2 * SP_BY, -SP_BX, -SP_BY, k, paint);
   FSP.body = body((g) => R.paintBody(g, px));
-  FSP.hot = body((g) => { g.strokeStyle = SH.white; g.lineWidth = F_WALL * 2 + 7; bothWalls(g); g.stroke(); });
+  FSP.hot = body((g) => { g.strokeStyle = abs ? SH.white : '#d6c4ff'; g.lineWidth = F_WALL * 2 + 7; bothWalls(g); g.stroke(); });
   FSP.shadow = abs ? null : body((g) => SPRITES.paintShadow(g));
   FSP.glowM = abs ? null : glowDiscs(GLOW_M, k, COL.red, 0.5, 0.16);
   FSP.glowS = abs ? null : glowDiscs(GLOW_S, k, COL.blue, 0.75, 0.22);
@@ -1537,7 +1599,7 @@ function drawFunnel(ctx, f, rt, R, alpha, extra) {
     ctx.restore();
   }
   const hot = Math.max(f.hot * 0.45, f.flash * 0.8);
-  if (hot <= 0.01 && m === sc && alpha === 1 && !f.lifted && f.w === 0 && f.wd === 0) blitResting(ctx, f, sp, x, y);
+  if (hot <= 0.01 && m === sc && alpha === 1 && !f.lifted && f.w === 0 && f.wd === 0 && !f.easing) blitResting(ctx, f, sp, x, y);
   else {
     ctx.save();
     ctx.translate(x, y); ctx.rotate(f.angle); ctx.scale(m, m);
@@ -1587,7 +1649,7 @@ const SPRITES = {
   particles(ctx) {
     // vector fallback for HiDPI screens (GPU canvases): one opaque fill per color bucket, dots plus short trails
     bucketize();
-    const sc = S.sc, ox = S.ox, oy = S.oy, r = tw('size') * sc, fast = BASE_SPEED * S.speed * 1.3;
+    const sc = S.sc, ox = S.ox, oy = S.oy, r = tw('size') * sc, fast = BASE_SPEED * S.speed * TRAIL_FROM;
     for (let b = 0; b < BK; b++) {
       const n = BN[b], idx = BIDX[b];
       if (!n) continue;
@@ -1598,12 +1660,11 @@ const SPRITES = {
         ctx.arc(x, y, r, 0, TAU);
         const vx = VX[i], vy = VY[i], v = Math.hypot(vx, vy);
         if (v > fast) {
-          // fast ones leave a short tapered trail of shrinking dots
-          const l = Math.min((v - fast) * 0.012, 9) * sc / v;
-          let tx = x - vx * l, ty = y - vy * l, tr = r * 0.78;
+          // fast ones leave a short tapered streak of shrinking dots
+          const L = Math.min((v - fast) * TRAIL_K, TRAIL_MAX), l = (L * sc) / v;
+          let tx = x - vx * l * 0.5, ty = y - vy * l * 0.5, tr = r * 0.72;
           ctx.moveTo(tx + tr, ty); ctx.arc(tx, ty, tr, 0, TAU);
-          tx -= vx * l; ty -= vy * l; tr = r * 0.55;
-          ctx.moveTo(tx + tr, ty); ctx.arc(tx, ty, tr, 0, TAU);
+          if (L > 4) { tx = x - vx * l; ty = y - vy * l; tr = r * 0.5; ctx.moveTo(tx + tr, ty); ctx.arc(tx, ty, tr, 0, TAU); }
         }
       }
       ctx.fillStyle = BCOL[b];
@@ -1715,6 +1776,8 @@ for (let b = 0; b < BK; b++) {
   RGB.set([c.r, c.g, c.b], b * 3); RGB_SH.set([d.r, d.g, d.b], b * 3);
 }
 const useStamp = () => Kit.dpr <= 1.25;
+// velocity streaks: from TRAIL_FROM × cruising speed, TRAIL_K world units of streak per unit/s faster, up to TRAIL_MAX
+const TRAIL_FROM = 1.15, TRAIL_K = 0.032, TRAIL_MAX = 11;
 /** Keep a copy of the finished maze layer as the frame buffer's background. */
 function captureLayer() {
   if (!useStamp()) { PB.bg = null; return; }
@@ -1730,7 +1793,7 @@ function captureLayer() {
  *  relative to the dot's pixel; fully covered pixels first (plain stores), then the soft edge (weights 1–255). */
 function makeKernels(R, soft, W) {
   const out = [];
-  for (const [rr, gain] of [[R, 1], [R * 0.72, 0.75], [0, 0]]) {
+  for (const [rr, gain] of [[R, 1], [R * 0.72, 0.75], [0, 0], [R * 0.5, 0.5]]) {   // head, streak, halo, streak tip
     if (!gain) { out.push(haloKernel(R, W)); continue; }
     const h = Math.ceil(rr + soft + 1), phases = [];
     for (let sy = 0; sy < SUB; sy++) for (let sx = 0; sx < SUB; sx++) {
@@ -1777,7 +1840,7 @@ function stampParticles() {
   const abs = Kit.isAbstract, dpr = Kit.dpr, sc = S.sc * dpr, ox = S.ox * dpr, oy = S.oy * dpr;
   const R = tw('size') * sc, key = (abs ? 'a' : 's') + R.toFixed(2) + ':' + PB.w;
   if (PB.key !== key) { PB.key = key; PB.kers = makeKernels(R, abs ? 1.1 : 1.4, PB.w); }
-  const k0 = PB.kers[0], k1 = PB.kers[1], k2 = PB.kers[2], cols = abs ? RGB_SH : RGB, fast = BASE_SPEED * S.speed * 1.3;
+  const k0 = PB.kers[0], k1 = PB.kers[1], k2 = PB.kers[2], k3 = PB.kers[3], cols = abs ? RGB_SH : RGB, fast = BASE_SPEED * S.speed * TRAIL_FROM;
   for (let i = 0; i < N; i++) {
     const w = WARM[i], c = COOL[i];
     let b = 0;
@@ -1786,9 +1849,10 @@ function stampParticles() {
     if (!abs) {
       if (b === 2 || b === 3 || b === 5 || b === 6) stamp(k2, x, y, cr, cg, cb);   // pulled and ejected ones glow
       const vx = VX[i], vy = VY[i], v = Math.hypot(vx, vy);
-      if (v > fast) {   // fast ones leave a short trail
-        const l = (Math.min((v - fast) * 0.014, 7) * sc) / v;
-        stamp(k1, x - vx * l, y - vy * l, cr, cg, cb);
+      if (v > fast) {   // fast ones leave a short tapered streak
+        const L = Math.min((v - fast) * TRAIL_K, TRAIL_MAX), l = (L * sc) / v;
+        stamp(k1, x - vx * l * 0.5, y - vy * l * 0.5, cr, cg, cb);
+        if (L > 4) stamp(k3, x - vx * l, y - vy * l, cr, cg, cb);
       }
     }
     stamp(k0, x, y, cr, cg, cb);
